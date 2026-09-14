@@ -1,0 +1,3 @@
+# Keep shell scripts LF so Linux containers don't break on Windows checkouts.
+*.sh text eol=lf
+backend/docker-entrypoint.sh text eol=lf

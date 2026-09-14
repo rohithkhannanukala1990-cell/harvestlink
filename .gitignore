@@ -1,0 +1,15 @@
+# Root gitignore — excludes dependencies, build output, and secrets across the monorepo.
+
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+Thumbs.db
+coverage/
+.vite/
+*.tsbuildinfo
+.prisma/

@@ -1,0 +1,8 @@
+{
+  // Root TypeScript project references for the Harvestlink frontend.
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}

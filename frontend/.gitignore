@@ -1,0 +1,8 @@
+# Frontend-local ignores — complements the monorepo root .gitignore.
+# Keeps Vite/Oxlint tooling artifacts out of git for this package.
+
+node_modules
+dist
+dist-ssr
+*.local
+.oxlintcache

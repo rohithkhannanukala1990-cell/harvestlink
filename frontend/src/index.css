@@ -1,0 +1,15 @@
+/**
+ * Global stylesheet for the Harvestlink frontend.
+ * Imports Tailwind and sets a simple full-viewport base layout.
+ */
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}

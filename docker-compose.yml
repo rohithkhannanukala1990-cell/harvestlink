@@ -1,0 +1,61 @@
+# Local development stack: Postgres + backend API + frontend UI.
+# Usage: docker compose up --build
+#
+# Browser calls the API at localhost:3001 (VITE_API_URL). Backend reaches Postgres
+# via the Docker network hostname `postgres`.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: harvestlink-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: harvestlink
+      POSTGRES_PASSWORD: harvestlink
+      POSTGRES_DB: harvestlink
+    volumes:
+      - harvestlink_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harvestlink -d harvestlink"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: harvestlink-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://harvestlink:harvestlink@postgres:5432/harvestlink?schema=public
+      JWT_SECRET: docker-compose-dev-jwt-change-me
+      PORT: "3001"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_CURRENCY: ${STRIPE_CURRENCY:-usd}
+      FRONTEND_URL: http://localhost:5173
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Host browser → host-mapped backend port (not the Docker service name).
+        VITE_API_URL: http://localhost:3001
+    container_name: harvestlink-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  harvestlink_pgdata:

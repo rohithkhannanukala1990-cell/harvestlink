@@ -1,0 +1,7 @@
+# Frontend image build context ignores — keep build context small and secrets out of the image.
+node_modules
+dist
+.env
+.env.*
+*.log
+.git

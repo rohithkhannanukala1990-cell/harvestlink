@@ -1,0 +1,7 @@
+# Backend-local ignores — complements the monorepo root .gitignore.
+# Excludes env secrets, build output, and Prisma-generated artifacts.
+
+node_modules/
+dist/
+.env
+*.log

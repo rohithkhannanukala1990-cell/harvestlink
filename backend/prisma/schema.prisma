@@ -1,0 +1,297 @@
+// Prisma schema for Harvestlink — defines the PostgreSQL data model for a multi-store retail co-op.
+// Migrations for this schema live under backend/prisma/migrations.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Roles that control what a user can do in the co-op platform (POS, store ops, or co-op-wide admin).
+enum Role {
+  CASHIER
+  STORE_ADMIN
+  COOP_ADMIN
+}
+
+/// Membership tiers that drive co-op member benefits and pricing eligibility.
+enum MemberTier {
+  STANDARD
+  PLUS
+  EXECUTIVE
+}
+
+/// Stripe / card payment lifecycle for a Sale. Stock is only decremented once status becomes PAID.
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+/// How the customer pays: Terminal = in-store card-present; Checkout = hosted card-not-present.
+enum PaymentMethod {
+  TERMINAL
+  CHECKOUT
+}
+
+/// A physical retail location in the co-op network, including the operator commission rate for that store.
+model Store {
+  /// Primary key uniquely identifying this store.
+  id              String   @id @default(cuid())
+  /// Human-readable store name shown in admin and POS UIs.
+  name            String
+  /// Street / mailing address of the store for records and logistics.
+  address         String
+  /// Fixed percentage of store sales the operator earns (snapshotted onto each Sale so history stays stable).
+  operatorPercent Decimal  @db.Decimal(5, 2)
+  /// When this store record was created in the system.
+  createdAt       DateTime @default(now())
+  /// Whether the store is currently operating; inactive stores should not take new sales.
+  isActive        Boolean  @default(true)
+
+  /// Users (cashiers / store admins) assigned to this store.
+  users   User[]
+  /// Catalog products sold at this store.
+  products Product[]
+  /// Completed sales that occurred at this store.
+  sales   Sale[]
+  /// Operator payouts issued against this store's earned commission.
+  payouts Payout[]
+  /// Manual stock adjustments recorded for products at this store.
+  stockAdjustments StockAdjustment[]
+}
+
+/// An authenticated account for cashiers, store admins, or co-op admins.
+model User {
+  /// Primary key uniquely identifying this user.
+  id           String   @id @default(cuid())
+  /// Store this user works at; null for co-op admins who are not tied to one store.
+  storeId      String?
+  /// Login email address; must be unique across the platform.
+  email        String   @unique
+  /// Bcrypt (or similar) hash of the user's password — never store plaintext.
+  passwordHash String
+  /// Authorization role determining accessible features and APIs.
+  role         Role
+  /// When this user account was created.
+  createdAt    DateTime @default(now())
+
+  /// Store assignment for store-scoped staff; null means co-op-wide (admin) scope.
+  store           Store?  @relation(fields: [storeId], references: [id])
+  /// Sales rung up by this user acting as cashier.
+  salesAsCashier  Sale[]  @relation("SaleCashier")
+  /// Operator payouts this user recorded as having been paid.
+  payoutsPaid     Payout[] @relation("PayoutPaidBy")
+  /// Manual inventory adjustments this user recorded (shrinkage, recounts, etc.).
+  stockAdjustments StockAdjustment[] @relation("StockAdjustedBy")
+
+  @@index([storeId])
+}
+
+/// A sellable SKU in a store's catalog, including pricing and inventory levels.
+model Product {
+  /// Primary key uniquely identifying this product row.
+  id        String   @id @default(cuid())
+  /// Store that owns this catalog entry (SKU uniqueness is per store, not global).
+  storeId   String
+  /// Store-local stock keeping unit code used at POS and receiving.
+  sku       String
+  /// Display name of the product on receipts and inventory screens.
+  name      String
+  /// Merchandising category for filtering and reporting.
+  category  String
+  /// Current retail selling price charged to the customer.
+  price     Decimal  @db.Decimal(12, 2)
+  /// Unit cost to the co-op / store, used for margin analysis.
+  cost      Decimal  @db.Decimal(12, 2)
+  /// Units currently on hand at this store.
+  stock     Int
+  /// Stock level at which a reorder should be triggered.
+  reorderAt Int
+  /// When this product was first added to the catalog.
+  createdAt DateTime @default(now())
+  /// When price, stock, or other product fields were last updated.
+  updatedAt DateTime @updatedAt
+
+  /// Owning store for this catalog item.
+  store     Store      @relation(fields: [storeId], references: [id])
+  /// Line items on sales that referenced this product.
+  saleItems SaleItem[]
+  /// Audit trail of non-sale stock changes for this product.
+  stockAdjustments StockAdjustment[]
+
+  /// Speeds store-scoped catalog and inventory queries.
+  @@index([storeId])
+  /// Two stores may each have "SKU-001"; uniqueness is (storeId, sku).
+  @@unique([storeId, sku])
+}
+
+/// An audited manual change to on-hand stock (shrinkage, recount, receiving correction).
+/// Sale-driven decrements do not create these rows — only intentional human adjustments do.
+model StockAdjustment {
+  /// Primary key uniquely identifying this adjustment event.
+  id            String   @id @default(cuid())
+  /// Product whose stock was changed.
+  productId     String
+  /// Store that owns the product (denormalized for store-scoped audit queries).
+  storeId       String
+  /// User who performed the adjustment (store admin or co-op admin).
+  adjustedById  String
+  /// On-hand quantity immediately before the adjustment.
+  previousStock Int
+  /// On-hand quantity after the adjustment was applied.
+  newStock      Int
+  /// Signed delta applied (newStock - previousStock); negative means inventory removed.
+  delta         Int
+  /// Human-readable explanation required for audit (e.g. "cycle count", "damaged goods").
+  reason        String
+  /// When the adjustment was recorded.
+  createdAt     DateTime @default(now())
+
+  product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  store      Store   @relation(fields: [storeId], references: [id])
+  adjustedBy User    @relation("StockAdjustedBy", fields: [adjustedById], references: [id])
+
+  @@index([productId])
+  @@index([storeId])
+  @@index([adjustedById])
+}
+
+/// A co-op member who can shop at any store; identity is co-op-wide via memberNumber.
+model Member {
+  /// Primary key uniquely identifying this member.
+  id           String     @id @default(cuid())
+  /// Co-op-wide membership number on the member card. Looked up at every POS checkout
+  /// when a shopper identifies — must stay indexed for O(1)-ish reads under live lane load.
+  /// (@unique already indexes this column; @@index below documents the POS requirement.)
+  memberNumber String     @unique
+  /// Member's full name for receipts and member services.
+  name         String
+  /// Contact email for membership communications.
+  email        String
+  /// Benefit tier (STANDARD / PLUS / EXECUTIVE) controlling member privileges.
+  tier         MemberTier @default(STANDARD)
+  /// Date the member joined the co-op.
+  joinedAt     DateTime   @default(now())
+  /// Membership expiration date; used to validate active status at checkout.
+  expiresAt    DateTime
+
+  /// Sales associated with this member when they identified at POS.
+  sales Sale[]
+
+  /// POS checkout hits memberNumber on every identified sale; keep this indexed for fast card lookups.
+  @@index([memberNumber])
+}
+
+/// A completed (or in-progress) checkout transaction; settlement amounts are frozen at sale time.
+///
+/// MONEY FLOW (Stripe vs internal ledger):
+/// - Stripe payouts should land in the CO-OP Stripe account (the co-op is the merchant of record).
+/// - Sale.operatorAmount / Phase 6 Payout rows are a SEPARATE internal ledger: they track what the
+///   co-op owes the store operator. They are NOT Stripe Connect/destination charges to the operator.
+///   The co-op decides when to actually pay the operator (e.g. weekly bank transfer) via /settlement.
+model Sale {
+  /// Primary key uniquely identifying this sale.
+  id              String   @id @default(cuid())
+  /// Store where the sale was rung up.
+  storeId         String
+  /// Cashier (User) who completed the sale.
+  cashierId       String
+  /// Optional member attached to the sale when a member number was provided.
+  memberId        String?
+  /// Sum of line items before any order-level adjustments (stored for audit).
+  subtotal        Decimal  @db.Decimal(12, 2)
+  /// Final amount charged / settled for this sale.
+  total           Decimal  @db.Decimal(12, 2)
+  /// Snapshot of the store's operatorPercent at sale time — never recalculate historical sales from later store settings.
+  operatorPercent Decimal  @db.Decimal(5, 2)
+  /// Operator's earned share for this sale (derived from total × operatorPercent snapshot).
+  /// Internal ledger only — not a Stripe transfer to the operator.
+  operatorAmount  Decimal  @db.Decimal(12, 2)
+  /// Portion of the sale attributable to the co-op after operator accrual (full card capture still goes to co-op Stripe).
+  coopAmount      Decimal  @db.Decimal(12, 2)
+  /// Card payment lifecycle; inventory decrements only when PAID (never while PENDING).
+  paymentStatus   PaymentStatus @default(PENDING)
+  /// Stripe channel used for this sale (Terminal reader vs Checkout Session).
+  paymentMethod   PaymentMethod?
+  /// Stripe PaymentIntent id (Terminal and often Checkout's underlying intent).
+  stripePaymentIntentId String? @unique
+  /// Stripe Checkout Session id when paymentMethod = CHECKOUT.
+  stripeCheckoutSessionId String? @unique
+  /// When Stripe reported successful payment and stock was finalized.
+  paidAt          DateTime?
+  /// When the sale was refunded (stock restored, status REFUNDED).
+  refundedAt      DateTime?
+  /// When the sale record was created (may be PENDING before payment).
+  createdAt       DateTime @default(now())
+
+  /// Store that recorded this sale.
+  store    Store      @relation(fields: [storeId], references: [id])
+  /// Cashier who processed the sale.
+  cashier  User       @relation("SaleCashier", fields: [cashierId], references: [id])
+  /// Member on the sale, if any.
+  member   Member?    @relation(fields: [memberId], references: [id])
+  /// Line items that make up this sale.
+  items    SaleItem[]
+
+  /// Speeds store sales reporting and settlement queries.
+  @@index([storeId])
+  @@index([cashierId])
+  @@index([memberId])
+  @@index([paymentStatus])
+}
+
+/// A single line on a sale; product name/price/SKU are snapshotted so history stays accurate after catalog changes.
+model SaleItem {
+  /// Primary key uniquely identifying this sale line.
+  id            String  @id @default(cuid())
+  /// Parent sale this line belongs to.
+  saleId        String
+  /// Product that was sold (kept for inventory/history links even if catalog fields change).
+  productId     String
+  /// SKU as it appeared at sale time (survives later SKU edits).
+  skuSnapshot   String
+  /// Product name as it appeared at sale time (survives later renames).
+  nameSnapshot  String
+  /// Unit price charged at sale time (survives later reprices).
+  priceSnapshot Decimal @db.Decimal(12, 2)
+  /// Quantity of units sold on this line.
+  quantity      Int
+
+  /// Parent sale transaction.
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  /// Catalog product referenced by this line.
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([saleId])
+  @@index([productId])
+}
+
+/// A record of money actually paid from the co-op account to a store operator.
+model Payout {
+  /// Primary key uniquely identifying this payout.
+  id           String   @id @default(cuid())
+  /// Store whose operator received this payout.
+  storeId      String
+  /// Amount paid out to the operator from the co-op account.
+  amount       Decimal  @db.Decimal(12, 2)
+  /// Optional note describing the payout period or payment method.
+  note         String?
+  /// Co-op user who recorded / authorized this payout.
+  paidByUserId String
+  /// When the payout was recorded.
+  createdAt    DateTime @default(now())
+
+  /// Store associated with the operator being paid.
+  store  Store @relation(fields: [storeId], references: [id])
+  /// User who marked this payout as paid.
+  paidBy User  @relation("PayoutPaidBy", fields: [paidByUserId], references: [id])
+
+  /// Speeds store payout history and operator settlement reports.
+  @@index([storeId])
+  @@index([paidByUserId])
+}
