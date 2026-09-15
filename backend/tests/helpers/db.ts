@@ -24,6 +24,8 @@ export async function truncateAll(): Promise<void> {
       "DividendAllocation",
       "Dividend",
       "BoardResolution",
+      "MemberBenefitUsage",
+      "MemberBenefit",
       "CapitalContribution",
       "MemberEquityAccount",
       "SaleItem",

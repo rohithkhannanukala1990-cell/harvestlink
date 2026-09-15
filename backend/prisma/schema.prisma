@@ -64,6 +64,44 @@ enum BallotStatus {
   CANCELLED
 }
 
+/// Kind of configurable member perk (R2 benefits engine — replaces hard-coded tier %).
+enum BenefitType {
+  PERCENT_DISCOUNT
+  FIXED_DISCOUNT
+  FREE_DELIVERY
+  EARLY_ACCESS
+  EXCLUSIVE_PRODUCT
+  BULK_PRICING
+  BIRTHDAY_CREDIT
+  STORE_CREDIT
+  FREE_ITEM
+}
+
+/// How narrowly a MemberBenefit applies in the catalog / network.
+enum BenefitScope {
+  ALL_PRODUCTS
+  CATEGORY
+  PRODUCT
+  STORE
+  NETWORK_WIDE
+}
+
+/// Window used when enforcing MemberBenefit.maxUsesPerPeriod caps.
+enum BenefitPeriod {
+  PER_TRANSACTION
+  DAILY
+  MONTHLY
+  ANNUAL
+  LIFETIME
+}
+
+/// Who absorbs the cost of a member discount at a store (moves to OperatorAgreement in P3).
+enum DiscountBearer {
+  OPERATOR
+  COOP
+  SHARED
+}
+
 /// Stripe / card payment lifecycle for a Sale. Physical stock decrements only when PAID.
 /// EXPIRED = abandoned PENDING past reservationExpiresAt (reservation released by cleanup job).
 /// REFUNDING = DB claimed a refund before Stripe; finalize to REFUNDED/PAID or reconcile if stuck.
@@ -98,6 +136,14 @@ model Store {
   taxRate         Decimal  @default(0) @db.Decimal(5, 2)
   /// Printed on receipts (returns / exchanges policy).
   refundPolicy    String   @default("Returns accepted within 14 days with receipt. Refunds to original form of payment.")
+  /// When false, this store does not apply NETWORK_WIDE / co-op network member benefits.
+  /// Lets the co-op admin exclude a store from network benefits, useful mid-onboarding.
+  honorsNetworkBenefits Boolean @default(true)
+  /// Who funds member discounts rung at this store (COOP / OPERATOR / SHARED).
+  memberDiscountBearer DiscountBearer @default(COOP)
+  /// When memberDiscountBearer = SHARED, percent of the discount borne by the operator (0–100).
+  /// Moves to OperatorAgreement in P3. See the split rules in a later step.
+  memberDiscountSharedPercent Decimal @default(0) @db.Decimal(5, 2)
   /// When this store record was created in the system.
   createdAt       DateTime @default(now())
   /// Whether the store is currently operating; inactive stores should not take new sales.
@@ -160,6 +206,8 @@ model User {
   goodsReceiptsReceived GoodsReceipt[] @relation("GoodsReceiptReceivedBy")
   /// Members this user approved into ACTIVE status.
   membersApproved Member[] @relation("MemberApprovedBy")
+  /// MemberBenefit rows this user created (versioned perk definitions).
+  memberBenefitsCreated MemberBenefit[] @relation("MemberBenefitCreatedBy")
 
   @@index([storeId])
 }
@@ -272,8 +320,91 @@ model MembershipClass {
   createdAt           DateTime @default(now())
 
   members Member[]
+  /// Versioned benefit definitions for members of this class.
+  benefits MemberBenefit[]
+  /// Sales that snapshotted this class at checkout time.
+  sales Sale[]
 
   @@index([isActive])
+}
+
+/// A configurable member perk attached to a MembershipClass.
+/// Benefits are VERSIONED, never overwritten. Members are owners who paid for life and cannot
+/// cancel like subscribers, so the record of what was promised and when must survive. To change
+/// a benefit, set endsAt on the old row and create a new one.
+model MemberBenefit {
+  /// Primary key uniquely identifying this benefit version.
+  id                     String         @id @default(cuid())
+  /// Membership class this perk applies to (e.g. Member $100 vs Member $1,000).
+  membershipClassId      String
+  /// Kind of perk (percent off, free delivery, exclusive SKU, etc.).
+  benefitType            BenefitType
+  /// Numeric magnitude for the perk (e.g. 5.00 = 5% or $5 depending on benefitType).
+  value                  Decimal        @db.Decimal(12, 4)
+  /// Catalog / network breadth of this perk.
+  scope                  BenefitScope
+  /// Category id, product id, or store id when scope is CATEGORY / PRODUCT / STORE; null otherwise.
+  scopeRefId             String?
+  /// When this benefit version becomes effective.
+  startsAt               DateTime       @default(now())
+  /// When this benefit version stops (null = indefinite / still current).
+  endsAt                 DateTime?
+  /// Max times a member may use this benefit in one period (null = unlimited).
+  maxUsesPerPeriod       Int?
+  /// Cap window for maxUsesPerPeriod (transaction / day / month / year / lifetime).
+  periodType             BenefitPeriod  @default(PER_TRANSACTION)
+  /// Minimum pre-discount purchase (USD) required before this benefit can apply.
+  minimumPurchaseAmount  Decimal        @default(0) @db.Decimal(12, 2)
+  /// Soft flag; prefer ending a version via endsAt rather than flipping false in place.
+  isActive               Boolean        @default(true)
+  /// Evaluation order when multiple benefits could apply (lower = earlier / higher priority).
+  priority               Int            @default(100)
+  /// Human-readable explanation shown in admin / member communications.
+  description            String         @default("")
+  /// Co-op admin (User) who created this benefit version.
+  createdByUserId        String
+  /// When this benefit version row was created.
+  createdAt              DateTime       @default(now())
+  /// When this row was last updated (metadata only — do not overwrite value/scope in place).
+  updatedAt              DateTime       @updatedAt
+
+  membershipClass MembershipClass @relation(fields: [membershipClassId], references: [id])
+  createdBy       User            @relation("MemberBenefitCreatedBy", fields: [createdByUserId], references: [id])
+  usages          MemberBenefitUsage[]
+  /// Sale lines that applied this benefit version (historical — never rewrite).
+  saleItems       SaleItem[]
+
+  @@index([membershipClassId])
+  @@index([isActive, startsAt, endsAt])
+  @@index([benefitType])
+  @@index([priority])
+  @@index([createdByUserId])
+}
+
+/// One application of a MemberBenefit on a Sale for a Member.
+/// Enforces usage caps AND answers "what are our member perks actually costing the co-op?"
+model MemberBenefitUsage {
+  /// Primary key uniquely identifying this usage event.
+  id          String   @id @default(cuid())
+  /// Member who received the perk on this sale.
+  memberId    String
+  /// Benefit version that was applied.
+  benefitId   String
+  /// Sale on which the perk was applied.
+  saleId      String
+  /// Dollar amount saved / cost of the perk on this sale (USD).
+  amountSaved Decimal  @db.Decimal(12, 2)
+  /// When the perk was applied (checkout time).
+  usedAt      DateTime @default(now())
+
+  member  Member        @relation(fields: [memberId], references: [id])
+  benefit MemberBenefit @relation(fields: [benefitId], references: [id])
+  sale    Sale          @relation(fields: [saleId], references: [id])
+
+  /// Fast cap checks during checkout: count usages for (member, benefit) in a time window.
+  @@index([memberId, benefitId, usedAt])
+  @@index([saleId])
+  @@index([benefitId])
 }
 
 /// A co-op member-OWNER. Membership NEVER expires. Soft status changes only — never hard-delete.
@@ -320,6 +451,8 @@ model Member {
   /// Per-dividend payout lines for this member.
   dividendAllocations DividendAllocation[]
   votes            MemberVote[]
+  /// Checkout applications of MemberBenefit for this owner (cap + cost tracking).
+  benefitUsages  MemberBenefitUsage[]
 
   @@index([memberNumber])
   @@index([status])
@@ -531,11 +664,21 @@ model Sale {
   cashierId       String
   /// Optional member attached to the sale when a member number was provided.
   memberId        String?
+  /// Membership class of the member at sale time (null if no member). Snapshotted so later
+  /// class changes never rewrite historical benefit eligibility on this sale.
+  membershipClassId String?
+  /// Line totals before any member benefit (and before manual discounts) — frozen at checkout.
+  /// Later benefit edits must never change this snapshot.
+  subtotalBeforeDiscount Decimal @db.Decimal(12, 2)
   /// Sum of line nets after discounts, BEFORE sales tax.
   /// Operator share is computed from this field — never from post-tax total.
   subtotal        Decimal  @db.Decimal(12, 2)
-  /// Total discounts applied (manual line discounts). Member capital is NOT a discount.
+  /// Total discounts applied (benefit + manual). Member capital is NOT a discount.
   discountAmount  Decimal  @default(0) @db.Decimal(12, 2)
+  /// Total member-benefit discount on this sale (excludes manual admin discounts). Snapshotted.
+  memberDiscountAmount Decimal @default(0) @db.Decimal(12, 2)
+  /// Who funded memberDiscountAmount at sale time (from Store settings — never re-read later).
+  memberDiscountBearer DiscountBearer @default(COOP)
   /// Sales tax charged on non-exempt lines (remitted to the state — not operator revenue).
   taxAmount       Decimal  @default(0) @db.Decimal(12, 2)
   /// Amount charged to the customer: subtotal + taxAmount.
@@ -584,17 +727,22 @@ model Sale {
   cashier  User       @relation("SaleCashier", fields: [cashierId], references: [id])
   /// Member on the sale, if any.
   member   Member?    @relation(fields: [memberId], references: [id])
+  /// Membership class snapshotted at sale time (independent of later Member.membershipClassId edits).
+  membershipClass MembershipClass? @relation(fields: [membershipClassId], references: [id])
   /// Line items that make up this sale.
   items    SaleItem[]
   /// Refund attempts (including in-flight REFUNDING rows).
   refunds  SaleRefund[]
   /// Stock conflicts created when this (typically offline) sale drove inventory negative.
   stockReconciliations StockReconciliation[]
+  /// Member benefit applications recorded against this checkout (cost + cap tracking).
+  benefitUsages MemberBenefitUsage[]
 
   /// Speeds store sales reporting and settlement queries.
   @@index([storeId])
   @@index([cashierId])
   @@index([memberId])
+  @@index([membershipClassId])
   @@index([paymentStatus])
   /// Cleanup job finds expired PENDING reservations via this index.
   @@index([reservationExpiresAt])
@@ -616,8 +764,14 @@ model SaleItem {
   priceSnapshot Decimal @db.Decimal(12, 2)
   /// Quantity of units sold on this line.
   quantity      Int
-  /// Discount dollars applied to this line (member benefit placeholder + manual), before tax.
+  /// TOTAL line discount (benefit + manual), before tax.
+  /// The existing discountAmount field stays as the TOTAL line discount (benefit + manual).
+  /// benefitDiscountAmount isolates the benefit portion for reporting.
   discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  /// MemberBenefit version applied to this line (null if none). Snapshotted — never rewritten.
+  benefitId     String?
+  /// Benefit portion of this line's discount (USD). Manual discounts are discountAmount − this.
+  benefitDiscountAmount Decimal @default(0) @db.Decimal(12, 2)
   /// Optional reason when a STORE_ADMIN applied a manual line discount.
   discountReason String?
   /// Sales tax for this line (0 when taxExempt at sale time).
@@ -631,11 +785,14 @@ model SaleItem {
   sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
   /// Catalog product referenced by this line.
   product Product @relation(fields: [productId], references: [id])
+  /// Benefit version applied to this line at sale time (null if none).
+  benefit MemberBenefit? @relation(fields: [benefitId], references: [id])
   /// Refund line allocations against this item.
   refundLines SaleRefundLine[]
 
   @@index([saleId])
   @@index([productId])
+  @@index([benefitId])
 }
 
 /// Status of a SaleRefund attempt (DB-first refund protocol).

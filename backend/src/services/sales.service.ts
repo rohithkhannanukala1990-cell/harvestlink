@@ -26,6 +26,7 @@
  * to the store operator. The co-op pays operators later (e.g. weekly bank transfer).
  */
 import {
+  DiscountBearer,
   PaymentMethod,
   PaymentStatus,
   Prisma,
@@ -39,10 +40,13 @@ import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { getStripe, toStripeCents } from "../lib/stripe.js";
+import { moneyDec } from "../lib/money.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
 
 export { resolveStoreScope };
+/** Re-export for callers that historically imported money rounding from this module. */
+export { moneyDec } from "../lib/money.js";
 
 /** How long a PENDING sale may hold reserved units before the cleanup job releases them. */
 export const RESERVATION_TTL_MS = 15 * 60 * 1000;
@@ -123,10 +127,6 @@ type LockedProductRow = {
   reserved: number;
   taxExempt: boolean;
 };
-
-function moneyDec(value: Prisma.Decimal | string | number): Prisma.Decimal {
-  return new Prisma.Decimal(value).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
-}
 
 function stockNeededByProduct(items: SaleLineInput[]): Map<string, number> {
   const quantityByProductId = new Map<string, number>();
@@ -378,9 +378,10 @@ export async function createSale(
           operatorPercent: Prisma.Decimal;
           isActive: boolean;
           taxRate: Prisma.Decimal;
+          memberDiscountBearer: DiscountBearer;
         }>
       >`
-        SELECT id, "operatorPercent", "isActive", "taxRate"
+        SELECT id, "operatorPercent", "isActive", "taxRate", "memberDiscountBearer"
         FROM "Store"
         WHERE id = ${storeId}
         FOR UPDATE
@@ -405,6 +406,7 @@ export async function createSale(
       }
 
       let memberAttached = false;
+      let membershipClassId: string | null = null;
       if (input.memberId) {
         const member = await tx.member.findUnique({ where: { id: input.memberId } });
         if (!member) {
@@ -418,6 +420,7 @@ export async function createSale(
           });
         }
         memberAttached = true;
+        membershipClassId = member.membershipClassId;
       }
 
       // R2 will replace this placeholder; keep calling it so discount math stays wired.
@@ -425,7 +428,9 @@ export async function createSale(
       const taxRate = new Prisma.Decimal(store.taxRate);
 
       let subtotal = new Prisma.Decimal(0);
+      let subtotalBeforeDiscount = new Prisma.Decimal(0);
       let discountAmount = new Prisma.Decimal(0);
+      let memberDiscountAmount = new Prisma.Decimal(0);
       let taxAmount = new Prisma.Decimal(0);
       const lineDrafts: Array<{
         productId: string;
@@ -434,6 +439,8 @@ export async function createSale(
         priceSnapshot: Prisma.Decimal;
         quantity: number;
         discountAmount: Prisma.Decimal;
+        benefitId: string | null;
+        benefitDiscountAmount: Prisma.Decimal;
         discountReason: string | null;
         taxAmount: Prisma.Decimal;
         taxExempt: boolean;
@@ -446,19 +453,22 @@ export async function createSale(
         const lineGross = moneyDec(priceSnapshot.mul(item.quantity));
 
         let manual = moneyDec(item.manualDiscount ?? 0);
-        const tierDiscount = moneyDec(lineGross.mul(tierPct).div(100));
-        if (manual.gt(lineGross.sub(tierDiscount))) {
+        // Placeholder benefit discount (0%) until R2 benefits engine plugs in here.
+        const benefitDiscount = moneyDec(lineGross.mul(tierPct).div(100));
+        if (manual.gt(lineGross.sub(benefitDiscount))) {
           throw new AppError(400, "manualDiscount exceeds line amount after tier discount", {
             productId: item.productId,
           });
         }
-        const lineDiscount = moneyDec(tierDiscount.add(manual));
+        const lineDiscount = moneyDec(benefitDiscount.add(manual));
         const lineNet = moneyDec(lineGross.sub(lineDiscount));
         const exempt = product.taxExempt;
         const lineTax = exempt ? moneyDec(0) : moneyDec(lineNet.mul(taxRate).div(100));
 
+        subtotalBeforeDiscount = subtotalBeforeDiscount.add(lineGross);
         subtotal = subtotal.add(lineNet);
         discountAmount = discountAmount.add(lineDiscount);
+        memberDiscountAmount = memberDiscountAmount.add(benefitDiscount);
         taxAmount = taxAmount.add(lineTax);
 
         if (manual.gt(0)) {
@@ -476,14 +486,18 @@ export async function createSale(
           priceSnapshot,
           quantity: item.quantity,
           discountAmount: lineDiscount,
+          benefitId: null,
+          benefitDiscountAmount: benefitDiscount,
           discountReason: manual.gt(0) ? item.discountReason!.trim() : null,
           taxAmount: lineTax,
           taxExempt: exempt,
         });
       }
 
+      subtotalBeforeDiscount = moneyDec(subtotalBeforeDiscount);
       subtotal = moneyDec(subtotal);
       discountAmount = moneyDec(discountAmount);
+      memberDiscountAmount = moneyDec(memberDiscountAmount);
       taxAmount = moneyDec(taxAmount);
       const total = moneyDec(subtotal.add(taxAmount));
 
@@ -491,6 +505,8 @@ export async function createSale(
       const operatorPercent = new Prisma.Decimal(store.operatorPercent);
       const operatorAmount = moneyDec(subtotal.mul(operatorPercent).div(100));
       const coopAmount = moneyDec(subtotal.sub(operatorAmount));
+      // Snapshot bearer at sale time — later Store.memberDiscountBearer edits must not rewrite history.
+      const memberDiscountBearer = store.memberDiscountBearer;
 
       if (isCash) {
         for (const [productId, quantity] of stockNeeded) {
@@ -506,8 +522,12 @@ export async function createSale(
             storeId,
             cashierId: cashier.id,
             memberId: input.memberId ?? null,
+            membershipClassId,
+            subtotalBeforeDiscount,
             subtotal,
             discountAmount,
+            memberDiscountAmount,
+            memberDiscountBearer,
             taxAmount,
             total,
             operatorPercent,
@@ -527,6 +547,8 @@ export async function createSale(
                 priceSnapshot: line.priceSnapshot,
                 quantity: line.quantity,
                 discountAmount: line.discountAmount,
+                benefitId: line.benefitId,
+                benefitDiscountAmount: line.benefitDiscountAmount,
                 discountReason: line.discountReason,
                 taxAmount: line.taxAmount,
                 taxExempt: line.taxExempt,
@@ -569,8 +591,12 @@ export async function createSale(
           storeId,
           cashierId: cashier.id,
           memberId: input.memberId ?? null,
+          membershipClassId,
+          subtotalBeforeDiscount,
           subtotal,
           discountAmount,
+          memberDiscountAmount,
+          memberDiscountBearer,
           taxAmount,
           total,
           operatorPercent,
@@ -589,6 +615,8 @@ export async function createSale(
               priceSnapshot: line.priceSnapshot,
               quantity: line.quantity,
               discountAmount: line.discountAmount,
+              benefitId: line.benefitId,
+              benefitDiscountAmount: line.benefitDiscountAmount,
               discountReason: line.discountReason,
               taxAmount: line.taxAmount,
               taxExempt: line.taxExempt,
