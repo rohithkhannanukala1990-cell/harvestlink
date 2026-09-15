@@ -8,6 +8,7 @@
  * deltas must be auditable so settlement and shrinkage reports stay trustworthy.
  */
 import { Prisma, type Product } from "@prisma/client";
+import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
@@ -15,7 +16,11 @@ import type { AuthUser } from "../types/auth.js";
 
 export { resolveStoreScope };
 
-export type ProductWithLowStock = Product & { lowStock: boolean };
+export type ProductWithLowStock = Product & {
+  /** Sellable units = stock - reserved (what POS / UI should show). */
+  available: number;
+  lowStock: boolean;
+};
 
 export type CreateProductInput = {
   sku: string;
@@ -25,6 +30,7 @@ export type CreateProductInput = {
   cost: number;
   stock: number;
   reorderAt: number;
+  taxExempt?: boolean;
 };
 
 export type UpdateProductInput = Partial<{
@@ -34,6 +40,7 @@ export type UpdateProductInput = Partial<{
   price: number;
   cost: number;
   reorderAt: number;
+  taxExempt: boolean;
 }>;
 
 export type AdjustStockInput = {
@@ -41,18 +48,23 @@ export type AdjustStockInput = {
   newStock: number;
   /** Required audit explanation (shrinkage, cycle count, receiving fix, etc.). */
   reason: string;
+  /** Client IP for the platform AuditLog (in addition to StockAdjustment.reason). */
+  ipAddress?: string | null;
 };
 
 function toProductView(product: Product): ProductWithLowStock {
+  const available = product.stock - product.reserved;
   return {
     ...product,
-    lowStock: product.stock <= product.reorderAt,
+    available,
+    // Reorder alerts use available stock so reserved holds do not hide a true low-stock state.
+    lowStock: available <= product.reorderAt,
   };
 }
 
 /**
- * Lists products for one store and flags low stock (stock <= reorderAt).
- * Low-stock flags drive reorder alerts without changing on-hand quantities.
+ * Lists products for one store.
+ * UI-facing available qty is stock - reserved; lowStock compares available to reorderAt.
  */
 export async function listProducts(storeId: string): Promise<ProductWithLowStock[]> {
   const store = await prisma.store.findUnique({ where: { id: storeId } });
@@ -91,6 +103,7 @@ export async function createProduct(
         cost: new Prisma.Decimal(input.cost),
         stock: input.stock,
         reorderAt: input.reorderAt,
+        taxExempt: input.taxExempt ?? false,
       },
     });
     return toProductView(product);
@@ -138,6 +151,7 @@ export async function updateProduct(
         ...(input.price !== undefined ? { price: new Prisma.Decimal(input.price) } : {}),
         ...(input.cost !== undefined ? { cost: new Prisma.Decimal(input.cost) } : {}),
         ...(input.reorderAt !== undefined ? { reorderAt: input.reorderAt } : {}),
+        ...(input.taxExempt !== undefined ? { taxExempt: input.taxExempt } : {}),
       },
     });
     return toProductView(product);
@@ -207,6 +221,14 @@ export async function adjustStock(
       throw new AppError(404, "Product not found for this store");
     }
 
+    if (input.newStock < product.reserved) {
+      throw new AppError(
+        400,
+        "newStock cannot be below reserved units held by PENDING sales",
+        { reserved: product.reserved, newStock: input.newStock },
+      );
+    }
+
     const previousStock = product.stock;
     const newStock = input.newStock;
     const delta = newStock - previousStock;
@@ -231,6 +253,26 @@ export async function adjustStock(
         reason,
       },
     });
+
+    // Platform audit trail mirrors StockAdjustment (reason + before/after stock).
+    await writeAuditLog(
+      {
+        userId: actor.id,
+        storeId,
+        action: AuditAction.STOCK_ADJUSTMENT,
+        entityType: "Product",
+        entityId: productId,
+        before: { stock: previousStock },
+        after: {
+          stock: newStock,
+          delta,
+          reason,
+          stockAdjustmentId: adjustment.id,
+        },
+        ipAddress: input.ipAddress ?? null,
+      },
+      { tx },
+    );
 
     return { product: updated, adjustment };
   });

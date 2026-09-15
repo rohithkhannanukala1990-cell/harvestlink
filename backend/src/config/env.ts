@@ -19,6 +19,12 @@ const envSchema = z.object({
   STRIPE_CURRENCY: z.string().min(3).default("usd"),
   /** Frontend origin used for Checkout success/cancel URLs. */
   FRONTEND_URL: z.string().url().default("http://localhost:5173"),
+  /** Optional SMTP for receipt emails (when unset, emails are logged only). */
+  SMTP_HOST: z.string().optional().default(""),
+  SMTP_PORT: z.coerce.number().int().positive().default(587),
+  SMTP_USER: z.string().optional().default(""),
+  SMTP_PASS: z.string().optional().default(""),
+  SMTP_FROM: z.string().optional().default(""),
 });
 
 const parsed = envSchema.safeParse(process.env);

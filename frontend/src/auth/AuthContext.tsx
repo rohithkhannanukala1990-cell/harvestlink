@@ -26,7 +26,8 @@ type AuthState = {
   user: AuthUser | null;
   token: string | null;
   activeStoreId: string | null;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<AuthUser>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   logout: () => void;
   setStoreId: (storeId: string) => void;
   isRole: (...roles: Role[]) => boolean;
@@ -57,6 +58,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setActiveStoreId(storeId);
       setActiveStoreIdState(storeId);
     }
+    return data.user;
+  }, []);
+
+  const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
+    const data = await apiRequest<{ token: string; user: AuthUser }>("/auth/change-password", {
+      method: "POST",
+      body: { currentPassword, newPassword },
+    });
+    setSession(data.token, data.user);
+    setToken(data.token);
+    setUser(data.user);
   }, []);
 
   const logout = useCallback(() => {
@@ -76,8 +88,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ user, token, activeStoreId, login, logout, setStoreId, isRole }),
-    [user, token, activeStoreId, login, logout, setStoreId, isRole],
+    () => ({
+      user,
+      token,
+      activeStoreId,
+      login,
+      changePassword,
+      logout,
+      setStoreId,
+      isRole,
+    }),
+    [user, token, activeStoreId, login, changePassword, logout, setStoreId, isRole],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -7,14 +7,26 @@
  * not by the POS UI, not by a spreadsheet, and not by recalculating operatorPercent
  * from today's Store settings.
  *
- * Reconciliation (per store):
- *   grossSales       = Σ Sale.total WHERE paymentStatus = PAID
- *   operatorAccrued  = Σ Sale.operatorAmount WHERE paymentStatus = PAID
- *   totalPaidOut     = Σ Payout.amount              (money already sent to the operator)
+ * Reconciliation (per store) — NET of refunds:
+ *   grossSales       = Σ (Sale.total - Sale.refundedAmount)
+ *                      WHERE paymentStatus IN (PAID, REFUNDING, REFUNDED)
+ *   operatorAccrued  = Σ (Sale.operatorAmount - Sale.refundedOperatorAmount)
+ *                      WHERE paymentStatus IN (PAID, REFUNDING, REFUNDED)
+ *   totalPaidOut     = Σ Payout.amount
  *   currentlyOwed    = operatorAccrued - totalPaidOut
  *
- * Only PAID sales count: PENDING never moved stock/money for settlement; REFUNDED sales
- * are excluded so operator accruals reverse when a card refund restores inventory.
+ * ACCOUNTING (why netting matters):
+ * - Full card capture still lands in the co-op Stripe account; operatorAmount is an
+ *   INTERNAL accrual only. When we refund the customer, we must claw back the same
+ *   proportion of operatorAmount (refundedOperatorAmount) or the co-op overpays the
+ *   operator on goods that are no longer sold.
+ * - Partial refunds leave paymentStatus = PAID with refunded* > 0 — excluding only
+ *   REFUNDED rows would still overpay on those partials. Netting both columns fixes
+ *   full and partial refunds in one formula.
+ * - REFUNDING rows are included at pre-finalize balances (refunded* not yet bumped).
+ *   That short window prefers not underpaying; finalize then nets the clawback.
+ * - Fully REFUNDED sales net to ~0 and stay in the aggregate so history is visible
+ *   without special-casing status.
  *
  * Why correctness beats speed:
  * - These aggregates decide real cash leaving the co-op account.
@@ -27,7 +39,7 @@
  * for edge cases (goodwill, correction) but that override is logged for audit.
  */
 import { Prisma, Role, type Payout } from "@prisma/client";
-import { PaymentStatus } from "@prisma/client";
+import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
@@ -53,6 +65,7 @@ export type NetworkSettlementSummary = {
 export type CreatePayoutInput = {
   amount: number;
   note?: string | null;
+  ipAddress?: string | null;
 };
 
 /**
@@ -89,15 +102,16 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
     throw new AppError(404, "Store not found");
   }
 
-  // Aggregate in parallel; both queries are read-only and keyed by storeId indexes.
+  // Net in SQL so partial refunds (PAID + refundedOperatorAmount > 0) reduce currentlyOwed.
   const [salesAgg, payoutsAgg] = await Promise.all([
-    prisma.sale.aggregate({
-      where: { storeId, paymentStatus: PaymentStatus.PAID },
-      _sum: {
-        total: true,
-        operatorAmount: true,
-      },
-    }),
+    prisma.$queryRaw<Array<{ gross: Prisma.Decimal; accrued: Prisma.Decimal }>>`
+      SELECT
+        COALESCE(SUM(total - "refundedAmount"), 0) AS gross,
+        COALESCE(SUM("operatorAmount" - "refundedOperatorAmount"), 0) AS accrued
+      FROM "Sale"
+      WHERE "storeId" = ${storeId}
+        AND "paymentStatus"::text IN ('PAID', 'REFUNDING', 'REFUNDED')
+    `,
     prisma.payout.aggregate({
       where: { storeId },
       _sum: {
@@ -106,8 +120,8 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
     }),
   ]);
 
-  const grossSales = new Prisma.Decimal(salesAgg._sum.total ?? 0);
-  const operatorAccrued = new Prisma.Decimal(salesAgg._sum.operatorAmount ?? 0);
+  const grossSales = new Prisma.Decimal(salesAgg[0]?.gross ?? 0);
+  const operatorAccrued = new Prisma.Decimal(salesAgg[0]?.accrued ?? 0);
   const totalPaidOut = new Prisma.Decimal(payoutsAgg._sum.amount ?? 0);
   // currentlyOwed can theoretically go negative if an admin over-paid; surface that honestly.
   const currentlyOwed = operatorAccrued.sub(totalPaidOut);
@@ -189,6 +203,24 @@ export async function createPayout(
 
   // Return post-payout summary so the UI refreshes from the same source of truth.
   const summary = await getStoreSettlementSummary(storeId);
+
+  await writeAuditLog({
+    userId: actor.id,
+    storeId,
+    action: AuditAction.PAYOUT_CREATE,
+    entityType: "Payout",
+    entityId: payout.id,
+    before: {
+      currentlyOwed: summaryBefore.currentlyOwed,
+    },
+    after: {
+      amount: decimalToMoneyString(amount),
+      note: payout.note,
+      adminOverride,
+      currentlyOwedAfter: summary.currentlyOwed,
+    },
+    ipAddress: input.ipAddress ?? null,
+  });
 
   return { payout, summary, adminOverride };
 }

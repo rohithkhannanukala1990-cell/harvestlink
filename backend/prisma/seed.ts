@@ -4,6 +4,9 @@
  * Creates the first COOP_ADMIN (required before POST /auth/register works) plus a sample
  * store and store-scoped staff so login, role checks, and later POS flows can be exercised
  * without manual SQL. Safe to re-run: existing emails/stores are skipped (upsert-style).
+ *
+ * Seeded accounts are created with mustChangePassword=true so first login forces a change.
+ * Refuses to run with the well-known default passwords when NODE_ENV=production.
  */
 import { PrismaClient, Role } from "@prisma/client";
 import bcrypt from "bcrypt";
@@ -14,12 +17,37 @@ dotenv.config();
 const prisma = new PrismaClient();
 const BCRYPT_ROUNDS = 12;
 
+const DEFAULT_ADMIN_PASSWORD = "ChangeMeAdmin123!";
+const DEFAULT_STORE_ADMIN_PASSWORD = "ChangeMeStore123!";
+const DEFAULT_CASHIER_PASSWORD = "ChangeMeCashier123!";
+
 const adminEmail = process.env.SEED_ADMIN_EMAIL ?? "admin@harvestlink.local";
-const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? "ChangeMeAdmin123!";
+const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? DEFAULT_ADMIN_PASSWORD;
 const storeAdminEmail = process.env.SEED_STORE_ADMIN_EMAIL ?? "storeadmin@harvestlink.local";
-const storeAdminPassword = process.env.SEED_STORE_ADMIN_PASSWORD ?? "ChangeMeStore123!";
+const storeAdminPassword = process.env.SEED_STORE_ADMIN_PASSWORD ?? DEFAULT_STORE_ADMIN_PASSWORD;
 const cashierEmail = process.env.SEED_CASHIER_EMAIL ?? "cashier@harvestlink.local";
-const cashierPassword = process.env.SEED_CASHIER_PASSWORD ?? "ChangeMeCashier123!";
+const cashierPassword = process.env.SEED_CASHIER_PASSWORD ?? DEFAULT_CASHIER_PASSWORD;
+
+const KNOWN_DEFAULT_PASSWORDS = new Set([
+  DEFAULT_ADMIN_PASSWORD,
+  DEFAULT_STORE_ADMIN_PASSWORD,
+  DEFAULT_CASHIER_PASSWORD,
+]);
+
+function assertProductionSeedSafe(): void {
+  if (process.env.NODE_ENV !== "production") {
+    return;
+  }
+
+  const passwords = [adminPassword, storeAdminPassword, cashierPassword];
+  const usingDefault = passwords.some((p) => KNOWN_DEFAULT_PASSWORDS.has(p));
+  if (usingDefault) {
+    throw new Error(
+      "Refusing to seed in production with default passwords. " +
+        "Set SEED_*_PASSWORD env vars to unique strong passwords, or do not run seed in production.",
+    );
+  }
+}
 
 async function upsertUser(input: {
   email: string;
@@ -42,14 +70,17 @@ async function upsertUser(input: {
       passwordHash,
       role: input.role,
       storeId: input.storeId,
+      mustChangePassword: true,
     },
   });
 
-  console.log(`Created ${input.role}: ${input.email}`);
+  console.log(`Created ${input.role}: ${input.email} (mustChangePassword=true)`);
   return user;
 }
 
 async function main() {
+  assertProductionSeedSafe();
+
   let store = await prisma.store.findFirst({
     where: { name: "Harvestlink Demo Store" },
   });
@@ -93,6 +124,7 @@ async function main() {
   console.log(`  COOP_ADMIN   ${adminEmail} / ${adminPassword}`);
   console.log(`  STORE_ADMIN  ${storeAdminEmail} / ${storeAdminPassword}`);
   console.log(`  CASHIER      ${cashierEmail} / ${cashierPassword}`);
+  console.log("Seeded accounts must change password on first login.");
 }
 
 main()

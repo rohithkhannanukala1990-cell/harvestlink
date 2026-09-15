@@ -1,18 +1,23 @@
 /**
  * Stripe webhook handler for Harvestlink.
  *
- * Finalizes PENDING sales to PAID (and decrements stock) when Checkout or Terminal
- * payments succeed. Marks FAILED when PaymentIntents fail.
+ * Stripe guarantees at-least-once delivery: the same evt_… may arrive more than once,
+ * and POST /sales/:id/confirm-payment can race the webhook. This handler MUST be safe
+ * to run twice for the same event.
  *
- * Remember: webhook money events credit the CO-OP Stripe balance. Operator payables
- * are updated only via Sale.operatorAmount on PAID sales + Phase 6 settlement — never
- * by Stripe automatically paying the store operator.
+ * Idempotency: after signature verification we insert ProcessedStripeEvent(id = event.id).
+ * A unique-constraint violation means we already handled that delivery — return 200 and
+ * skip work. finalizePaidSale is also idempotent on PAID, but the event log makes
+ * double-finalize debugging possible for ops.
+ *
+ * Money still settles to the CO-OP Stripe account; operator payables stay on /settlement.
  */
+import { Prisma } from "@prisma/client";
 import type { Request, Response } from "express";
 import type Stripe from "stripe";
 import { AppError } from "../lib/errors.js";
-import { constructStripeEvent } from "../lib/stripe.js";
 import { prisma } from "../lib/prisma.js";
+import { constructStripeEvent } from "../lib/stripe.js";
 import * as salesService from "../services/sales.service.js";
 
 async function saleIdFromEvent(event: Stripe.Event): Promise<string | null> {
@@ -53,6 +58,31 @@ async function saleIdFromEvent(event: Stripe.Event): Promise<string | null> {
   return null;
 }
 
+/**
+ * Claims this Stripe event id for processing. Returns false if already processed
+ * (unique violation on ProcessedStripeEvent.id).
+ */
+async function claimStripeEvent(
+  event: Stripe.Event,
+  saleId: string | null,
+): Promise<boolean> {
+  try {
+    await prisma.processedStripeEvent.create({
+      data: {
+        id: event.id,
+        type: event.type,
+        saleId,
+      },
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export async function stripeWebhookHandler(req: Request, res: Response): Promise<void> {
   const signature = req.headers["stripe-signature"];
   if (!signature || typeof signature !== "string") {
@@ -74,33 +104,38 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
     return;
   }
 
+  // Resolve sale early so the idempotency row records saleId for audit.
+  const saleId = await saleIdFromEvent(event);
+
+  const claimed = await claimStripeEvent(event, saleId);
+  if (!claimed) {
+    // Duplicate delivery (Stripe retry) or prior successful claim — do not reprocess.
+    res.status(200).json({ received: true, duplicate: true });
+    return;
+  }
+
   try {
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
-        if (session.payment_status === "paid") {
-          const saleId = await saleIdFromEvent(event);
-          if (saleId) {
-            if (typeof session.payment_intent === "string") {
-              await prisma.sale.updateMany({
-                where: { id: saleId, stripePaymentIntentId: null },
-                data: { stripePaymentIntentId: session.payment_intent },
-              });
-            }
-            await salesService.finalizePaidSale(saleId);
+        if (session.payment_status === "paid" && saleId) {
+          if (typeof session.payment_intent === "string") {
+            await prisma.sale.updateMany({
+              where: { id: saleId, stripePaymentIntentId: null },
+              data: { stripePaymentIntentId: session.payment_intent },
+            });
           }
+          await salesService.finalizePaidSale(saleId);
         }
         break;
       }
       case "payment_intent.succeeded": {
-        const saleId = await saleIdFromEvent(event);
         if (saleId) {
           await salesService.finalizePaidSale(saleId);
         }
         break;
       }
       case "payment_intent.payment_failed": {
-        const saleId = await saleIdFromEvent(event);
         if (saleId) {
           await salesService.markSalePaymentFailed(saleId);
         }
@@ -112,10 +147,22 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
 
     res.status(200).json({ received: true });
   } catch (error) {
+    // Allow Stripe to retry: drop the claim so the next delivery can reprocess.
+    await prisma.processedStripeEvent.delete({ where: { id: event.id } }).catch(() => undefined);
+
     if (error instanceof AppError) {
       console.error("Stripe webhook business error", error.message, error.details);
-      // Acknowledge to avoid infinite retries on permanent 409s; ops can reconcile.
-      res.status(200).json({ received: true, warning: error.message });
+      // Permanent business conflicts (already PAID, etc.) — acknowledge to stop retries.
+      if (error.status === 409) {
+        await prisma.processedStripeEvent
+          .create({
+            data: { id: event.id, type: event.type, saleId },
+          })
+          .catch(() => undefined);
+        res.status(200).json({ received: true, warning: error.message });
+        return;
+      }
+      res.status(500).json({ error: error.message });
       return;
     }
     console.error("Stripe webhook handler failed", error);

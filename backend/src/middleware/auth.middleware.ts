@@ -1,7 +1,7 @@
 /**
  * JWT authentication middleware for Harvestlink.
  *
- * Verifies the Bearer token and attaches { id, storeId, role } to the request.
+ * Verifies the Bearer token and attaches { id, storeId, role, mustChangePassword }.
  * This gate protects every authenticated route so handlers can trust the caller's identity:
  * for example a CASHIER can only create sales for their own store (using req.user.storeId),
  * while settlement and cross-store reporting stay behind COOP_ADMIN role checks that use
@@ -17,6 +17,7 @@ type JwtPayload = {
   sub: string;
   storeId: string | null;
   role: Role;
+  mustChangePassword?: boolean;
 };
 
 export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -46,6 +47,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
       id: decoded.sub,
       storeId: decoded.storeId ?? null,
       role: decoded.role,
+      mustChangePassword: Boolean(decoded.mustChangePassword),
     };
 
     req.user = user;

@@ -24,18 +24,23 @@ enum MemberTier {
   EXECUTIVE
 }
 
-/// Stripe / card payment lifecycle for a Sale. Stock is only decremented once status becomes PAID.
+/// Stripe / card payment lifecycle for a Sale. Physical stock decrements only when PAID.
+/// EXPIRED = abandoned PENDING past reservationExpiresAt (reservation released by cleanup job).
+/// REFUNDING = DB claimed a refund before Stripe; finalize to REFUNDED/PAID or reconcile if stuck.
 enum PaymentStatus {
   PENDING
   PAID
   FAILED
   REFUNDED
+  EXPIRED
+  REFUNDING
 }
 
-/// How the customer pays: Terminal = in-store card-present; Checkout = hosted card-not-present.
+/// How the customer pays: Terminal / Checkout = card via Stripe; CASH skips Stripe and finalizes immediately.
 enum PaymentMethod {
   TERMINAL
   CHECKOUT
+  CASH
 }
 
 /// A physical retail location in the co-op network, including the operator commission rate for that store.
@@ -47,7 +52,16 @@ model Store {
   /// Street / mailing address of the store for records and logistics.
   address         String
   /// Fixed percentage of store sales the operator earns (snapshotted onto each Sale so history stays stable).
+  /// Applied to PRE-TAX subtotal only — sales tax is remitted to the state, not co-op revenue.
   operatorPercent Decimal  @db.Decimal(5, 2)
+  /// Sales-tax rate (%) applied to non-exempt line items at this store.
+  taxRate         Decimal  @default(0) @db.Decimal(5, 2)
+  /// Member tier discount percentages (%) off pre-tax line gross (configurable per store).
+  tierDiscountStandard  Decimal @default(0) @db.Decimal(5, 2)
+  tierDiscountPlus      Decimal @default(5) @db.Decimal(5, 2)
+  tierDiscountExecutive Decimal @default(10) @db.Decimal(5, 2)
+  /// Printed on receipts (returns / exchanges policy).
+  refundPolicy    String   @default("Returns accepted within 14 days with receipt. Refunds to original form of payment.")
   /// When this store record was created in the system.
   createdAt       DateTime @default(now())
   /// Whether the store is currently operating; inactive stores should not take new sales.
@@ -63,6 +77,10 @@ model Store {
   payouts Payout[]
   /// Manual stock adjustments recorded for products at this store.
   stockAdjustments StockAdjustment[]
+  /// Cash drawer shifts for this store.
+  cashDrawers CashDrawer[]
+  /// Offline / sync stock conflicts awaiting human review.
+  stockReconciliations StockReconciliation[]
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -77,6 +95,12 @@ model User {
   passwordHash String
   /// Authorization role determining accessible features and APIs.
   role         Role
+  /// Consecutive failed login attempts; reset on successful login.
+  failedLoginAttempts Int @default(0)
+  /// When set and in the future, login is rejected until this timestamp.
+  lockedUntil  DateTime?
+  /// Seeded / provisional accounts must change password before using the API.
+  mustChangePassword Boolean @default(false)
   /// When this user account was created.
   createdAt    DateTime @default(now())
 
@@ -88,6 +112,10 @@ model User {
   payoutsPaid     Payout[] @relation("PayoutPaidBy")
   /// Manual inventory adjustments this user recorded (shrinkage, recounts, etc.).
   stockAdjustments StockAdjustment[] @relation("StockAdjustedBy")
+  /// Cash drawers this user opened.
+  drawersOpened CashDrawer[] @relation("DrawerOpenedBy")
+  /// Cash drawers this user closed.
+  drawersClosed CashDrawer[] @relation("DrawerClosedBy")
 
   @@index([storeId])
 }
@@ -108,10 +136,18 @@ model Product {
   price     Decimal  @db.Decimal(12, 2)
   /// Unit cost to the co-op / store, used for margin analysis.
   cost      Decimal  @db.Decimal(12, 2)
-  /// Units currently on hand at this store.
+  /// Units physically on hand at this store (shelf / backroom count).
+  /// Do NOT treat this alone as sellable qty while unpaid PENDING sales exist.
   stock     Int
-  /// Stock level at which a reorder should be triggered.
+  /// Units spoken for by unpaid PENDING sales (explicit reservation).
+  /// Available to sell = stock - reserved. FOR UPDATE + reserved must stay — do not
+  /// "simplify" back to checking only `stock` at createSale then decrementing later:
+  /// that race lets two cashiers charge cards for the last unit (see sales.service).
+  reserved  Int      @default(0)
+  /// Stock level at which a reorder should be triggered (compared to available stock).
   reorderAt Int
+  /// When true, this SKU is sales-tax exempt (common for groceries).
+  taxExempt Boolean  @default(false)
   /// When this product was first added to the catalog.
   createdAt DateTime @default(now())
   /// When price, stock, or other product fields were last updated.
@@ -123,6 +159,8 @@ model Product {
   saleItems SaleItem[]
   /// Audit trail of non-sale stock changes for this product.
   stockAdjustments StockAdjustment[]
+  /// Offline sync conflicts that drove this product's stock negative.
+  stockReconciliations StockReconciliation[]
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
@@ -203,29 +241,50 @@ model Sale {
   cashierId       String
   /// Optional member attached to the sale when a member number was provided.
   memberId        String?
-  /// Sum of line items before any order-level adjustments (stored for audit).
+  /// Sum of line nets after discounts, BEFORE sales tax.
+  /// Operator share is computed from this field — never from post-tax total.
   subtotal        Decimal  @db.Decimal(12, 2)
-  /// Final amount charged / settled for this sale.
+  /// Total discounts applied (member tier + manual line discounts).
+  discountAmount  Decimal  @default(0) @db.Decimal(12, 2)
+  /// Sales tax charged on non-exempt lines (remitted to the state — not operator revenue).
+  taxAmount       Decimal  @default(0) @db.Decimal(12, 2)
+  /// Amount charged to the customer: subtotal + taxAmount.
   total           Decimal  @db.Decimal(12, 2)
   /// Snapshot of the store's operatorPercent at sale time — never recalculate historical sales from later store settings.
   operatorPercent Decimal  @db.Decimal(5, 2)
-  /// Operator's earned share for this sale (derived from total × operatorPercent snapshot).
+  /// Operator's earned share = PRE-TAX subtotal × operatorPercent.
+  /// Tax is excluded because it is remitted to the state and is not store revenue.
   /// Internal ledger only — not a Stripe transfer to the operator.
   operatorAmount  Decimal  @db.Decimal(12, 2)
-  /// Portion of the sale attributable to the co-op after operator accrual (full card capture still goes to co-op Stripe).
+  /// Co-op share of pre-tax subtotal after operator accrual (subtotal − operatorAmount).
   coopAmount      Decimal  @db.Decimal(12, 2)
-  /// Card payment lifecycle; inventory decrements only when PAID (never while PENDING).
+  /// Card payment lifecycle; physical stock decrements only when PAID.
+  /// PENDING sales hold Product.reserved until paid, failed, refunded-from-pending, or expired.
+  /// CASH sales are created already PAID (no Stripe, no reservation hold).
   paymentStatus   PaymentStatus @default(PENDING)
-  /// Stripe channel used for this sale (Terminal reader vs Checkout Session).
+  /// Payment channel: TERMINAL / CHECKOUT (Stripe) or CASH (drawer).
   paymentMethod   PaymentMethod?
+  /// Last 4 digits of card when paid via Stripe (null for cash).
+  cardLast4       String?
   /// Stripe PaymentIntent id (Terminal and often Checkout's underlying intent).
   stripePaymentIntentId String? @unique
   /// Stripe Checkout Session id when paymentMethod = CHECKOUT.
   stripeCheckoutSessionId String? @unique
-  /// When Stripe reported successful payment and stock was finalized.
+  /// Cumulative customer $ refunded via Stripe (full or partial).
+  refundedAmount Decimal @default(0) @db.Decimal(12, 2)
+  /// Cumulative operator share clawed back so settlement does not overpay on refunds.
+  refundedOperatorAmount Decimal @default(0) @db.Decimal(12, 2)
+  /// In-flight SaleRefund id while paymentStatus = REFUNDING (for reconciliation).
+  pendingRefundId String?
+  /// When Stripe reported successful payment and stock was finalized (or cash taken).
   paidAt          DateTime?
-  /// When the sale was refunded (stock restored, status REFUNDED).
+  /// When the sale was fully refunded (all line qty returned).
   refundedAt      DateTime?
+  /// When the PENDING stock reservation expires if payment never completes (cleanup job).
+  reservationExpiresAt DateTime?
+  /// Client-generated key for offline / retry-safe checkout. Unique globally so a
+  /// replayed POST /sales never creates a second Sale (double stock decrement / charge).
+  idempotencyKey String? @unique
   /// When the sale record was created (may be PENDING before payment).
   createdAt       DateTime @default(now())
 
@@ -237,12 +296,18 @@ model Sale {
   member   Member?    @relation(fields: [memberId], references: [id])
   /// Line items that make up this sale.
   items    SaleItem[]
+  /// Refund attempts (including in-flight REFUNDING rows).
+  refunds  SaleRefund[]
+  /// Stock conflicts created when this (typically offline) sale drove inventory negative.
+  stockReconciliations StockReconciliation[]
 
   /// Speeds store sales reporting and settlement queries.
   @@index([storeId])
   @@index([cashierId])
   @@index([memberId])
   @@index([paymentStatus])
+  /// Cleanup job finds expired PENDING reservations via this index.
+  @@index([reservationExpiresAt])
 }
 
 /// A single line on a sale; product name/price/SKU are snapshotted so history stays accurate after catalog changes.
@@ -261,14 +326,99 @@ model SaleItem {
   priceSnapshot Decimal @db.Decimal(12, 2)
   /// Quantity of units sold on this line.
   quantity      Int
+  /// Discount dollars applied to this line (tier + manual), before tax.
+  discountAmount Decimal @default(0) @db.Decimal(12, 2)
+  /// Optional reason when a STORE_ADMIN applied a manual line discount.
+  discountReason String?
+  /// Sales tax for this line (0 when taxExempt at sale time).
+  taxAmount     Decimal @default(0) @db.Decimal(12, 2)
+  /// Whether this line was tax-exempt when sold (snapshot).
+  taxExempt     Boolean @default(false)
+  /// Units already refunded on this line (partial refunds accumulate here).
+  refundedQuantity Int @default(0)
 
   /// Parent sale transaction.
   sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
   /// Catalog product referenced by this line.
   product Product @relation(fields: [productId], references: [id])
+  /// Refund line allocations against this item.
+  refundLines SaleRefundLine[]
 
   @@index([saleId])
   @@index([productId])
+}
+
+/// Status of a SaleRefund attempt (DB-first refund protocol).
+enum SaleRefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+/// A refund attempt against a Sale — claimed in DB before Stripe.refunds.create.
+model SaleRefund {
+  /// Primary key for this refund attempt.
+  id              String          @id @default(cuid())
+  /// Parent sale being refunded.
+  saleId          String
+  /// Customer-facing refund amount (cents settle via Stripe).
+  amount          Decimal         @db.Decimal(12, 2)
+  /// Operator share clawed back for settlement (proportional to refunded lines).
+  operatorAmount  Decimal         @db.Decimal(12, 2)
+  /// When true, restock sellable inventory; when false, record a write-off instead.
+  restock         Boolean         @default(true)
+  /// Lifecycle of this attempt (PENDING while Stripe call in flight).
+  status          SaleRefundStatus @default(PENDING)
+  /// Stripe refund id once created (reconciliation key).
+  stripeRefundId  String?         @unique
+  /// Who initiated the refund.
+  createdByUserId String?
+  /// When the attempt was created (sale moved to REFUNDING).
+  createdAt       DateTime        @default(now())
+  /// When the attempt reached SUCCEEDED or FAILED.
+  completedAt     DateTime?
+
+  sale  Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  lines SaleRefundLine[]
+  writeOffs InventoryWriteOff[]
+
+  @@index([saleId])
+  @@index([status])
+}
+
+/// Line-level allocation within a SaleRefund (supports partial item refunds).
+model SaleRefundLine {
+  id          String @id @default(cuid())
+  saleRefundId String
+  saleItemId  String
+  /// Units of this SaleItem included in the refund.
+  quantity    Int
+
+  saleRefund SaleRefund @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
+  saleItem   SaleItem   @relation(fields: [saleItemId], references: [id])
+
+  @@index([saleRefundId])
+  @@index([saleItemId])
+}
+
+/// Audit row when a refund does not restock (damaged / discarded goods).
+/// Physical Product.stock is left unchanged; this records why units did not return to sellable.
+model InventoryWriteOff {
+  id           String   @id @default(cuid())
+  storeId      String
+  productId    String
+  saleId       String
+  saleItemId   String
+  saleRefundId String
+  quantity     Int
+  reason       String
+  createdAt    DateTime @default(now())
+
+  saleRefund SaleRefund @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
+
+  @@index([storeId])
+  @@index([productId])
+  @@index([saleRefundId])
 }
 
 /// A record of money actually paid from the co-op account to a store operator.
@@ -294,4 +444,111 @@ model Payout {
   /// Speeds store payout history and operator settlement reports.
   @@index([storeId])
   @@index([paidByUserId])
+}
+
+/// In-store cash drawer shift. Exactly one may be open (closedAt null) per store.
+model CashDrawer {
+  id              String    @id @default(cuid())
+  storeId         String
+  openedByUserId  String
+  closedByUserId  String?
+  /// Cash in the drawer when the shift opened.
+  openingFloat    Decimal   @db.Decimal(12, 2)
+  /// openingFloat + net cash sales during the open window (set at close; 0 while open).
+  expectedCash    Decimal   @default(0) @db.Decimal(12, 2)
+  /// Physical count entered when closing.
+  countedCash     Decimal?  @db.Decimal(12, 2)
+  /// countedCash − expectedCash (set at close).
+  variance        Decimal?  @db.Decimal(12, 2)
+  openedAt        DateTime  @default(now())
+  closedAt        DateTime?
+
+  store    Store @relation(fields: [storeId], references: [id])
+  openedBy User  @relation("DrawerOpenedBy", fields: [openedByUserId], references: [id])
+  closedBy User? @relation("DrawerClosedBy", fields: [closedByUserId], references: [id])
+
+  @@index([storeId])
+  @@index([storeId, closedAt])
+}
+
+/// Offline / sync inventory conflicts awaiting human review.
+///
+/// When a cash sale queued during an outage is replayed and physical stock is already
+/// gone (another till sold it online), we still ACCEPT the sale — the goods left the
+/// store in the cashier's hands. Stock may go negative; this row flags that skew so
+/// ops can recount / adjust rather than silently dropping a real transaction.
+model StockReconciliation {
+  id            String    @id @default(cuid())
+  storeId       String
+  saleId        String
+  productId     String
+  /// Units sold on the conflicting line.
+  quantitySold  Int
+  /// Product.stock immediately before this sale's decrement.
+  stockBefore   Int
+  /// Product.stock after decrement (often negative).
+  stockAfter    Int
+  /// Stable reason code (e.g. OFFLINE_SALE_NEGATIVE_STOCK).
+  reason        String
+  resolvedAt    DateTime?
+  resolvedByUserId String?
+  notes         String?
+  createdAt     DateTime  @default(now())
+
+  store   Store   @relation(fields: [storeId], references: [id])
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([storeId])
+  @@index([storeId, resolvedAt])
+  @@index([saleId])
+  @@index([productId])
+}
+
+/// Idempotency log for Stripe webhook deliveries.
+/// Stripe guarantees at-least-once delivery (retries + confirm-payment races), so each
+/// event id must be processed at most once. Insert-before-handle; duplicate id → skip.
+model ProcessedStripeEvent {
+  /// Stripe event id (evt_…) — primary key enforces uniqueness.
+  id          String   @id
+  /// Event type string (e.g. payment_intent.succeeded) for ops debugging.
+  type        String
+  /// Sale this event was applied to, when resolved.
+  saleId      String?
+  /// When Harvestlink accepted/processed this event.
+  processedAt DateTime @default(now())
+
+  @@index([saleId])
+  @@index([processedAt])
+}
+
+/// Append-only financial / security audit trail.
+/// Application code ONLY inserts. No update/delete endpoints exist — rewriting history
+/// would defeat "who changed this, and when?" for operatorPercent, payouts, refunds, etc.
+/// No FK to User/Store so deleting those rows cannot cascade-erase evidence.
+model AuditLog {
+  id         String   @id @default(cuid())
+  /// Actor who performed the action; null for anonymous failed logins.
+  userId     String?
+  /// Store scope when the action was store-specific.
+  storeId    String?
+  /// Stable action code (e.g. STORE_OPERATOR_PERCENT_CHANGE, LOGIN_FAILURE).
+  action     String
+  /// Entity kind (Store, Product, Payout, Sale, User, Session, …).
+  entityType String
+  /// Primary key of the entity when applicable.
+  entityId   String?
+  /// Snapshot before the change (JSON); omit for creates / login events as needed.
+  before     Json?
+  /// Snapshot after the change (JSON); never store plaintext passwords.
+  after      Json?
+  /// Client IP best-effort (may be proxy-forwarded).
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([storeId])
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([entityType, entityId])
 }

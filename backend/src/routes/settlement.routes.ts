@@ -14,7 +14,9 @@ import { Role } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { AppError } from "../lib/errors.js";
+import { clientIp } from "../lib/audit.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { requirePasswordChanged } from "../middleware/requirePasswordChanged.middleware.js";
 import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as settlementService from "../services/settlement.service.js";
 
@@ -40,6 +42,7 @@ function handleError(res: import("express").Response, error: unknown): void {
 export const settlementRouter = Router();
 
 settlementRouter.use(authMiddleware);
+settlementRouter.use(requirePasswordChanged);
 
 settlementRouter.get(
   "/network-summary",
@@ -81,11 +84,10 @@ settlementRouter.post(
         return;
       }
 
-      const result = await settlementService.createPayout(
-        req.params.storeId,
-        req.user!,
-        parsed.data,
-      );
+      const result = await settlementService.createPayout(req.params.storeId, req.user!, {
+        ...parsed.data,
+        ipAddress: clientIp(req),
+      });
       res.status(201).json(result);
     } catch (error) {
       handleError(res, error);

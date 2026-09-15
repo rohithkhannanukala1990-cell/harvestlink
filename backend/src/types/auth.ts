@@ -9,4 +9,6 @@ export type AuthUser = {
   id: string;
   storeId: string | null;
   role: Role;
+  /** When true, only POST /auth/change-password is allowed until cleared. */
+  mustChangePassword: boolean;
 };

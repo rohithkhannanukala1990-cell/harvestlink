@@ -1,0 +1,67 @@
+# Continuous integration for Harvestlink backend.
+# Runs lint, typecheck, and Vitest money-path tests on every push and pull request.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend lint, typecheck, test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: harvestlink
+          POSTGRES_PASSWORD: harvestlink
+          POSTGRES_DB: harvestlink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U harvestlink -d harvestlink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      NODE_ENV: test
+      JWT_SECRET: ci-jwt-secret-harvestlink-not-for-production
+      STRIPE_SECRET_KEY: sk_test_harvestlink_ci
+      STRIPE_WEBHOOK_SECRET: whsec_test_harvestlink_ci
+      STRIPE_CURRENCY: usd
+      FRONTEND_URL: http://localhost:5173
+      DATABASE_URL_TEST: postgresql://harvestlink:harvestlink@localhost:5432/harvestlink_test?schema=public
+      DATABASE_URL: postgresql://harvestlink:harvestlink@localhost:5432/harvestlink_test?schema=public
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test

@@ -24,6 +24,7 @@ const emptyForm = {
   cost: "",
   stock: "0",
   reorderAt: "5",
+  taxExempt: false,
 };
 
 export function InventoryPage() {
@@ -53,6 +54,7 @@ export function InventoryPage() {
             price: Number(form.price),
             cost: Number(form.cost),
             reorderAt: Number(form.reorderAt),
+            taxExempt: form.taxExempt,
             ...(activeStoreId ? { storeId: activeStoreId } : {}),
           },
         });
@@ -67,6 +69,7 @@ export function InventoryPage() {
           cost: Number(form.cost),
           stock: Number(form.stock),
           reorderAt: Number(form.reorderAt),
+          taxExempt: form.taxExempt,
           ...(activeStoreId ? { storeId: activeStoreId } : {}),
         },
       });
@@ -97,6 +100,7 @@ export function InventoryPage() {
       cost: String(p.cost),
       stock: String(p.stock),
       reorderAt: String(p.reorderAt),
+      taxExempt: Boolean(p.taxExempt),
     });
   }
 
@@ -143,6 +147,14 @@ export function InventoryPage() {
               />
             </label>
           ))}
+          <label className="flex items-end gap-2 text-sm sm:col-span-2">
+            <input
+              type="checkbox"
+              checked={form.taxExempt}
+              onChange={(e) => setForm((f) => ({ ...f, taxExempt: e.target.checked }))}
+            />
+            Tax exempt (e.g. groceries)
+          </label>
           <div className="flex items-end gap-2 sm:col-span-4">
             <button
               type="submit"
@@ -176,6 +188,7 @@ export function InventoryPage() {
               <th className="px-3 py-2">Name</th>
               <th className="px-3 py-2">Category</th>
               <th className="px-3 py-2">Price</th>
+              <th className="px-3 py-2">Tax</th>
               <th className="px-3 py-2">Stock</th>
               <th className="px-3 py-2">Status</th>
               {canEdit && <th className="px-3 py-2">Actions</th>}
@@ -188,7 +201,15 @@ export function InventoryPage() {
                 <td className="px-3 py-2">{p.name}</td>
                 <td className="px-3 py-2">{p.category}</td>
                 <td className="px-3 py-2">{money(p.price)}</td>
-                <td className="px-3 py-2">{p.stock}</td>
+                <td className="px-3 py-2">{p.taxExempt ? "Exempt" : "Taxable"}</td>
+                <td className="px-3 py-2">
+                  {p.available ?? p.stock}
+                  {(p.reserved ?? 0) > 0 ? (
+                    <span className="ml-1 text-xs text-stone-400">
+                      ({p.reserved} reserved)
+                    </span>
+                  ) : null}
+                </td>
                 <td className="px-3 py-2">
                   {p.lowStock ? (
                     <span className="text-amber-700">Low</span>

@@ -23,14 +23,22 @@ function StoreSettingsForm({ store }: { store: Store }) {
   const [name, setName] = useState(store.name);
   const [address, setAddress] = useState(store.address);
   const [operatorPercent, setOperatorPercent] = useState(String(store.operatorPercent));
+  const [taxRate, setTaxRate] = useState(String(store.taxRate ?? 0));
+  const [tierPlus, setTierPlus] = useState(String(store.tierDiscountPlus ?? 5));
+  const [tierExec, setTierExec] = useState(String(store.tierDiscountExecutive ?? 10));
+  const [refundPolicy, setRefundPolicy] = useState(store.refundPolicy ?? "");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const saveMutation = useMutation({
     mutationFn: () => {
-      const body: { name: string; address: string; operatorPercent?: number } = {
+      const body: Record<string, string | number> = {
         name,
         address,
+        taxRate: Number(taxRate),
+        tierDiscountPlus: Number(tierPlus),
+        tierDiscountExecutive: Number(tierExec),
+        refundPolicy,
       };
       if (canEditPercent) {
         body.operatorPercent = Number(operatorPercent);
@@ -92,9 +100,54 @@ function StoreSettingsForm({ store }: { store: Store }) {
         />
         <span className="mt-1 block text-xs text-stone-500">
           {canEditPercent
-            ? "COOP_ADMIN only. Changing this does not recalculate past sales — each sale already snapshotted its operatorPercent."
+            ? "COOP_ADMIN only. Changing this does not recalculate past sales — each sale already snapshotted its operatorPercent. Operator % applies to PRE-TAX subtotal only."
             : "Only COOP_ADMIN can change the operator commission rate."}
         </span>
+      </label>
+      <label className="block text-sm">
+        Tax rate (%)
+        <input
+          type="number"
+          min={0}
+          max={100}
+          step="0.01"
+          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          value={taxRate}
+          onChange={(e) => setTaxRate(e.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        PLUS tier discount (%)
+        <input
+          type="number"
+          min={0}
+          max={100}
+          step="0.01"
+          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          value={tierPlus}
+          onChange={(e) => setTierPlus(e.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        EXECUTIVE tier discount (%)
+        <input
+          type="number"
+          min={0}
+          max={100}
+          step="0.01"
+          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          value={tierExec}
+          onChange={(e) => setTierExec(e.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Receipt refund policy
+        <textarea
+          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          rows={3}
+          value={refundPolicy}
+          onChange={(e) => setRefundPolicy(e.target.value)}
+        />
       </label>
       <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
         Save

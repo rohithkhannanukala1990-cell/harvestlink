@@ -10,7 +10,9 @@ import { Role } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { AppError } from "../lib/errors.js";
+import { clientIp } from "../lib/audit.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { requirePasswordChanged } from "../middleware/requirePasswordChanged.middleware.js";
 import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as inventoryService from "../services/inventory.service.js";
 
@@ -22,6 +24,7 @@ const createProductSchema = z.object({
   cost: z.number().nonnegative(),
   stock: z.number().int().nonnegative(),
   reorderAt: z.number().int().nonnegative(),
+  taxExempt: z.boolean().optional(),
   storeId: z.string().min(1).optional(),
 });
 
@@ -33,6 +36,7 @@ const updateProductSchema = z
     price: z.number().nonnegative().optional(),
     cost: z.number().nonnegative().optional(),
     reorderAt: z.number().int().nonnegative().optional(),
+    taxExempt: z.boolean().optional(),
     storeId: z.string().min(1).optional(),
   })
   .refine((body) => Object.keys(body).some((key) => key !== "storeId" && body[key as keyof typeof body] !== undefined), {
@@ -57,6 +61,7 @@ function handleError(res: import("express").Response, error: unknown): void {
 export const inventoryRouter = Router();
 
 inventoryRouter.use(authMiddleware);
+inventoryRouter.use(requirePasswordChanged);
 
 inventoryRouter.get("/", async (req, res) => {
   try {
@@ -137,7 +142,10 @@ inventoryRouter.patch(
         req.user!,
         bodyStoreId ?? (typeof req.query.storeId === "string" ? req.query.storeId : undefined),
       );
-      const result = await inventoryService.adjustStock(req.params.id, storeId, req.user!, input);
+      const result = await inventoryService.adjustStock(req.params.id, storeId, req.user!, {
+        ...input,
+        ipAddress: clientIp(req),
+      });
       res.status(200).json(result);
     } catch (error) {
       handleError(res, error);

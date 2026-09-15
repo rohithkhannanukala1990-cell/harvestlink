@@ -41,11 +41,22 @@ export function AppLayout() {
                 Network
               </NavLink>
             )}
+            {isRole("COOP_ADMIN") && (
+              <NavLink to="/audit" className={linkClass}>
+                Audit
+              </NavLink>
+            )}
             <NavLink to="/" end className={linkClass}>
               Dashboard
             </NavLink>
             <NavLink to="/pos" className={linkClass}>
               POS
+            </NavLink>
+            <NavLink to="/sales" className={linkClass}>
+              Sales
+            </NavLink>
+            <NavLink to="/drawer" className={linkClass}>
+              Drawer
             </NavLink>
             <NavLink to="/inventory" className={linkClass}>
               Inventory
@@ -56,6 +67,11 @@ export function AppLayout() {
             {isRole("STORE_ADMIN", "COOP_ADMIN") && (
               <NavLink to="/settlement" className={linkClass}>
                 Settlement
+              </NavLink>
+            )}
+            {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+              <NavLink to="/daily-close" className={linkClass}>
+                Daily close
               </NavLink>
             )}
             {isRole("STORE_ADMIN", "COOP_ADMIN") && (

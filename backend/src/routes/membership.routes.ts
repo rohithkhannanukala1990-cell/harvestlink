@@ -13,6 +13,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { AppError } from "../lib/errors.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { requirePasswordChanged } from "../middleware/requirePasswordChanged.middleware.js";
 import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as membershipService from "../services/membership.service.js";
 
@@ -68,6 +69,7 @@ function handleError(res: import("express").Response, error: unknown): void {
 export const membershipRouter = Router();
 
 membershipRouter.use(authMiddleware);
+membershipRouter.use(requirePasswordChanged);
 
 membershipRouter.get(
   "/",

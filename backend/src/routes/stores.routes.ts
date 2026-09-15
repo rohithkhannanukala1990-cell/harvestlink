@@ -14,7 +14,9 @@ import { Role } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { AppError } from "../lib/errors.js";
+import { clientIp } from "../lib/audit.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
+import { requirePasswordChanged } from "../middleware/requirePasswordChanged.middleware.js";
 import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as storesService from "../services/stores.service.js";
 
@@ -23,6 +25,11 @@ const updateStoreSchema = z
     name: z.string().min(1).optional(),
     address: z.string().min(1).optional(),
     operatorPercent: z.number().min(0).max(100).optional(),
+    taxRate: z.number().min(0).max(100).optional(),
+    tierDiscountStandard: z.number().min(0).max(100).optional(),
+    tierDiscountPlus: z.number().min(0).max(100).optional(),
+    tierDiscountExecutive: z.number().min(0).max(100).optional(),
+    refundPolicy: z.string().min(1).optional(),
     isActive: z.boolean().optional(),
   })
   .refine((body) => Object.values(body).some((v) => v !== undefined), {
@@ -41,6 +48,7 @@ function handleError(res: import("express").Response, error: unknown): void {
 export const storesRouter = Router();
 
 storesRouter.use(authMiddleware);
+storesRouter.use(requirePasswordChanged);
 
 storesRouter.get("/", requireRole(Role.CASHIER, Role.STORE_ADMIN, Role.COOP_ADMIN), async (req, res) => {
   try {
@@ -76,7 +84,10 @@ storesRouter.patch(
         res.status(400).json({ error: "Invalid store update", details: parsed.error.flatten() });
         return;
       }
-      const store = await storesService.updateStore(req.params.id, req.user!, parsed.data);
+      const store = await storesService.updateStore(req.params.id, req.user!, {
+        ...parsed.data,
+        ipAddress: clientIp(req),
+      });
       res.status(200).json({ store });
     } catch (error) {
       handleError(res, error);

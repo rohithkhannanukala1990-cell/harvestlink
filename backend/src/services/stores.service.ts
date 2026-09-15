@@ -9,7 +9,8 @@
  * are far easier to debug when there is only ever one store under test. Multi-store
  * overview builds on that once POS / inventory / settlement are trustworthy per store.
  */
-import { PaymentStatus, Prisma, Role, type Store } from "@prisma/client";
+import { Prisma, Role, type Store } from "@prisma/client";
+import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
@@ -19,16 +20,23 @@ export type UpdateStoreInput = {
   address?: string;
   /** Only COOP_ADMIN may set this — affects future sales only, never historical ones. */
   operatorPercent?: number;
+  taxRate?: number;
+  tierDiscountStandard?: number;
+  tierDiscountPlus?: number;
+  tierDiscountExecutive?: number;
+  refundPolicy?: string;
   isActive?: boolean;
+  /** Client IP for audit log (operatorPercent changes). */
+  ipAddress?: string | null;
 };
 
 export type StoreWithStats = Store & {
-  /** Sum of PAID Sale.total for the store since UTC midnight. */
+  /** Sum of net PAID sales (total − refundedAmount) for the store since UTC midnight. */
   todaysSales: string;
-  /** Count of products where stock <= reorderAt. */
+  /** Count of products where available (stock - reserved) <= reorderAt. */
   stockAlertCount: number;
-  /** operatorAccrued − totalPaidOut from the settlement ledger (PAID sales only). */
-  currentlyOwed: string;
+  /** Net operatorAccrued − totalPaidOut (refunds claw back operator share). Omitted for CASHIER. */
+  currentlyOwed?: string;
 };
 
 export function assertStoreAccess(actor: AuthUser, storeId: string): void {
@@ -59,36 +67,38 @@ async function statsForStore(store: Store): Promise<StoreWithStats> {
   const { from, to } = utcDayBounds();
 
   const [todaysSalesAgg, alertRows, operatorAccruedAgg, payoutsAgg] = await Promise.all([
-    prisma.sale.aggregate({
-      where: {
-        storeId: store.id,
-        paymentStatus: PaymentStatus.PAID,
-        createdAt: { gte: from, lte: to },
-      },
-      _sum: { total: true },
-    }),
+    prisma.$queryRaw<Array<{ gross: Prisma.Decimal }>>`
+      SELECT COALESCE(SUM(total - "refundedAmount"), 0) AS gross
+      FROM "Sale"
+      WHERE "storeId" = ${store.id}
+        AND "paymentStatus"::text IN ('PAID', 'REFUNDING', 'REFUNDED')
+        AND "createdAt" >= ${from}
+        AND "createdAt" <= ${to}
+    `,
     prisma.$queryRaw<Array<{ count: bigint }>>`
       SELECT COUNT(*)::bigint AS count
       FROM "Product"
       WHERE "storeId" = ${store.id}
-        AND stock <= "reorderAt"
+        AND (stock - reserved) <= "reorderAt"
     `,
-    prisma.sale.aggregate({
-      where: { storeId: store.id, paymentStatus: PaymentStatus.PAID },
-      _sum: { operatorAmount: true },
-    }),
+    prisma.$queryRaw<Array<{ accrued: Prisma.Decimal }>>`
+      SELECT COALESCE(SUM("operatorAmount" - "refundedOperatorAmount"), 0) AS accrued
+      FROM "Sale"
+      WHERE "storeId" = ${store.id}
+        AND "paymentStatus"::text IN ('PAID', 'REFUNDING', 'REFUNDED')
+    `,
     prisma.payout.aggregate({
       where: { storeId: store.id },
       _sum: { amount: true },
     }),
   ]);
 
-  const accrued = new Prisma.Decimal(operatorAccruedAgg._sum.operatorAmount ?? 0);
+  const accrued = new Prisma.Decimal(operatorAccruedAgg[0]?.accrued ?? 0);
   const paidOut = new Prisma.Decimal(payoutsAgg._sum.amount ?? 0);
 
   return {
     ...store,
-    todaysSales: moneyString(new Prisma.Decimal(todaysSalesAgg._sum.total ?? 0)),
+    todaysSales: moneyString(new Prisma.Decimal(todaysSalesAgg[0]?.gross ?? 0)),
     stockAlertCount: Number(alertRows[0]?.count ?? 0),
     currentlyOwed: moneyString(accrued.sub(paidOut)),
   };
@@ -97,6 +107,7 @@ async function statsForStore(store: Store): Promise<StoreWithStats> {
 /**
  * Lists stores the caller may see, each with basic network stats.
  * COOP_ADMIN gets every store — used by Network Overview and the Switch store control.
+ * CASHIER responses omit currentlyOwed (settlement payable is admin-only).
  */
 export async function listStores(actor: AuthUser): Promise<StoreWithStats[]> {
   let stores: Store[];
@@ -111,7 +122,17 @@ export async function listStores(actor: AuthUser): Promise<StoreWithStats[]> {
     stores = store ? [store] : [];
   }
 
-  return Promise.all(stores.map((store) => statsForStore(store)));
+  const withStats = await Promise.all(stores.map((store) => statsForStore(store)));
+
+  if (actor.role === Role.CASHIER) {
+    return withStats.map((row) => {
+      const rest = { ...row };
+      delete rest.currentlyOwed;
+      return rest;
+    });
+  }
+
+  return withStats;
 }
 
 export async function getStore(storeId: string): Promise<Store> {
@@ -127,7 +148,7 @@ export async function updateStore(
   actor: AuthUser,
   input: UpdateStoreInput,
 ): Promise<Store> {
-  await getStore(storeId);
+  const existing = await getStore(storeId);
 
   if (input.operatorPercent !== undefined && actor.role !== Role.COOP_ADMIN) {
     throw new AppError(
@@ -142,15 +163,56 @@ export async function updateStore(
     }
   }
 
-  return prisma.store.update({
+  for (const [key, value] of [
+    ["taxRate", input.taxRate],
+    ["tierDiscountStandard", input.tierDiscountStandard],
+    ["tierDiscountPlus", input.tierDiscountPlus],
+    ["tierDiscountExecutive", input.tierDiscountExecutive],
+  ] as const) {
+    if (value !== undefined && (value < 0 || value > 100)) {
+      throw new AppError(400, `${key} must be between 0 and 100`);
+    }
+  }
+
+  const updated = await prisma.store.update({
     where: { id: storeId },
     data: {
       ...(input.name !== undefined ? { name: input.name } : {}),
       ...(input.address !== undefined ? { address: input.address } : {}),
       ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
+      ...(input.refundPolicy !== undefined ? { refundPolicy: input.refundPolicy } : {}),
       ...(input.operatorPercent !== undefined
         ? { operatorPercent: new Prisma.Decimal(input.operatorPercent) }
         : {}),
+      ...(input.taxRate !== undefined ? { taxRate: new Prisma.Decimal(input.taxRate) } : {}),
+      ...(input.tierDiscountStandard !== undefined
+        ? { tierDiscountStandard: new Prisma.Decimal(input.tierDiscountStandard) }
+        : {}),
+      ...(input.tierDiscountPlus !== undefined
+        ? { tierDiscountPlus: new Prisma.Decimal(input.tierDiscountPlus) }
+        : {}),
+      ...(input.tierDiscountExecutive !== undefined
+        ? { tierDiscountExecutive: new Prisma.Decimal(input.tierDiscountExecutive) }
+        : {}),
     },
   });
+
+  // Critical money control: operator earnings rate — always audit when it changes.
+  if (
+    input.operatorPercent !== undefined &&
+    !existing.operatorPercent.equals(updated.operatorPercent)
+  ) {
+    await writeAuditLog({
+      userId: actor.id,
+      storeId,
+      action: AuditAction.STORE_OPERATOR_PERCENT_CHANGE,
+      entityType: "Store",
+      entityId: storeId,
+      before: { operatorPercent: existing.operatorPercent.toFixed(2) },
+      after: { operatorPercent: updated.operatorPercent.toFixed(2) },
+      ipAddress: input.ipAddress ?? null,
+    });
+  }
+
+  return updated;
 }
