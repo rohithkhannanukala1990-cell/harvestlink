@@ -1,8 +1,9 @@
 /**
  * Membership HTTP routes — co-op owners (equity), not subscription tiers.
  *
- * Capital contribution endpoints live here intentionally so equity money never
+ * Capital investment endpoints live here intentionally so equity money never
  * enters /sales or /settlement. POS lookup checks status=ACTIVE (no expiry).
+ * Joining fees (MembershipFee) are separate from CapitalInvestment and confer no votes.
  */
 import {
   DividendAllocationMethod,
@@ -23,10 +24,11 @@ const createMemberSchema = z.object({
   email: z.string().email(),
   phone: z.string().optional(),
   mailingAddress: z.string().optional(),
-  membershipClassId: z.string().min(1),
   taxIdLast4: z.string().min(4).max(11).optional(),
   householdPrimaryMemberId: z.string().nullable().optional(),
   activate: z.boolean().optional(),
+  /** Optional one-time joining fee amount (MembershipFee — confers NO votes). */
+  joiningFeeAmount: z.number().positive().optional(),
 });
 
 const updateMemberSchema = z
@@ -35,7 +37,6 @@ const updateMemberSchema = z
     email: z.string().email().optional(),
     phone: z.string().optional(),
     mailingAddress: z.string().optional(),
-    membershipClassId: z.string().min(1).optional(),
     taxIdLast4: z.string().min(4).max(11).nullable().optional(),
     householdPrimaryMemberId: z.string().nullable().optional(),
     isEligibleToVote: z.boolean().optional(),
@@ -66,51 +67,39 @@ function handleError(res: import("express").Response, error: unknown): void {
   res.status(500).json({ error: "Internal server error" });
 }
 
+/** Prefer renamed service APIs when present; fall back while membership.service migrates. */
+const svc = membershipService as typeof membershipService & {
+  recordCapitalInvestment?: typeof membershipService.recordCapitalContribution;
+  refundCapitalInvestment?: typeof membershipService.refundCapitalContribution;
+  markInvestmentConfirmed?: typeof membershipService.markContributionPaid;
+};
+
 export const membershipRouter = Router();
 
 membershipRouter.use(authMiddleware);
 membershipRouter.use(requirePasswordChanged);
 
-// ── Classes ──
+// ── Classes (removed — MembershipClass no longer exists) ──
 
 membershipRouter.get(
   "/classes",
   requireRole(Role.CASHIER, Role.STORE_ADMIN, Role.COOP_ADMIN),
-  async (req, res) => {
-    try {
-      const classes = await membershipService.listMembershipClasses(req.query.active === "true");
-      res.status(200).json({ classes });
-    } catch (error) {
-      handleError(res, error);
-    }
+  (_req, res) => {
+    res.status(410).json({
+      error: "Membership classes have been removed",
+      details: "Use CooperativeSettings.votingThresholdAmount and CapitalInvestment instead",
+    });
   },
 );
 
 membershipRouter.post(
   "/classes",
   requireRole(Role.COOP_ADMIN),
-  async (req, res) => {
-    try {
-      const parsed = z
-        .object({
-          name: z.string().min(1),
-          contributionAmount: z.number().positive(),
-          dividendWeight: z.number().positive().optional(),
-          description: z.string().optional(),
-        })
-        .safeParse(req.body);
-      if (!parsed.success) {
-        res.status(400).json({ error: "Invalid class", details: parsed.error.flatten() });
-        return;
-      }
-      const membershipClass = await membershipService.createMembershipClass(
-        req.user!,
-        parsed.data,
-      );
-      res.status(201).json({ membershipClass });
-    } catch (error) {
-      handleError(res, error);
-    }
+  (_req, res) => {
+    res.status(410).json({
+      error: "Membership classes have been removed",
+      details: "Use CooperativeSettings.votingThresholdAmount and CapitalInvestment instead",
+    });
   },
 );
 
@@ -144,7 +133,11 @@ membershipRouter.post(
         res.status(400).json({ error: "Invalid member payload", details: parsed.error.flatten() });
         return;
       }
-      const member = await membershipService.createMember(req.user!, parsed.data);
+      // Service CreateMemberInput is mid-migration (class removed; joiningFee optional).
+      const member = await membershipService.createMember(
+        req.user!,
+        parsed.data as unknown as Parameters<typeof membershipService.createMember>[1],
+      );
       res.status(201).json({ member });
     } catch (error) {
       handleError(res, error);
@@ -152,7 +145,8 @@ membershipRouter.post(
   },
 );
 
-// ── Equity / board / ballots (static paths before :id) ──
+// ── Equity investments / board / ballots (static paths before :id) ──
+// Paths stay /contributions for compatibility; semantics are CapitalInvestment.
 
 membershipRouter.post(
   "/contributions",
@@ -167,15 +161,17 @@ membershipRouter.post(
         })
         .safeParse(req.body);
       if (!parsed.success) {
-        res.status(400).json({ error: "Invalid contribution", details: parsed.error.flatten() });
+        res.status(400).json({ error: "Invalid investment", details: parsed.error.flatten() });
         return;
       }
-      const contribution = await membershipService.recordCapitalContribution(
+      const record =
+        svc.recordCapitalInvestment ?? membershipService.recordCapitalContribution;
+      const investment = await record(
         parsed.data.memberId,
         parsed.data.amount,
         parsed.data.stripePaymentIntentId,
       );
-      res.status(201).json({ contribution });
+      res.status(201).json({ contribution: investment, investment });
     } catch (error) {
       handleError(res, error);
     }
@@ -187,12 +183,10 @@ membershipRouter.post(
   requireRole(Role.COOP_ADMIN),
   async (req, res) => {
     try {
-      const contribution = await membershipService.markContributionPaid(
-        req.user!,
-        req.params.id!,
-        clientIp(req),
-      );
-      res.status(200).json({ contribution });
+      const mark =
+        svc.markInvestmentConfirmed ?? membershipService.markContributionPaid;
+      const investment = await mark(req.user!, req.params.id!, clientIp(req));
+      res.status(200).json({ contribution: investment, investment });
     } catch (error) {
       handleError(res, error);
     }
@@ -204,12 +198,10 @@ membershipRouter.post(
   requireRole(Role.COOP_ADMIN),
   async (req, res) => {
     try {
-      const contribution = await membershipService.refundCapitalContribution(
-        req.user!,
-        req.params.id!,
-        clientIp(req),
-      );
-      res.status(200).json({ contribution });
+      const refund =
+        svc.refundCapitalInvestment ?? membershipService.refundCapitalContribution;
+      const investment = await refund(req.user!, req.params.id!, clientIp(req));
+      res.status(200).json({ contribution: investment, investment });
     } catch (error) {
       handleError(res, error);
     }

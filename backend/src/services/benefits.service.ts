@@ -3,11 +3,12 @@
  *
  * HARD RULES:
  * 1. Benefits NEVER apply to sales tax (tax is remitted to the state, not discounted).
- * 2. Capital contributions are NOT sales — this service is never called from
- *    membership.service / recordCapitalContribution.
+ * 2. CapitalInvestment payments are NOT sales — this service is never called from
+ *    membership.service / CapitalInvestment flows.
  * 3. All money math uses Prisma.Decimal via moneyDec — no JS floating point.
+ * 4. Benefits are network-wide (MemberBenefit has no membership class filter).
  *
- * Caching: active benefits are cached in-process per membershipClassId with a short TTL.
+ * Caching: active benefits are cached in-process under a single global key with a short TTL.
  * Invalidate on create / soft-end / any write that changes what checkout should see
  * (see invalidateBenefitCache).
  */
@@ -23,30 +24,29 @@ import { moneyDec } from "../lib/money.js";
 /** In-memory cache TTL — short so admin changes appear quickly even if invalidation is missed. */
 const BENEFIT_CACHE_TTL_MS = 30_000;
 
+/** Single cache key — benefits are network-wide, not per class. */
+const GLOBAL_BENEFIT_CACHE_KEY = "all";
+
 type BenefitCacheEntry = {
   expiresAt: number;
   benefits: MemberBenefit[];
 };
 
 /**
- * Active benefits keyed by membershipClassId.
+ * Active benefits cached globally (one entry for the whole network).
  *
  * INVALIDATION STRATEGY:
- * - Call invalidateBenefitCache(membershipClassId) after creating a new benefit version,
- *   setting endsAt on an old row, flipping isActive, or otherwise mutating MemberBenefit
- *   for that class.
- * - Call invalidateBenefitCache() with no args to clear all classes (e.g. bulk import).
+ * - Call invalidateBenefitCache() after creating a new benefit version,
+ *   setting endsAt on an old row, flipping isActive, or otherwise mutating MemberBenefit.
+ * - Optional unused arg is accepted for back-compat with older call sites; always clears
+ *   the global cache.
  * - TTL is a safety net only — writers MUST invalidate; do not rely on expiry alone for
  *   correctness of "what was promised" at the next checkout.
  */
 const activeBenefitsCache = new Map<string, BenefitCacheEntry>();
 
 /** Clears cached active benefits so the next checkout reloads from the DB. */
-export function invalidateBenefitCache(membershipClassId?: string): void {
-  if (membershipClassId) {
-    activeBenefitsCache.delete(membershipClassId);
-    return;
-  }
+export function invalidateBenefitCache(_unused?: string): void {
   activeBenefitsCache.clear();
 }
 
@@ -152,12 +152,8 @@ function periodWindowStart(periodType: BenefitPeriod, now: Date): Date | null {
   }
 }
 
-async function loadActiveBenefits(
-  membershipClassId: string,
-  now: Date,
-  tx: DbClient,
-): Promise<MemberBenefit[]> {
-  const cached = activeBenefitsCache.get(membershipClassId);
+async function loadActiveBenefits(now: Date, tx: DbClient): Promise<MemberBenefit[]> {
+  const cached = activeBenefitsCache.get(GLOBAL_BENEFIT_CACHE_KEY);
   if (cached && cached.expiresAt > Date.now()) {
     // Still filter by window in case TTL spans a startsAt/endsAt boundary.
     return cached.benefits.filter(
@@ -165,10 +161,9 @@ async function loadActiveBenefits(
     );
   }
 
-  // 1) Load ACTIVE benefits for the member's MembershipClass where now ∈ [startsAt, endsAt).
+  // 1) Load ALL ACTIVE network-wide MemberBenefit rows where now ∈ [startsAt, endsAt).
   const benefits = await tx.memberBenefit.findMany({
     where: {
-      membershipClassId,
       isActive: true,
       startsAt: { lte: now },
       OR: [{ endsAt: null }, { endsAt: { gt: now } }],
@@ -176,7 +171,7 @@ async function loadActiveBenefits(
     orderBy: [{ priority: "asc" }, { createdAt: "asc" }],
   });
 
-  activeBenefitsCache.set(membershipClassId, {
+  activeBenefitsCache.set(GLOBAL_BENEFIT_CACHE_KEY, {
     expiresAt: Date.now() + BENEFIT_CACHE_TTL_MS,
     benefits,
   });
@@ -216,18 +211,19 @@ function scopeMatchesLine(
 /**
  * Resolves which member benefits apply to this cart at checkout.
  *
+ * Benefits are network-wide — any ACTIVE member at a store that honors network benefits
+ * may receive them. Never called for CapitalInvestment / membership.service flows.
+ *
  * Returns per-line benefit discounts + applicable benefit ids. Skipped perks always include
  * a cashier-facing reason (caps, min purchase, scope, non-discount types).
  *
  * @param memberId Owner receiving perks (used for usage-cap queries)
- * @param membershipClassId Class whose benefit versions apply
  * @param storeId Checkout store (honorsNetworkBenefits + STORE scope)
  * @param cartLines Pre-tax retail lines only — never tax, never capital
  * @param tx Transaction client from createSale (same FOR UPDATE txn)
  */
 export async function resolveBenefits(
   memberId: string,
-  membershipClassId: string,
   storeId: string,
   cartLines: BenefitCartLine[],
   tx: DbClient,
@@ -250,9 +246,9 @@ export async function resolveBenefits(
     skipped: [],
   });
 
-  // 7) This function only sees grocery cart lines. Capital contributions never call here.
+  // 7) This function only sees grocery cart lines. CapitalInvestment never calls here.
   //    Tax is never part of unitPrice / lineGross — discounts are PRE-TAX only.
-  if (!memberId || !membershipClassId || cartLines.length === 0) {
+  if (!memberId || cartLines.length === 0) {
     return emptyResult();
   }
 
@@ -279,7 +275,7 @@ export async function resolveBenefits(
   }
 
   const now = new Date();
-  const benefits = await loadActiveBenefits(membershipClassId, now, tx);
+  const benefits = await loadActiveBenefits(now, tx);
 
   // Cart gross (pre-tax) for minimumPurchaseAmount checks — never includes tax.
   const cartGross = moneyDec(

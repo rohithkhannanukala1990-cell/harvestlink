@@ -41,14 +41,15 @@ export type Product = {
   updatedAt: string;
 };
 
-export type MembershipClass = {
+/** Co-op-wide settings (singleton). Voting threshold lives here — never hardcoded. */
+export type CooperativeSettings = {
   id: string;
-  name: string;
-  contributionAmount: string | number;
-  votingRights: number;
-  dividendWeight: string | number;
-  isActive: boolean;
-  description: string;
+  votingThresholdAmount: string | number;
+  fiscalYearEnd: string;
+  legalEntityName: string;
+  stateOfIncorporation: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type Member = {
@@ -58,12 +59,14 @@ export type Member = {
   email: string;
   phone?: string;
   mailingAddress?: string;
-  membershipClassId: string;
   status: MemberStatus;
   joinedAt: string;
   approvedAt?: string | null;
   isEligibleToVote?: boolean;
-  membershipClass?: MembershipClass;
+  /** Rollup of CONFIRMED CapitalInvestment amounts only. */
+  totalInvested: string | number;
+  /** True when totalInvested >= CooperativeSettings.votingThresholdAmount. */
+  hasVotingRights: boolean;
   equityAccount?: {
     totalContributed: string | number;
     distributedToDate: string | number;

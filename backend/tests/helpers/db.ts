@@ -26,7 +26,8 @@ export async function truncateAll(): Promise<void> {
       "BoardResolution",
       "MemberBenefitUsage",
       "MemberBenefit",
-      "CapitalContribution",
+      "CapitalInvestment",
+      "MembershipFee",
       "MemberEquityAccount",
       "SaleItem",
       "Sale",
@@ -35,7 +36,7 @@ export async function truncateAll(): Promise<void> {
       "CashDrawer",
       "Product",
       "Member",
-      "MembershipClass",
+      "CooperativeSettings",
       "User",
       "Store"
     RESTART IDENTITY CASCADE

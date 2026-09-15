@@ -92,16 +92,70 @@ describe("membership equity", () => {
     expect(withSale.operatorAccrued).not.toBe("105.00");
   });
 
-  it("sums two contributions for dividend weight but allows exactly one vote", async () => {
-    const member = await createMember({ status: MemberStatus.ACTIVE });
-    await membershipService.recordCapitalContribution(member.id, 100, null);
-    await membershipService.recordCapitalContribution(member.id, 1000, null);
+  it("rejects voting when member only paid the $100 joining fee", async () => {
+    await membershipService.getCooperativeSettings();
+    const admin = await prisma.user.create({
+      data: {
+        email: `coop-vote-${Date.now()}@test.local`,
+        passwordHash: "x",
+        role: "COOP_ADMIN",
+      },
+    });
+    const member = await membershipService.createMember(asAuthUser(admin), {
+      name: "Fee Only",
+      email: `fee-only-${Date.now()}@test.local`,
+      activate: true,
+      joiningFeeAmount: 100,
+    });
+    const fee = await prisma.membershipFee.findFirstOrThrow({
+      where: { memberId: member.id },
+    });
+    await membershipService.confirmMembershipFee(asAuthUser(admin), fee.id);
 
-    const equity = await membershipService.getMemberEquity(member.id);
-    expect(equity.totalContributed.toFixed(2)).toBe("1100.00");
-    expect(equity.contributions).toHaveLength(2);
+    const refreshed = await prisma.member.findUniqueOrThrow({ where: { id: member.id } });
+    expect(refreshed.hasVotingRights).toBe(false);
+    expect(Number(refreshed.totalInvested)).toBe(0);
 
-    // Dividend BY_CAPITAL weight uses total contributed capital.
+    const ballot = await prisma.ballot.create({
+      data: {
+        title: "Fee-only ballot",
+        options: { create: [{ label: "Yes", sortOrder: 0 }] },
+      },
+      include: { options: true },
+    });
+
+    await expect(
+      membershipService.castVote({
+        ballotId: ballot.id,
+        memberId: member.id,
+        ballotOptionId: ballot.options[0]!.id,
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringMatching(/voting rights|threshold/i),
+    });
+  });
+
+  it("$1,000 and $5,000 investors each get exactly ONE vote; dividend weight 1:5", async () => {
+    const investor1k = await createMember({
+      status: MemberStatus.ACTIVE,
+      email: `inv-1k-${Date.now()}@test.local`,
+    });
+    const investor5k = await createMember({
+      status: MemberStatus.ACTIVE,
+      email: `inv-5k-${Date.now()}@test.local`,
+    });
+    await membershipService.recordCapitalInvestment(investor1k.id, 1000);
+    await membershipService.recordCapitalInvestment(investor5k.id, 5000);
+
+    const eq1 = await membershipService.getMemberEquity(investor1k.id);
+    const eq5 = await membershipService.getMemberEquity(investor5k.id);
+    expect(eq1.hasVotingRights).toBe(true);
+    expect(eq5.hasVotingRights).toBe(true);
+    expect(eq1.totalInvested.toFixed(2)).toBe("1000.00");
+    expect(eq5.totalInvested.toFixed(2)).toBe("5000.00");
+
+    // Dividend BY_CAPITAL weight is proportional to totalInvested (1:5).
     const resolution = await prisma.boardResolution.create({
       data: {
         title: "Declare FY dividend",
@@ -112,19 +166,173 @@ describe("membership equity", () => {
     const dividend = await membershipService.declareDividend(
       resolution.id,
       new Date().getUTCFullYear(),
-      110,
+      600,
+      DividendAllocationMethod.BY_CAPITAL,
+    );
+    const allocated = await membershipService.allocateDividend(dividend.id);
+    const a1 = allocated.allocations.find((a) => a.memberId === investor1k.id)!;
+    const a5 = allocated.allocations.find((a) => a.memberId === investor5k.id)!;
+    expect(Number(a1.memberWeight)).toBe(1000);
+    expect(Number(a5.memberWeight)).toBe(5000);
+    expect(a1.amount.toFixed(2)).toBe("100.00");
+    expect(a5.amount.toFixed(2)).toBe("500.00");
+
+    // Each voting member gets exactly ONE vote — capital size never multiplies votes.
+    const ballot = await prisma.ballot.create({
+      data: {
+        title: "Board slate",
+        options: {
+          create: [
+            { label: "Yes", sortOrder: 0 },
+            { label: "No", sortOrder: 1 },
+          ],
+        },
+      },
+      include: { options: true },
+    });
+    const yes = ballot.options[0]!;
+    const no = ballot.options[1]!;
+
+    await membershipService.castVote({
+      ballotId: ballot.id,
+      memberId: investor1k.id,
+      ballotOptionId: yes.id,
+    });
+    await membershipService.castVote({
+      ballotId: ballot.id,
+      memberId: investor5k.id,
+      ballotOptionId: yes.id,
+    });
+
+    await expect(
+      membershipService.castVote({
+        ballotId: ballot.id,
+        memberId: investor1k.id,
+        ballotOptionId: no.id,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining("already voted"),
+    });
+
+    const voteCount = await prisma.memberVote.count({ where: { ballotId: ballot.id } });
+    expect(voteCount).toBe(2);
+  });
+
+  it("an UNCONFIRMED investment does not grant voting rights", async () => {
+    const member = await createMember({ status: MemberStatus.ACTIVE });
+    await membershipService.recordCapitalInvestment(member.id, 5000, { confirm: false });
+
+    const equity = await membershipService.getMemberEquity(member.id);
+    expect(equity.hasVotingRights).toBe(false);
+    expect(equity.totalInvested.toFixed(2)).toBe("0.00");
+    expect(equity.investments).toHaveLength(1);
+    expect(equity.investments[0]!.paymentStatus).toBe("PENDING");
+
+    const ballot = await prisma.ballot.create({
+      data: {
+        title: "Pending capital ballot",
+        options: { create: [{ label: "Yes", sortOrder: 0 }] },
+      },
+      include: { options: true },
+    });
+
+    await expect(
+      membershipService.castVote({
+        ballotId: ballot.id,
+        memberId: member.id,
+        ballotOptionId: ballot.options[0]!.id,
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("lowering votingThresholdAmount re-enfranchises members correctly", async () => {
+    const admin = await prisma.user.create({
+      data: {
+        email: `threshold-admin-${Date.now()}@test.local`,
+        passwordHash: "x",
+        role: "COOP_ADMIN",
+      },
+    });
+    await membershipService.getCooperativeSettings();
+    // Reset threshold to $1000 for this test.
+    await membershipService.updateCooperativeSettings(asAuthUser(admin), {
+      votingThresholdAmount: 1000,
+    });
+
+    const member = await createMember({
+      status: MemberStatus.ACTIVE,
+      email: `threshold-mem-${Date.now()}@test.local`,
+    });
+    await membershipService.recordCapitalInvestment(member.id, 500);
+
+    let refreshed = await prisma.member.findUniqueOrThrow({ where: { id: member.id } });
+    expect(refreshed.hasVotingRights).toBe(false);
+
+    await membershipService.updateCooperativeSettings(asAuthUser(admin), {
+      votingThresholdAmount: 500,
+    });
+
+    refreshed = await prisma.member.findUniqueOrThrow({ where: { id: member.id } });
+    expect(refreshed.hasVotingRights).toBe(true);
+    expect(Number(refreshed.totalInvested)).toBe(500);
+
+    const ballot = await prisma.ballot.create({
+      data: {
+        title: "Re-enfranchise ballot",
+        options: { create: [{ label: "Yes", sortOrder: 0 }] },
+      },
+      include: { options: true },
+    });
+    await membershipService.castVote({
+      ballotId: ballot.id,
+      memberId: member.id,
+      ballotOptionId: ballot.options[0]!.id,
+    });
+    expect(
+      await prisma.memberVote.count({
+        where: { ballotId: ballot.id, memberId: member.id },
+      }),
+    ).toBe(1);
+
+    // Restore default for other tests.
+    await membershipService.updateCooperativeSettings(asAuthUser(admin), {
+      votingThresholdAmount: 1000,
+    });
+  });
+
+  it("sums two investments for dividend weight but allows exactly one vote", async () => {
+    const member = await createMember({ status: MemberStatus.ACTIVE });
+    await membershipService.recordCapitalInvestment(member.id, 1000);
+    await membershipService.recordCapitalInvestment(member.id, 1000);
+
+    const equity = await membershipService.getMemberEquity(member.id);
+    expect(equity.totalContributed.toFixed(2)).toBe("2000.00");
+    expect(equity.investments).toHaveLength(2);
+    expect(equity.hasVotingRights).toBe(true);
+
+    const resolution = await prisma.boardResolution.create({
+      data: {
+        title: "Declare FY dividend sum",
+        outcome: BoardResolutionOutcome.PASSED,
+        votedAt: new Date(),
+      },
+    });
+    const dividend = await membershipService.declareDividend(
+      resolution.id,
+      new Date().getUTCFullYear(),
+      200,
       DividendAllocationMethod.BY_CAPITAL,
     );
     const allocated = await membershipService.allocateDividend(dividend.id);
     const mine = allocated.allocations.find((a) => a.memberId === member.id);
     expect(mine).toBeTruthy();
-    expect(Number(mine!.memberWeight)).toBe(1100);
-    expect(mine!.amount.toFixed(2)).toBe("110.00");
+    expect(Number(mine!.memberWeight)).toBe(2000);
+    expect(mine!.amount.toFixed(2)).toBe("200.00");
 
-    // One member, one vote — second cast is rejected regardless of capital size.
     const ballot = await prisma.ballot.create({
       data: {
-        title: "Board slate",
+        title: "Board slate sum",
         options: {
           create: [
             { label: "Yes", sortOrder: 0 },

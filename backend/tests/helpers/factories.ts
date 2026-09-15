@@ -69,32 +69,19 @@ export async function createProduct(
 export async function createMember(input?: {
   status?: MemberStatus;
   email?: string;
-  membershipClassId?: string;
+  hasVotingRights?: boolean;
+  totalInvested?: number;
 }): Promise<Member> {
-  let classId = input?.membershipClassId;
-  if (!classId) {
-    const klass =
-      (await prisma.membershipClass.findFirst({ where: { isActive: true } })) ??
-      (await prisma.membershipClass.create({
-        data: {
-          id: "mc_test_100",
-          name: "Member $100",
-          contributionAmount: new Prisma.Decimal(100),
-          votingRights: 1,
-          dividendWeight: new Prisma.Decimal(100),
-        },
-      }));
-    classId = klass.id;
-  }
-
+  const status = input?.status ?? MemberStatus.ACTIVE;
   const member = await prisma.member.create({
     data: {
       memberNumber: `M${Math.floor(Math.random() * 1_000_000)}`,
       name: "Test Member",
       email: input?.email ?? `member-${Date.now()}@test.local`,
-      membershipClassId: classId,
-      status: input?.status ?? MemberStatus.ACTIVE,
-      isEligibleToVote: (input?.status ?? MemberStatus.ACTIVE) === MemberStatus.ACTIVE,
+      status,
+      isEligibleToVote: status === MemberStatus.ACTIVE,
+      hasVotingRights: input?.hasVotingRights ?? false,
+      totalInvested: new Prisma.Decimal(input?.totalInvested ?? 0),
       approvedAt: new Date(),
     },
   });

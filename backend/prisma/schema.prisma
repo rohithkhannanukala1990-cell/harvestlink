@@ -27,12 +27,20 @@ enum MemberStatus {
   TRANSFERRED
 }
 
-/// Payment lifecycle for a CapitalContribution (equity, NOT store revenue).
+/// Payment lifecycle for CapitalInvestment (equity stake — NOT store revenue).
+/// CONFIRMED (formerly PAID) means funds are received and count toward totalInvested / voting.
 enum CapitalPaymentStatus {
   PENDING
-  PAID
+  CONFIRMED
   FAILED
   REFUNDED
+}
+
+/// Payment lifecycle for the one-time MembershipFee (joining fee — confers NO votes).
+enum MembershipFeeStatus {
+  PENDING
+  CONFIRMED
+  FAILED
 }
 
 /// How a declared Dividend pool is split across members.
@@ -208,6 +216,10 @@ model User {
   membersApproved Member[] @relation("MemberApprovedBy")
   /// MemberBenefit rows this user created (versioned perk definitions).
   memberBenefitsCreated MemberBenefit[] @relation("MemberBenefitCreatedBy")
+  /// MembershipFee rows this user confirmed as received.
+  membershipFeesConfirmed MembershipFee[] @relation("MembershipFeeConfirmedBy")
+  /// CapitalInvestment rows this user confirmed as received.
+  capitalInvestmentsConfirmed CapitalInvestment[] @relation("CapitalInvestmentConfirmedBy")
 
   @@index([storeId])
 }
@@ -297,46 +309,64 @@ model StockAdjustment {
   @@index([adjustedById])
 }
 
-/// A sellable membership class — the ONE-TIME lifetime capital contribution amount.
-/// Harvestlink uses classes like "Member $100" and "Member $1,000", not subscription tiers.
-model MembershipClass {
-  /// Primary key uniquely identifying this class.
-  id                  String   @id @default(cuid())
-  /// Display name (e.g. "Member $100", "Member $1,000").
-  name                String
-  /// One-time lifetime capital contribution required for this class (USD).
-  contributionAmount  Decimal  @db.Decimal(12, 2)
-  /// Votes this class carries in co-op elections.
-  /// ALWAYS 1 for every class. Stored as data so one-member-one-vote is explicit and
-  /// auditable — never an assumption buried in application code.
-  votingRights        Int      @default(1)
-  /// Relative weight for capital-based dividend allocation (typically proportional to contribution).
-  dividendWeight      Decimal  @db.Decimal(12, 4)
-  /// When false, new members cannot join this class.
-  isActive            Boolean  @default(true)
-  /// Human-readable description of rights / obligations.
-  description         String   @default("")
-  /// When this class was created.
-  createdAt           DateTime @default(now())
-
-  members Member[]
-  /// Versioned benefit definitions for members of this class.
-  benefits MemberBenefit[]
-  /// Sales that snapshotted this class at checkout time.
-  sales Sale[]
-
-  @@index([isActive])
+/// Co-op-wide settings (singleton in practice). Voting threshold lives here — never hardcoded.
+model CooperativeSettings {
+  /// Primary key uniquely identifying this settings row.
+  id                    String   @id @default(cuid())
+  /// Minimum CONFIRMED capital investment (USD) required before a member may vote.
+  /// Threshold lives here, never hardcoded — bylaws can change it by member vote.
+  votingThresholdAmount Decimal  @default(1000) @db.Decimal(12, 2)
+  /// Fiscal year end month-day (e.g. "12-31") for dividends / reporting.
+  fiscalYearEnd         String   @default("12-31")
+  /// Legal name of the cooperative entity.
+  legalEntityName       String   @default("Harvestlink Cooperative")
+  /// US state (or jurisdiction) of incorporation.
+  stateOfIncorporation  String   @default("")
+  /// When this settings row was created.
+  createdAt             DateTime @default(now())
+  /// When settings were last updated.
+  updatedAt             DateTime @updatedAt
 }
 
-/// A configurable member perk attached to a MembershipClass.
+/// The one-time joining fee that makes someone a member. Confers NO voting rights.
+/// Confirm with the co-op's accountant whether this is revenue or member capital.
+model MembershipFee {
+  /// Primary key uniquely identifying this fee payment.
+  id                String              @id @default(cuid())
+  /// Member who owes / paid this joining fee.
+  memberId          String
+  /// Joining fee amount (USD). Default $100 per harvestlinx.com/membership.
+  amount            Decimal             @default(100) @db.Decimal(12, 2)
+  /// How the fee was paid (cash, check, card, ACH, etc.).
+  paymentMethod     String              @default("")
+  /// External reference (check number, Stripe id, etc.).
+  paymentReference  String?
+  /// PENDING → CONFIRMED / FAILED.
+  paymentStatus     MembershipFeeStatus @default(PENDING)
+  /// When funds were received (null while PENDING).
+  paidAt            DateTime?
+  /// Admin who confirmed receipt.
+  confirmedByUserId String?
+  /// When an admin confirmed the fee.
+  confirmedAt       DateTime?
+  /// When this row was created.
+  createdAt         DateTime            @default(now())
+
+  member      Member @relation(fields: [memberId], references: [id])
+  confirmedBy User?  @relation("MembershipFeeConfirmedBy", fields: [confirmedByUserId], references: [id])
+
+  @@index([memberId])
+  @@index([paymentStatus])
+  @@index([confirmedByUserId])
+}
+
+/// A configurable member perk (network-wide — not tied to a dollar tier).
 /// Benefits are VERSIONED, never overwritten. Members are owners who paid for life and cannot
 /// cancel like subscribers, so the record of what was promised and when must survive. To change
 /// a benefit, set endsAt on the old row and create a new one.
 model MemberBenefit {
   /// Primary key uniquely identifying this benefit version.
   id                     String         @id @default(cuid())
-  /// Membership class this perk applies to (e.g. Member $100 vs Member $1,000).
-  membershipClassId      String
   /// Kind of perk (percent off, free delivery, exclusive SKU, etc.).
   benefitType            BenefitType
   /// Numeric magnitude for the perk (e.g. 5.00 = 5% or $5 depending on benefitType).
@@ -368,13 +398,11 @@ model MemberBenefit {
   /// When this row was last updated (metadata only — do not overwrite value/scope in place).
   updatedAt              DateTime       @updatedAt
 
-  membershipClass MembershipClass @relation(fields: [membershipClassId], references: [id])
-  createdBy       User            @relation("MemberBenefitCreatedBy", fields: [createdByUserId], references: [id])
-  usages          MemberBenefitUsage[]
+  createdBy User                 @relation("MemberBenefitCreatedBy", fields: [createdByUserId], references: [id])
+  usages    MemberBenefitUsage[]
   /// Sale lines that applied this benefit version (historical — never rewrite).
-  saleItems       SaleItem[]
+  saleItems SaleItem[]
 
-  @@index([membershipClassId])
   @@index([isActive, startsAt, endsAt])
   @@index([benefitType])
   @@index([priority])
@@ -421,8 +449,6 @@ model Member {
   phone                   String       @default("")
   /// Mailing address for equity certificates and tax forms (1099).
   mailingAddress          String       @default("")
-  /// FK to MembershipClass (contribution amount / votingRights=1). Required after backfill.
-  membershipClassId       String
   /// Owner lifecycle (PENDING → ACTIVE → soft exit). Never hard-delete members.
   status                  MemberStatus @default(PENDING)
   /// When the member record was created (application / join date).
@@ -434,18 +460,29 @@ model Member {
   /// Last 4 of SSN/ITIN for dividend tax reporting — encrypted at rest by membership.service
   /// (AES-GCM). 1099-PATR vs 1099-DIV classification must be confirmed with the co-op accountant.
   taxIdLast4              String?
-  /// Whether this member may cast ballots (one member, one vote — never weighted by capital).
+  /// Soft eligibility flag (board can suspend voting for other reasons). Actual ballot rights
+  /// require hasVotingRights = true (capital threshold). Prefer checking hasVotingRights.
   isEligibleToVote        Boolean      @default(true)
+  /// Rollup of CONFIRMED CapitalInvestment amounts only (excludes PENDING / FAILED / REFUNDED).
+  /// Recomputed whenever a CapitalInvestment is CONFIRMED or refunded.
+  totalInvested           Decimal      @default(0) @db.Decimal(12, 2)
+  /// A member votes ONLY if totalInvested >= CooperativeSettings.votingThresholdAmount.
+  /// Above the threshold every voting member gets EXACTLY ONE vote, whether they invested $1,000
+  /// or $50,000. Investing more buys more dividend participation, never more votes.
+  /// One member, one vote AMONG MEMBERS WITH VOTING RIGHTS.
+  /// Recomputed whenever a CapitalInvestment is CONFIRMED or refunded.
+  hasVotingRights         Boolean      @default(false)
   /// Optional household primary: secondary shopper cards linked under one voting owner.
   householdPrimaryMemberId String?
 
-  membershipClass MembershipClass @relation(fields: [membershipClassId], references: [id])
   approvedBy      User?            @relation("MemberApprovedBy", fields: [approvedByUserId], references: [id])
   householdPrimary Member?         @relation("MemberHousehold", fields: [householdPrimaryMemberId], references: [id])
   householdMembers Member[]        @relation("MemberHousehold")
   sales            Sale[]
-  /// Equity buy-ins for this owner (CapitalContribution — never sales revenue).
-  contributions    CapitalContribution[]
+  /// One-time joining fees (MembershipFee — confers NO votes).
+  membershipFees   MembershipFee[]
+  /// Equity stakes for this owner (CapitalInvestment — never sales revenue).
+  investments      CapitalInvestment[]
   /// Running capital account (total in / distributed / balance).
   equityAccount    MemberEquityAccount?
   /// Per-dividend payout lines for this member.
@@ -456,50 +493,61 @@ model Member {
 
   @@index([memberNumber])
   @@index([status])
-  @@index([membershipClassId])
   @@index([email])
   @@index([approvedByUserId])
   @@index([householdPrimaryMemberId])
+  @@index([hasVotingRights])
 }
 
-/// A capital contribution (equity buy-in). EQUITY, NOT REVENUE.
+/// A capital investment (equity stake). EQUITY — never revenue, never part of store sales or
+/// operator settlement. Amount is VARIABLE (a $1,000 minimum for voting; someone may invest $5,000).
 /// Must NEVER appear in sales reports, store revenue, operator settlement, or P&L.
 /// Operators earn NO percentage. Routed only through membership.service — never createSale.
-/// Upgrading $100 → $1,000 ADDS a row; never replaces prior contributions.
-/// Dividend weight uses TOTAL contributed capital; voting stays at 1.
-model CapitalContribution {
-  /// Primary key uniquely identifying this contribution.
+/// Additional investments ADD rows; never replace prior investments.
+/// Dividend weight uses totalInvested; voting is binary (hasVotingRights) — never weighted.
+model CapitalInvestment {
+  /// Primary key uniquely identifying this investment.
   id                     String               @id @default(cuid())
-  /// Member who paid this equity contribution.
+  /// Member who made this equity investment.
   memberId               String
-  /// Amount contributed (USD).
+  /// Amount invested (USD). Variable — may exceed the voting threshold.
   amount                 Decimal              @db.Decimal(12, 2)
+  /// How the investment was paid (cash, check, card, ACH, wire, etc.).
+  paymentMethod          String               @default("")
+  /// External reference (check number, Stripe id, wire confirmation, etc.).
+  paymentReference       String?
   /// Payment lifecycle for this equity payment.
   paymentStatus          CapitalPaymentStatus @default(PENDING)
   /// Stripe PaymentIntent id when collected via card (optional; cash/check also allowed).
   stripePaymentIntentId  String?              @unique
-  /// When funds were confirmed received.
+  /// Admin who confirmed receipt of funds.
+  confirmedByUserId      String?
+  /// URL / path to signed subscription (equity purchase) agreement.
+  subscriptionAgreementUrl String?
+  /// When funds were confirmed received (CONFIRMED status).
   receivedAt             DateTime?
   /// Printed equity certificate number (human-readable).
   certificateNumber      String?              @unique
-  /// When this contribution was refunded (withdrawal).
+  /// When this investment was refunded (withdrawal).
   refundedAt             DateTime?
-  /// When the contribution row was created.
+  /// When the investment row was created.
   createdAt              DateTime             @default(now())
 
-  member Member @relation(fields: [memberId], references: [id])
+  member      Member @relation(fields: [memberId], references: [id])
+  confirmedBy User?  @relation("CapitalInvestmentConfirmedBy", fields: [confirmedByUserId], references: [id])
 
   @@index([memberId])
   @@index([paymentStatus])
+  @@index([confirmedByUserId])
 }
 
-/// Running equity ledger for a member (derived from CapitalContribution + DividendAllocation).
+/// Running equity ledger for a member (derived from CapitalInvestment + DividendAllocation).
 model MemberEquityAccount {
   /// Primary key uniquely identifying this equity account.
   id                 String   @id @default(cuid())
   /// Owner of this equity account (one per member).
   memberId           String   @unique
-  /// Sum of PAID (non-refunded) capital contributions.
+  /// Sum of CONFIRMED (non-refunded) capital investments.
   totalContributed   Decimal  @default(0) @db.Decimal(12, 2)
   /// Cumulative dividends paid/allocated to date.
   distributedToDate  Decimal  @default(0) @db.Decimal(12, 2)
@@ -631,7 +679,7 @@ model MemberVote {
   id             String   @id @default(cuid())
   /// Ballot being voted on.
   ballotId       String
-  /// Voting member (must be ACTIVE + isEligibleToVote).
+  /// Voting member (must be ACTIVE + hasVotingRights; soft isEligibleToVote also checked).
   memberId       String
   /// Option selected.
   ballotOptionId String
@@ -664,9 +712,6 @@ model Sale {
   cashierId       String
   /// Optional member attached to the sale when a member number was provided.
   memberId        String?
-  /// Membership class of the member at sale time (null if no member). Snapshotted so later
-  /// class changes never rewrite historical benefit eligibility on this sale.
-  membershipClassId String?
   /// Line totals before any member benefit (and before manual discounts) — frozen at checkout.
   /// Later benefit edits must never change this snapshot.
   subtotalBeforeDiscount Decimal @db.Decimal(12, 2)
@@ -685,10 +730,15 @@ model Sale {
   total           Decimal  @db.Decimal(12, 2)
   /// Snapshot of the store's operatorPercent at sale time — never recalculate historical sales from later store settings.
   operatorPercent Decimal  @db.Decimal(5, 2)
-  /// Operator's earned share = PRE-TAX subtotal × operatorPercent.
+  /// Operator's earned share = operatorBaseSnapshot × operatorPercent (PRE-TAX).
   /// Tax is excluded because it is remitted to the state and is not store revenue.
   /// Internal ledger only — not a Stripe transfer to the operator.
   operatorAmount  Decimal  @db.Decimal(12, 2)
+  /// The pre-tax base the operator share was actually computed from, determined by
+  /// memberDiscountBearer at sale time. Refund proration MUST divide by this, not by subtotal —
+  /// under COOP bearer they are different numbers. Nullable for sales created before this field
+  /// existed; those fall back to subtotal.
+  operatorBaseSnapshot Decimal? @db.Decimal(12, 2)
   /// Co-op share of pre-tax subtotal after operator accrual (subtotal − operatorAmount).
   coopAmount      Decimal  @db.Decimal(12, 2)
   /// Card payment lifecycle; physical stock decrements only when PAID.
@@ -727,8 +777,6 @@ model Sale {
   cashier  User       @relation("SaleCashier", fields: [cashierId], references: [id])
   /// Member on the sale, if any.
   member   Member?    @relation(fields: [memberId], references: [id])
-  /// Membership class snapshotted at sale time (independent of later Member.membershipClassId edits).
-  membershipClass MembershipClass? @relation(fields: [membershipClassId], references: [id])
   /// Line items that make up this sale.
   items    SaleItem[]
   /// Refund attempts (including in-flight REFUNDING rows).
@@ -742,7 +790,6 @@ model Sale {
   @@index([storeId])
   @@index([cashierId])
   @@index([memberId])
-  @@index([membershipClassId])
   @@index([paymentStatus])
   /// Cleanup job finds expired PENDING reservations via this index.
   @@index([reservationExpiresAt])

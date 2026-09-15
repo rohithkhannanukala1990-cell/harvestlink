@@ -23,8 +23,8 @@ describe("createSale", () => {
         TRUNCATE TABLE
           "AuditLog","ProcessedStripeEvent","InventoryWriteOff","SaleRefundLine","SaleRefund",
           "StockReconciliation","MemberVote","BallotOption","Ballot","DividendAllocation","Dividend","BoardResolution",
-          "CapitalContribution","MemberEquityAccount","SaleItem","Sale","StockAdjustment","Payout","CashDrawer",
-          "Product","Member","MembershipClass","User","Store"
+          "CapitalInvestment","MembershipFee","MemberEquityAccount","SaleItem","Sale","StockAdjustment","Payout","CashDrawer",
+          "Product","Member","CooperativeSettings","User","Store"
         RESTART IDENTITY CASCADE
       `);
 

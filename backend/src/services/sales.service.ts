@@ -43,6 +43,7 @@ import { getStripe, toStripeCents } from "../lib/stripe.js";
 import { moneyDec } from "../lib/money.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
+import { resolveBenefits } from "./benefits.service.js";
 
 export { resolveStoreScope };
 /** Re-export for callers that historically imported money rounding from this module. */
@@ -115,6 +116,8 @@ export type CreateSaleResult = {
   replayed?: boolean;
   /** True when one or more lines drove stock negative (offline sync conflict). */
   stockReconciliationQueued?: boolean;
+  /** Promised benefits that did not apply (caps, scope, etc.) — surface to POS cashier. */
+  benefitSkips?: Array<{ benefitId: string; description: string; reason: string }>;
 };
 
 type LockedProductRow = {
@@ -122,6 +125,7 @@ type LockedProductRow = {
   storeId: string;
   sku: string;
   name: string;
+  category: string;
   price: Prisma.Decimal;
   stock: number;
   reserved: number;
@@ -149,10 +153,8 @@ function availableStock(stock: number, reserved: number): number {
 /**
  * Member benefit % applied to lineGross before manual $.
  *
- * /// PLACEHOLDER: member discounts are being rebuilt as configurable benefits in R2. This returns
- * /// zero so the discount arithmetic, field shapes, and manual-discount validation all stay
- * /// intact, and R2 can plug the real benefits engine into this same seam. Do not delete the
- * /// discount plumbing.
+ * /// PLACEHOLDER removed from the hot path — resolveBenefits is the real engine.
+ * Kept as a zero stub only if a caller still imports the old seam name.
  *
  * Do not read removed Store.tierDiscount* columns or Member.tier — those are gone.
  */
@@ -281,6 +283,7 @@ export async function createSale(
   let sale: SaleWithItems;
   let stockReconciliationQueued = false;
   let replayedFromTxn = false;
+  let benefitSkips: Array<{ benefitId: string; description: string; reason: string }> = [];
   let manualDiscountAudit: Array<{
     productId: string;
     amount: string;
@@ -306,7 +309,7 @@ export async function createSale(
       }
 
       const lockedProducts = await tx.$queryRaw<LockedProductRow[]>`
-        SELECT id, "storeId", sku, name, price, stock, reserved, "taxExempt"
+        SELECT id, "storeId", sku, name, category, price, stock, reserved, "taxExempt"
         FROM "Product"
         WHERE id IN (${Prisma.join(productIds)})
           AND "storeId" = ${storeId}
@@ -379,9 +382,10 @@ export async function createSale(
           isActive: boolean;
           taxRate: Prisma.Decimal;
           memberDiscountBearer: DiscountBearer;
+          memberDiscountSharedPercent: Prisma.Decimal;
         }>
       >`
-        SELECT id, "operatorPercent", "isActive", "taxRate", "memberDiscountBearer"
+        SELECT id, "operatorPercent", "isActive", "taxRate", "memberDiscountBearer", "memberDiscountSharedPercent"
         FROM "Store"
         WHERE id = ${storeId}
         FOR UPDATE
@@ -406,7 +410,6 @@ export async function createSale(
       }
 
       let memberAttached = false;
-      let membershipClassId: string | null = null;
       if (input.memberId) {
         const member = await tx.member.findUnique({ where: { id: input.memberId } });
         if (!member) {
@@ -420,12 +423,40 @@ export async function createSale(
           });
         }
         memberAttached = true;
-        membershipClassId = member.membershipClassId;
       }
 
-      // R2 will replace this placeholder; keep calling it so discount math stays wired.
-      const tierPct = tierDiscountPercent(memberAttached, store);
       const taxRate = new Prisma.Decimal(store.taxRate);
+
+      // Resolve network-wide member benefits once per cart (PRE-TAX only — never tax / capital).
+      let benefitByLineKey = new Map<
+        string,
+        { benefitId: string | null; benefitDiscountAmount: Prisma.Decimal }
+      >();
+      if (memberAttached && input.memberId) {
+        const cartLines = input.items.map((item, index) => {
+          const product = productById.get(item.productId)!;
+          return {
+            lineKey: `${index}:${item.productId}`,
+            productId: item.productId,
+            category: product.category,
+            quantity: item.quantity,
+            unitPrice: product.price,
+          };
+        });
+        const resolved = await resolveBenefits(input.memberId, storeId, cartLines, tx);
+        benefitSkips = resolved.skipped;
+        benefitByLineKey = new Map(
+          resolved.lines.map((line) => [
+            line.lineKey,
+            {
+              benefitId: line.benefitId,
+              benefitDiscountAmount: line.benefitDiscountAmount,
+            },
+          ]),
+        );
+      } else {
+        void tierDiscountPercent(memberAttached, store); // keep placeholder seam referenced
+      }
 
       let subtotal = new Prisma.Decimal(0);
       let subtotalBeforeDiscount = new Prisma.Decimal(0);
@@ -447,14 +478,16 @@ export async function createSale(
       }> = [];
       manualDiscountAudit = [];
 
-      for (const item of input.items) {
+      for (let index = 0; index < input.items.length; index++) {
+        const item = input.items[index]!;
         const product = productById.get(item.productId)!;
         const priceSnapshot = new Prisma.Decimal(product.price);
         const lineGross = moneyDec(priceSnapshot.mul(item.quantity));
+        const lineKey = `${index}:${item.productId}`;
+        const benefit = benefitByLineKey.get(lineKey);
 
         let manual = moneyDec(item.manualDiscount ?? 0);
-        // Placeholder benefit discount (0%) until R2 benefits engine plugs in here.
-        const benefitDiscount = moneyDec(lineGross.mul(tierPct).div(100));
+        const benefitDiscount = moneyDec(benefit?.benefitDiscountAmount ?? 0);
         if (manual.gt(lineGross.sub(benefitDiscount))) {
           throw new AppError(400, "manualDiscount exceeds line amount after tier discount", {
             productId: item.productId,
@@ -463,6 +496,7 @@ export async function createSale(
         const lineDiscount = moneyDec(benefitDiscount.add(manual));
         const lineNet = moneyDec(lineGross.sub(lineDiscount));
         const exempt = product.taxExempt;
+        // Tax is always on post-discount lineNet — benefits NEVER reduce the tax base below net.
         const lineTax = exempt ? moneyDec(0) : moneyDec(lineNet.mul(taxRate).div(100));
 
         subtotalBeforeDiscount = subtotalBeforeDiscount.add(lineGross);
@@ -486,7 +520,7 @@ export async function createSale(
           priceSnapshot,
           quantity: item.quantity,
           discountAmount: lineDiscount,
-          benefitId: null,
+          benefitId: benefit?.benefitId ?? null,
           benefitDiscountAmount: benefitDiscount,
           discountReason: manual.gt(0) ? item.discountReason!.trim() : null,
           taxAmount: lineTax,
@@ -503,10 +537,40 @@ export async function createSale(
 
       // Operator share is PRE-TAX only (see function docblock).
       const operatorPercent = new Prisma.Decimal(store.operatorPercent);
-      const operatorAmount = moneyDec(subtotal.mul(operatorPercent).div(100));
-      const coopAmount = moneyDec(subtotal.sub(operatorAmount));
       // Snapshot bearer at sale time — later Store.memberDiscountBearer edits must not rewrite history.
       const memberDiscountBearer = store.memberDiscountBearer;
+
+      /// Who funds a member discount changes WHICH pre-tax base the operator is paid on.
+      /// COOP: the co-op funds the benefit it promised — the operator is paid as if the sale were full
+      ///       price, so operators stay neutral about serving members. This is the default.
+      /// OPERATOR: the operator absorbs the discount and earns less on member sales.
+      /// SHARED: the operator absorbs memberDiscountSharedPercent of the discount; co-op takes the rest.
+      /// The base is PRE-TAX in every branch — sales tax is remitted to the state and is never
+      /// operator revenue. Do not change that.
+      const operatorBase =
+        memberDiscountBearer === "COOP"
+          ? subtotalBeforeDiscount
+          : memberDiscountBearer === "OPERATOR"
+            ? subtotal
+            : moneyDec(
+                subtotal.add(
+                  memberDiscountAmount
+                    .mul(new Prisma.Decimal(100).sub(store.memberDiscountSharedPercent))
+                    .div(100),
+                ),
+              );
+
+      const operatorAmount = moneyDec(operatorBase.mul(operatorPercent).div(100));
+      const coopAmount = moneyDec(subtotal.sub(operatorAmount));
+
+      /// GUARD: a discount large enough to push coopAmount below zero means the co-op is paying the
+      /// operator more than the customer paid. Never persist that silently.
+      if (coopAmount.lt(0)) {
+        throw new AppError(400, "Member discount exceeds co-op share; benefit configuration invalid", {
+          subtotal: subtotal.toFixed(2),
+          operatorAmount: operatorAmount.toFixed(2),
+        });
+      }
 
       if (isCash) {
         for (const [productId, quantity] of stockNeeded) {
@@ -522,7 +586,6 @@ export async function createSale(
             storeId,
             cashierId: cashier.id,
             memberId: input.memberId ?? null,
-            membershipClassId,
             subtotalBeforeDiscount,
             subtotal,
             discountAmount,
@@ -532,6 +595,7 @@ export async function createSale(
             total,
             operatorPercent,
             operatorAmount,
+            operatorBaseSnapshot: operatorBase,
             coopAmount,
             paymentStatus: PaymentStatus.PAID,
             paymentMethod: PaymentMethod.CASH,
@@ -557,6 +621,10 @@ export async function createSale(
           },
           include: { items: true },
         });
+
+        if (input.memberId) {
+          await recordMemberBenefitUsages(tx, created.id, input.memberId, lineDrafts);
+        }
 
         if (negativeStockFlags.length) {
           stockReconciliationQueued = true;
@@ -586,12 +654,11 @@ export async function createSale(
         });
       }
 
-      return tx.sale.create({
+      const pendingSale = await tx.sale.create({
         data: {
           storeId,
           cashierId: cashier.id,
           memberId: input.memberId ?? null,
-          membershipClassId,
           subtotalBeforeDiscount,
           subtotal,
           discountAmount,
@@ -601,6 +668,7 @@ export async function createSale(
           total,
           operatorPercent,
           operatorAmount,
+          operatorBaseSnapshot: operatorBase,
           coopAmount,
           paymentStatus: PaymentStatus.PENDING,
           paymentMethod: input.paymentMethod,
@@ -625,6 +693,12 @@ export async function createSale(
         },
         include: { items: true },
       });
+
+      if (input.memberId) {
+        await recordMemberBenefitUsages(tx, pendingSale.id, input.memberId, lineDrafts);
+      }
+
+      return pendingSale;
     });
   } catch (error) {
     if (error instanceof AppError) {
@@ -669,16 +743,56 @@ export async function createSale(
   }
 
   if (isCash) {
-    return { sale, stockReconciliationQueued: stockReconciliationQueued || undefined };
+    return {
+      sale,
+      stockReconciliationQueued: stockReconciliationQueued || undefined,
+      benefitSkips: benefitSkips.length ? benefitSkips : undefined,
+    };
   }
 
   if (input.paymentMethod === PaymentMethod.CHECKOUT) {
     const checkout = await startCheckoutPayment(sale);
-    return { sale: checkout.sale, checkout: checkout.checkout };
+    return {
+      sale: checkout.sale,
+      checkout: checkout.checkout,
+      benefitSkips: benefitSkips.length ? benefitSkips : undefined,
+    };
   }
 
   const terminal = await startTerminalPayment(sale);
-  return { sale: terminal.sale, terminal: terminal.terminal };
+  return {
+    sale: terminal.sale,
+    terminal: terminal.terminal,
+    benefitSkips: benefitSkips.length ? benefitSkips : undefined,
+  };
+}
+
+/** Records one MemberBenefitUsage row per applied benefit id (caps + co-op cost tracking). */
+async function recordMemberBenefitUsages(
+  tx: Prisma.TransactionClient,
+  saleId: string,
+  memberId: string,
+  lineDrafts: Array<{
+    benefitId: string | null;
+    benefitDiscountAmount: Prisma.Decimal;
+  }>,
+): Promise<void> {
+  const savedByBenefit = new Map<string, Prisma.Decimal>();
+  for (const line of lineDrafts) {
+    if (!line.benefitId || line.benefitDiscountAmount.lte(0)) continue;
+    const prev = savedByBenefit.get(line.benefitId) ?? new Prisma.Decimal(0);
+    savedByBenefit.set(line.benefitId, prev.add(line.benefitDiscountAmount));
+  }
+  for (const [benefitId, amountSaved] of savedByBenefit) {
+    await tx.memberBenefitUsage.create({
+      data: {
+        memberId,
+        benefitId,
+        saleId,
+        amountSaved: moneyDec(amountSaved),
+      },
+    });
+  }
 }
 
 async function startCheckoutPayment(sale: SaleWithItems): Promise<CreateSaleResult> {
@@ -957,13 +1071,25 @@ async function resolvePaymentIntentId(sale: Sale): Promise<string> {
 
 /**
  * Builds refund lines + $ amounts from optional item list (full remaining when omitted).
- * Customer refund = proportional (lineNet + lineTax); operator clawback uses PRE-TAX lineNet only.
+ * Customer refund = proportional (lineNet + lineTax); operator clawback prorates against
+ * operatorBaseSnapshot (same base operatorAmount was computed from), not sale.subtotal.
  */
 function planRefundLines(
   sale: Sale,
   items: SaleItem[],
   requested: RefundLineInput[] | undefined,
-): { lines: Array<{ saleItemId: string; productId: string; quantity: number; lineAmount: Prisma.Decimal; lineNet: Prisma.Decimal }>; amount: Prisma.Decimal; operatorAmount: Prisma.Decimal } {
+): {
+  lines: Array<{
+    saleItemId: string;
+    productId: string;
+    quantity: number;
+    lineAmount: Prisma.Decimal;
+    lineNet: Prisma.Decimal;
+    lineGross: Prisma.Decimal;
+  }>;
+  amount: Prisma.Decimal;
+  operatorAmount: Prisma.Decimal;
+} {
   const byId = new Map(items.map((item) => [item.id, item]));
   const specs: Array<{ item: SaleItem; quantity: number }> = [];
 
@@ -1011,16 +1137,19 @@ function planRefundLines(
   }
 
   const lines = specs.map(({ item, quantity }) => {
-    const gross = item.priceSnapshot.mul(item.quantity);
-    const netTotal = money(gross.sub(item.discountAmount));
+    const grossFull = item.priceSnapshot.mul(item.quantity);
+    const netTotal = money(grossFull.sub(item.discountAmount));
     const unitNet = netTotal.div(item.quantity);
     const unitTax = item.taxAmount.div(item.quantity);
+    const unitGross = item.priceSnapshot;
+    const lineGross = money(unitGross.mul(quantity));
     const lineNet = money(unitNet.mul(quantity));
     const lineTax = money(unitTax.mul(quantity));
     return {
       saleItemId: item.id,
       productId: item.productId,
       quantity,
+      lineGross,
       lineNet,
       lineAmount: money(lineNet.add(lineTax)),
     };
@@ -1048,11 +1177,24 @@ function planRefundLines(
   if (refundsAllRemaining) {
     operatorAmount = money(sale.operatorAmount.sub(sale.refundedOperatorAmount));
     amount = remainingCustomer;
-  } else if (sale.subtotal.eq(0)) {
-    operatorAmount = money(0);
   } else {
-    const netRefunded = lines.reduce((sum, line) => sum.add(line.lineNet), new Prisma.Decimal(0));
-    operatorAmount = money(sale.operatorAmount.mul(netRefunded).div(sale.subtotal));
+    /// Must divide by the base operatorAmount was derived from. Under COOP bearer that is the
+    /// pre-discount subtotal, not sale.subtotal. Legacy rows predate operatorBaseSnapshot and were
+    /// all computed from subtotal, so they fall back to it.
+    const operatorBase = sale.operatorBaseSnapshot ?? sale.subtotal;
+
+    if (operatorBase.eq(0)) {
+      operatorAmount = money(0);
+    } else {
+      // Refunded portion must be measured on the SAME basis as operatorBase.
+      // Under COOP bearer, use the refunded lines' PRE-discount gross; otherwise their net.
+      const refundedOnBase =
+        sale.memberDiscountBearer === "COOP"
+          ? lines.reduce((sum, line) => sum.add(line.lineGross), new Prisma.Decimal(0))
+          : lines.reduce((sum, line) => sum.add(line.lineNet), new Prisma.Decimal(0));
+
+      operatorAmount = money(sale.operatorAmount.mul(refundedOnBase).div(operatorBase));
+    }
   }
 
   return { lines, amount, operatorAmount };

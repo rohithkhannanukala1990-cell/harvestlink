@@ -1,11 +1,12 @@
 /**
  * Members directory — co-op OWNERS (equity), not subscription tiers.
- * Capital contributions are recorded via /members/contributions (COOP_ADMIN), never POS.
+ * Capital investments are recorded via /members/contributions (COOP_ADMIN), never POS.
+ * Joining fee (MembershipFee) is separate from CapitalInvestment and confers no votes.
  */
-import { useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest, money } from "../api/client";
-import type { Member, MembershipClass, Sale } from "../api/types";
+import type { Member, Sale } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 
 export function MembersPage() {
@@ -19,18 +20,11 @@ export function MembersPage() {
     name: "",
     email: "",
     phone: "",
-    membershipClassId: "",
     activate: true,
   });
   const [contribAmount, setContribAmount] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-
-  const classesQuery = useQuery({
-    queryKey: ["membership-classes"],
-    queryFn: () =>
-      apiRequest<{ classes: MembershipClass[] }>("/members/classes?active=true"),
-  });
 
   const membersQuery = useQuery({
     queryKey: ["members", q],
@@ -59,7 +53,6 @@ export function MembersPage() {
           name: form.name,
           email: form.email,
           phone: form.phone || undefined,
-          membershipClassId: form.membershipClassId,
           activate: form.activate,
         },
       }),
@@ -83,26 +76,20 @@ export function MembersPage() {
       }),
     onSuccess: () => {
       setContribAmount("");
-      setMessage("Capital contribution recorded (equity — not store revenue)");
+      setMessage("Capital investment recorded (equity — not store revenue)");
       void qc.invalidateQueries({ queryKey: ["member-history", selectedId] });
       void qc.invalidateQueries({ queryKey: ["members"] });
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : "Contribution failed"),
+    onError: (err) => setError(err instanceof ApiError ? err.message : "Investment failed"),
   });
-
-  const defaultClassId = classesQuery.data?.classes[0]?.id ?? "";
-  useEffect(() => {
-    if (!form.membershipClassId && defaultClassId) {
-      setForm((f) => ({ ...f, membershipClassId: defaultClassId }));
-    }
-  }, [defaultClassId, form.membershipClassId]);
 
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-semibold tracking-tight">Members (owners)</h1>
       <p className="text-sm text-stone-600">
-        Lifetime capital contribution — memberships never expire. Capital is equity, not sales
-        revenue.
+        Lifetime capital investment — memberships never expire. Capital is equity, not sales
+        revenue. A $100 joining fee confers membership but no votes; $1,000+ invested confers
+        voting rights (one member, one vote).
       </p>
       {(message || error) && (
         <p className={`text-sm ${error ? "text-red-700" : "text-stone-600"}`}>
@@ -148,19 +135,12 @@ export function MembersPage() {
             />
           </label>
           <label className="text-sm">
-            Class
-            <select
+            Phone
+            <input
               className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
-              value={form.membershipClassId}
-              onChange={(e) => setForm((f) => ({ ...f, membershipClassId: e.target.value }))}
-              required
-            >
-              {(classesQuery.data?.classes ?? []).map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name} ({money(c.contributionAmount)})
-                </option>
-              ))}
-            </select>
+              value={form.phone}
+              onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
+            />
           </label>
           <div className="flex items-end">
             <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
@@ -186,9 +166,9 @@ export function MembersPage() {
                 <span className="text-right text-sm text-stone-500">
                   <span className="block">{m.status}</span>
                   <span className="block text-xs">
-                    {m.membershipClass?.name ?? "—"}
+                    {m.hasVotingRights ? "Voting" : "No vote"}
                     {" · "}
-                    {money(m.equityAccount?.totalContributed ?? 0)} contributed
+                    {money(m.totalInvested ?? 0)} invested
                   </span>
                 </span>
               </button>
@@ -205,14 +185,14 @@ export function MembersPage() {
             {historyQuery.data && (
               <>
                 <p className="text-sm">
-                  Class: {historyQuery.data.member.membershipClass?.name ?? "—"}
-                  {" · "}
                   Status: {historyQuery.data.member.status}
                   {" · "}
-                  Equity contributed:{" "}
-                  {money(historyQuery.data.member.equityAccount?.totalContributed ?? 0)}
+                  Invested: {money(historyQuery.data.member.totalInvested ?? 0)}
                   {" · "}
-                  Vote eligible: {historyQuery.data.member.isEligibleToVote ? "yes" : "no"}
+                  Voting rights: {historyQuery.data.member.hasVotingRights ? "yes" : "no"}
+                  {" · "}
+                  Soft vote eligible:{" "}
+                  {historyQuery.data.member.isEligibleToVote ? "yes" : "no"}
                 </p>
                 {isCoop && (
                   <div className="flex gap-2">
