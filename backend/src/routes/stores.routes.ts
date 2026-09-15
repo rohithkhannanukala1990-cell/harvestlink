@@ -26,9 +26,6 @@ const updateStoreSchema = z
     address: z.string().min(1).optional(),
     operatorPercent: z.number().min(0).max(100).optional(),
     taxRate: z.number().min(0).max(100).optional(),
-    tierDiscountStandard: z.number().min(0).max(100).optional(),
-    tierDiscountPlus: z.number().min(0).max(100).optional(),
-    tierDiscountExecutive: z.number().min(0).max(100).optional(),
     refundPolicy: z.string().min(1).optional(),
     isActive: z.boolean().optional(),
   })

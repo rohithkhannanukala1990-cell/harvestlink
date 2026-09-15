@@ -17,11 +17,51 @@ enum Role {
   COOP_ADMIN
 }
 
-/// Membership tiers that drive co-op member benefits and pricing eligibility.
-enum MemberTier {
-  STANDARD
-  PLUS
-  EXECUTIVE
+/// Lifecycle of a co-op member (owners). Members are NEVER hard-deleted — withdrawal preserves history.
+enum MemberStatus {
+  PENDING
+  ACTIVE
+  WITHDRAWN
+  SUSPENDED
+  DECEASED
+  TRANSFERRED
+}
+
+/// Payment lifecycle for a CapitalContribution (equity, NOT store revenue).
+enum CapitalPaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+/// How a declared Dividend pool is split across members.
+/// Configurable ON PURPOSE: classic co-ops often use patronage; Harvestlink's current terms
+/// say by investment. Legal counsel may advise changing this — never hardcode the formula.
+enum DividendAllocationMethod {
+  BY_CAPITAL
+  BY_PATRONAGE
+  HYBRID
+}
+
+enum DividendStatus {
+  DECLARED
+  ALLOCATED
+  PAID
+  CANCELLED
+}
+
+enum BoardResolutionOutcome {
+  PENDING
+  PASSED
+  FAILED
+  TABLED
+}
+
+enum BallotStatus {
+  OPEN
+  CLOSED
+  CANCELLED
 }
 
 /// Stripe / card payment lifecycle for a Sale. Physical stock decrements only when PAID.
@@ -56,10 +96,6 @@ model Store {
   operatorPercent Decimal  @db.Decimal(5, 2)
   /// Sales-tax rate (%) applied to non-exempt line items at this store.
   taxRate         Decimal  @default(0) @db.Decimal(5, 2)
-  /// Member tier discount percentages (%) off pre-tax line gross (configurable per store).
-  tierDiscountStandard  Decimal @default(0) @db.Decimal(5, 2)
-  tierDiscountPlus      Decimal @default(5) @db.Decimal(5, 2)
-  tierDiscountExecutive Decimal @default(10) @db.Decimal(5, 2)
   /// Printed on receipts (returns / exchanges policy).
   refundPolicy    String   @default("Returns accepted within 14 days with receipt. Refunds to original form of payment.")
   /// When this store record was created in the system.
@@ -122,6 +158,8 @@ model User {
   purchaseOrdersCreated PurchaseOrder[] @relation("PurchaseOrderCreatedBy")
   /// Goods receipts this user recorded at the dock.
   goodsReceiptsReceived GoodsReceipt[] @relation("GoodsReceiptReceivedBy")
+  /// Members this user approved into ACTIVE status.
+  membersApproved Member[] @relation("MemberApprovedBy")
 
   @@index([storeId])
 }
@@ -211,30 +249,265 @@ model StockAdjustment {
   @@index([adjustedById])
 }
 
-/// A co-op member who can shop at any store; identity is co-op-wide via memberNumber.
+/// A sellable membership class — the ONE-TIME lifetime capital contribution amount.
+/// Harvestlink uses classes like "Member $100" and "Member $1,000", not subscription tiers.
+model MembershipClass {
+  /// Primary key uniquely identifying this class.
+  id                  String   @id @default(cuid())
+  /// Display name (e.g. "Member $100", "Member $1,000").
+  name                String
+  /// One-time lifetime capital contribution required for this class (USD).
+  contributionAmount  Decimal  @db.Decimal(12, 2)
+  /// Votes this class carries in co-op elections.
+  /// ALWAYS 1 for every class. Stored as data so one-member-one-vote is explicit and
+  /// auditable — never an assumption buried in application code.
+  votingRights        Int      @default(1)
+  /// Relative weight for capital-based dividend allocation (typically proportional to contribution).
+  dividendWeight      Decimal  @db.Decimal(12, 4)
+  /// When false, new members cannot join this class.
+  isActive            Boolean  @default(true)
+  /// Human-readable description of rights / obligations.
+  description         String   @default("")
+  /// When this class was created.
+  createdAt           DateTime @default(now())
+
+  members Member[]
+
+  @@index([isActive])
+}
+
+/// A co-op member-OWNER. Membership NEVER expires. Soft status changes only — never hard-delete.
 model Member {
   /// Primary key uniquely identifying this member.
-  id           String     @id @default(cuid())
-  /// Co-op-wide membership number on the member card. Looked up at every POS checkout
-  /// when a shopper identifies — must stay indexed for O(1)-ish reads under live lane load.
-  /// (@unique already indexes this column; @@index below documents the POS requirement.)
-  memberNumber String     @unique
-  /// Member's full name for receipts and member services.
-  name         String
-  /// Contact email for membership communications.
-  email        String
-  /// Benefit tier (STANDARD / PLUS / EXECUTIVE) controlling member privileges.
-  tier         MemberTier @default(STANDARD)
-  /// Date the member joined the co-op.
-  joinedAt     DateTime   @default(now())
-  /// Membership expiration date; used to validate active status at checkout.
-  expiresAt    DateTime
+  id                      String       @id @default(cuid())
+  /// Co-op-wide membership / card number (POS hot-path lookup; keep indexed).
+  memberNumber            String       @unique
+  /// Legal name for certificates, dividends, and tax forms.
+  name                    String
+  /// Contact email (receipts, dividend notices).
+  email                   String
+  /// Contact phone.
+  phone                   String       @default("")
+  /// Mailing address for certificates and tax forms.
+  mailingAddress          String       @default("")
+  /// Membership class (contribution amount / votingRights=1 / dividendWeight).
+  membershipClassId       String
+  /// Owner lifecycle. WITHDRAWN/SUSPENDED/etc. keep financial history intact.
+  status                  MemberStatus @default(PENDING)
+  /// When the member record was created (application / join date).
+  joinedAt                DateTime     @default(now())
+  /// COOP_ADMIN (or authorized approver) who moved the member to ACTIVE.
+  approvedByUserId        String?
+  /// When membership was approved / activated.
+  approvedAt              DateTime?
+  /// Last 4 of SSN/ITIN, encrypted at rest — needed for dividend tax reporting
+  /// (1099-PATR vs 1099-DIV depends on classification; confirm with the co-op accountant).
+  taxIdLast4Encrypted     String?
+  /// Whether this member may cast ballots (usually true when status=ACTIVE).
+  isEligibleToVote        Boolean      @default(false)
+  /// Optional household primary (secondary shoppers linked to one voting owner).
+  householdPrimaryMemberId String?
 
-  /// Sales associated with this member when they identified at POS.
-  sales Sale[]
+  membershipClass MembershipClass @relation(fields: [membershipClassId], references: [id])
+  approvedBy      User?           @relation("MemberApprovedBy", fields: [approvedByUserId], references: [id])
+  householdPrimary Member?        @relation("MemberHousehold", fields: [householdPrimaryMemberId], references: [id])
+  householdMembers Member[]       @relation("MemberHousehold")
+  sales            Sale[]
+  contributions    CapitalContribution[]
+  equityAccount    MemberEquityAccount?
+  dividendAllocations DividendAllocation[]
+  votes            MemberVote[]
 
-  /// POS checkout hits memberNumber on every identified sale; keep this indexed for fast card lookups.
   @@index([memberNumber])
+  @@index([status])
+  @@index([membershipClassId])
+  @@index([email])
+}
+
+/// A capital contribution (equity buy-in). EQUITY, NOT REVENUE.
+/// Must NEVER appear in sales reports, store revenue, operator settlement, or P&L.
+/// Operators earn NO percentage. Routed only through membership.service — never createSale.
+/// Upgrading $100 → $1,000 ADDS a row; never replaces prior contributions.
+/// Dividend weight uses TOTAL contributed capital; voting stays at 1.
+model CapitalContribution {
+  /// Primary key uniquely identifying this contribution.
+  id                     String               @id @default(cuid())
+  /// Member who paid this equity contribution.
+  memberId               String
+  /// Amount contributed (USD).
+  amount                 Decimal              @db.Decimal(12, 2)
+  /// Payment lifecycle for this equity payment.
+  paymentStatus          CapitalPaymentStatus @default(PENDING)
+  /// Stripe PaymentIntent id when collected via card (optional; cash/check also allowed).
+  stripePaymentIntentId  String?              @unique
+  /// When funds were confirmed received.
+  receivedAt             DateTime?
+  /// Printed equity certificate number (human-readable).
+  certificateNumber      String?              @unique
+  /// When this contribution was refunded (withdrawal).
+  refundedAt             DateTime?
+  /// When the contribution row was created.
+  createdAt              DateTime             @default(now())
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@index([memberId])
+  @@index([paymentStatus])
+}
+
+/// Running equity ledger for a member (derived from CapitalContribution + DividendAllocation).
+model MemberEquityAccount {
+  /// Primary key uniquely identifying this equity account.
+  id                 String   @id @default(cuid())
+  /// Owner of this equity account (one per member).
+  memberId           String   @unique
+  /// Sum of PAID (non-refunded) capital contributions.
+  totalContributed   Decimal  @default(0) @db.Decimal(12, 2)
+  /// Cumulative dividends paid/allocated to date.
+  distributedToDate  Decimal  @default(0) @db.Decimal(12, 2)
+  /// currentBalance = totalContributed − distributedToDate (simplified equity book).
+  currentBalance     Decimal  @default(0) @db.Decimal(12, 2)
+  /// When totals were last recomputed.
+  lastUpdatedAt      DateTime @default(now())
+
+  member Member @relation(fields: [memberId], references: [id])
+}
+
+/// Board action authorizing dividends or other co-op decisions (minutes link).
+model BoardResolution {
+  /// Primary key uniquely identifying this resolution.
+  id          String                  @id @default(cuid())
+  /// Short title for the resolution.
+  title       String
+  /// Full text / description of what the board resolved.
+  description String                  @default("")
+  /// When the resolution was proposed.
+  proposedAt  DateTime                @default(now())
+  /// When the board voted (null while pending).
+  votedAt     DateTime?
+  /// Outcome of the board vote.
+  outcome     BoardResolutionOutcome  @default(PENDING)
+  /// URL to meeting minutes / PDF.
+  minutesUrl  String?
+  /// When this row was created.
+  createdAt   DateTime                @default(now())
+
+  dividends Dividend[]
+}
+
+/// A declared dividend pool. REQUIRES a BoardResolution — cannot be created without one.
+model Dividend {
+  /// Primary key uniquely identifying this dividend declaration.
+  id                 String                    @id @default(cuid())
+  /// Authorizing board resolution (required).
+  boardResolutionId  String
+  /// Fiscal year the dividend relates to (e.g. 2026).
+  fiscalYear         Int
+  /// Total pool amount to allocate across members.
+  totalPoolAmount    Decimal                   @db.Decimal(12, 2)
+  /// How to split the pool (BY_CAPITAL / BY_PATRONAGE / HYBRID) — see enum comment.
+  allocationMethod   DividendAllocationMethod
+  /// When the dividend was declared.
+  declaredAt         DateTime                  @default(now())
+  /// When payments were marked paid (null until paid).
+  paidAt             DateTime?
+  /// Lifecycle of this dividend run.
+  status             DividendStatus            @default(DECLARED)
+
+  boardResolution BoardResolution     @relation(fields: [boardResolutionId], references: [id])
+  allocations     DividendAllocation[]
+
+  @@index([boardResolutionId])
+  @@index([fiscalYear])
+  @@index([status])
+}
+
+/// Per-member share of a Dividend.
+/// Tax form issuance: 1099-PATR vs 1099-DIV depends on whether the distribution is classified
+/// as patronage dividend vs investment return — MUST be confirmed with the co-op's accountant
+/// before setting taxFormIssued; Harvestlink stores the flag, not the legal classification.
+model DividendAllocation {
+  /// Primary key uniquely identifying this allocation line.
+  id              String               @id @default(cuid())
+  /// Parent dividend declaration.
+  dividendId      String
+  /// Member receiving this allocation.
+  memberId        String
+  /// Weight used in the allocation formula (capital, patronage dollars, or hybrid blend).
+  memberWeight    Decimal              @db.Decimal(18, 6)
+  /// Dollar amount allocated to this member.
+  amount          Decimal              @db.Decimal(12, 2)
+  /// Whether this allocation has been paid out.
+  paymentStatus   CapitalPaymentStatus @default(PENDING)
+  /// Whether a tax form was issued for this allocation (see accountant note above).
+  taxFormIssued   Boolean              @default(false)
+
+  dividend Dividend @relation(fields: [dividendId], references: [id], onDelete: Cascade)
+  member   Member   @relation(fields: [memberId], references: [id])
+
+  @@unique([dividendId, memberId])
+  @@index([memberId])
+}
+
+/// A co-op ballot (election / referendum). One vote per ACTIVE member — never weighted by capital.
+model Ballot {
+  /// Primary key uniquely identifying this ballot.
+  id          String       @id @default(cuid())
+  /// Ballot title shown to voters.
+  title       String
+  /// Description / question text.
+  description String       @default("")
+  /// When voting opens.
+  opensAt     DateTime     @default(now())
+  /// When voting closes (null = open until closed manually).
+  closesAt    DateTime?
+  /// OPEN / CLOSED / CANCELLED.
+  status      BallotStatus @default(OPEN)
+  /// When this ballot was created.
+  createdAt   DateTime     @default(now())
+
+  options BallotOption[]
+  votes   MemberVote[]
+}
+
+/// A selectable option on a Ballot.
+model BallotOption {
+  /// Primary key uniquely identifying this option.
+  id       String @id @default(cuid())
+  /// Parent ballot.
+  ballotId String
+  /// Option label (e.g. "Yes", "Candidate A").
+  label    String
+  /// Display order (ascending).
+  sortOrder Int   @default(0)
+
+  ballot Ballot       @relation(fields: [ballotId], references: [id], onDelete: Cascade)
+  votes  MemberVote[]
+
+  @@index([ballotId])
+}
+
+/// One member's vote on a ballot. Unique (ballotId, memberId) enforces one-member-one-vote at DB level.
+model MemberVote {
+  /// Primary key uniquely identifying this vote.
+  id             String   @id @default(cuid())
+  /// Ballot being voted on.
+  ballotId       String
+  /// Voting member (must be ACTIVE + isEligibleToVote).
+  memberId       String
+  /// Option selected.
+  ballotOptionId String
+  /// When the vote was cast.
+  castAt         DateTime @default(now())
+
+  ballot Ballot       @relation(fields: [ballotId], references: [id], onDelete: Cascade)
+  member Member       @relation(fields: [memberId], references: [id])
+  option BallotOption @relation(fields: [ballotOptionId], references: [id])
+
+  /// HARD RULE: one member, one vote — never weight by contribution size.
+  @@unique([ballotId, memberId])
+  @@index([memberId])
+  @@index([ballotOptionId])
 }
 
 /// A completed (or in-progress) checkout transaction; settlement amounts are frozen at sale time.
@@ -256,7 +529,7 @@ model Sale {
   /// Sum of line nets after discounts, BEFORE sales tax.
   /// Operator share is computed from this field — never from post-tax total.
   subtotal        Decimal  @db.Decimal(12, 2)
-  /// Total discounts applied (member tier + manual line discounts).
+  /// Total discounts applied (manual line discounts). Member capital is NOT a discount.
   discountAmount  Decimal  @default(0) @db.Decimal(12, 2)
   /// Sales tax charged on non-exempt lines (remitted to the state — not operator revenue).
   taxAmount       Decimal  @default(0) @db.Decimal(12, 2)

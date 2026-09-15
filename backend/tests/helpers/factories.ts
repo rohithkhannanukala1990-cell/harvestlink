@@ -1,7 +1,7 @@
 /**
  * Factories for money-path tests — store, users, products, members.
  */
-import { MemberTier, Prisma, Role, type Member, type Product, type Store, type User } from "@prisma/client";
+import { MemberStatus, Prisma, Role, type Member, type Product, type Store, type User } from "@prisma/client";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { prisma } from "./db.js";
@@ -67,19 +67,41 @@ export async function createProduct(
 }
 
 export async function createMember(input?: {
-  expiresAt?: Date;
+  status?: MemberStatus;
   email?: string;
+  membershipClassId?: string;
 }): Promise<Member> {
-  const expiresAt = input?.expiresAt ?? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
-  return prisma.member.create({
+  let classId = input?.membershipClassId;
+  if (!classId) {
+    const klass =
+      (await prisma.membershipClass.findFirst({ where: { isActive: true } })) ??
+      (await prisma.membershipClass.create({
+        data: {
+          id: "mc_test_100",
+          name: "Member $100",
+          contributionAmount: new Prisma.Decimal(100),
+          votingRights: 1,
+          dividendWeight: new Prisma.Decimal(100),
+        },
+      }));
+    classId = klass.id;
+  }
+
+  const member = await prisma.member.create({
     data: {
       memberNumber: `M${Math.floor(Math.random() * 1_000_000)}`,
       name: "Test Member",
       email: input?.email ?? `member-${Date.now()}@test.local`,
-      tier: MemberTier.STANDARD,
-      expiresAt,
+      membershipClassId: classId,
+      status: input?.status ?? MemberStatus.ACTIVE,
+      isEligibleToVote: (input?.status ?? MemberStatus.ACTIVE) === MemberStatus.ACTIVE,
+      approvedAt: new Date(),
     },
   });
+  await prisma.memberEquityAccount.create({
+    data: { memberId: member.id },
+  });
+  return member;
 }
 
 export function asAuthUser(user: User): AuthUser {

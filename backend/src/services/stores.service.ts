@@ -21,9 +21,6 @@ export type UpdateStoreInput = {
   /** Only COOP_ADMIN may set this — affects future sales only, never historical ones. */
   operatorPercent?: number;
   taxRate?: number;
-  tierDiscountStandard?: number;
-  tierDiscountPlus?: number;
-  tierDiscountExecutive?: number;
   refundPolicy?: string;
   isActive?: boolean;
   /** Client IP for audit log (operatorPercent changes). */
@@ -163,15 +160,8 @@ export async function updateStore(
     }
   }
 
-  for (const [key, value] of [
-    ["taxRate", input.taxRate],
-    ["tierDiscountStandard", input.tierDiscountStandard],
-    ["tierDiscountPlus", input.tierDiscountPlus],
-    ["tierDiscountExecutive", input.tierDiscountExecutive],
-  ] as const) {
-    if (value !== undefined && (value < 0 || value > 100)) {
-      throw new AppError(400, `${key} must be between 0 and 100`);
-    }
+  if (input.taxRate !== undefined && (input.taxRate < 0 || input.taxRate > 100)) {
+    throw new AppError(400, "taxRate must be between 0 and 100");
   }
 
   const updated = await prisma.store.update({
@@ -185,15 +175,6 @@ export async function updateStore(
         ? { operatorPercent: new Prisma.Decimal(input.operatorPercent) }
         : {}),
       ...(input.taxRate !== undefined ? { taxRate: new Prisma.Decimal(input.taxRate) } : {}),
-      ...(input.tierDiscountStandard !== undefined
-        ? { tierDiscountStandard: new Prisma.Decimal(input.tierDiscountStandard) }
-        : {}),
-      ...(input.tierDiscountPlus !== undefined
-        ? { tierDiscountPlus: new Prisma.Decimal(input.tierDiscountPlus) }
-        : {}),
-      ...(input.tierDiscountExecutive !== undefined
-        ? { tierDiscountExecutive: new Prisma.Decimal(input.tierDiscountExecutive) }
-        : {}),
     },
   });
 

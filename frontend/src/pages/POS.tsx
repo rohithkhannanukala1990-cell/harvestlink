@@ -397,7 +397,7 @@ export function POSPage() {
         <p className="text-lg font-semibold">Subtotal {money(subtotal)}</p>
         {member && (
           <p className="text-xs text-stone-500">
-            Member tier discount applies at checkout ({member.tier}).
+            Member {member.memberNumber} · {member.status} (memberships never expire)
           </p>
         )}
 
@@ -424,7 +424,7 @@ export function POSPage() {
           </label>
           {member && (
             <p className="text-sm text-stone-600">
-              {member.name} · {member.tier}
+              {member.name} · {member.status}
             </p>
           )}
         </div>

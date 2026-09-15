@@ -2,7 +2,13 @@
  * Typed shapes mirrored from the Harvestlink backend API responses.
  */
 export type Role = "CASHIER" | "STORE_ADMIN" | "COOP_ADMIN";
-export type MemberTier = "STANDARD" | "PLUS" | "EXECUTIVE";
+export type MemberStatus =
+  | "PENDING"
+  | "ACTIVE"
+  | "WITHDRAWN"
+  | "SUSPENDED"
+  | "DECEASED"
+  | "TRANSFERRED";
 export type PaymentMethod = "CHECKOUT" | "TERMINAL" | "CASH";
 export type PaymentStatus = "PENDING" | "PAID" | "FAILED" | "REFUNDED" | "EXPIRED" | "REFUNDING";
 
@@ -35,14 +41,34 @@ export type Product = {
   updatedAt: string;
 };
 
+export type MembershipClass = {
+  id: string;
+  name: string;
+  contributionAmount: string | number;
+  votingRights: number;
+  dividendWeight: string | number;
+  isActive: boolean;
+  description: string;
+};
+
 export type Member = {
   id: string;
   memberNumber: string;
   name: string;
   email: string;
-  tier: MemberTier;
+  phone?: string;
+  mailingAddress?: string;
+  membershipClassId: string;
+  status: MemberStatus;
   joinedAt: string;
-  expiresAt: string;
+  approvedAt?: string | null;
+  isEligibleToVote?: boolean;
+  membershipClass?: MembershipClass;
+  equityAccount?: {
+    totalContributed: string | number;
+    distributedToDate: string | number;
+    currentBalance: string | number;
+  } | null;
 };
 
 export type Sale = {
@@ -101,9 +127,6 @@ export type Store = {
   address: string;
   operatorPercent: string | number;
   taxRate?: string | number;
-  tierDiscountStandard?: string | number;
-  tierDiscountPlus?: string | number;
-  tierDiscountExecutive?: string | number;
   refundPolicy?: string;
   createdAt: string;
   isActive: boolean;

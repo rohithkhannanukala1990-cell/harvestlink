@@ -24,8 +24,6 @@ function StoreSettingsForm({ store }: { store: Store }) {
   const [address, setAddress] = useState(store.address);
   const [operatorPercent, setOperatorPercent] = useState(String(store.operatorPercent));
   const [taxRate, setTaxRate] = useState(String(store.taxRate ?? 0));
-  const [tierPlus, setTierPlus] = useState(String(store.tierDiscountPlus ?? 5));
-  const [tierExec, setTierExec] = useState(String(store.tierDiscountExecutive ?? 10));
   const [refundPolicy, setRefundPolicy] = useState(store.refundPolicy ?? "");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,8 +34,6 @@ function StoreSettingsForm({ store }: { store: Store }) {
         name,
         address,
         taxRate: Number(taxRate),
-        tierDiscountPlus: Number(tierPlus),
-        tierDiscountExecutive: Number(tierExec),
         refundPolicy,
       };
       if (canEditPercent) {
@@ -114,30 +110,6 @@ function StoreSettingsForm({ store }: { store: Store }) {
           className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
           value={taxRate}
           onChange={(e) => setTaxRate(e.target.value)}
-        />
-      </label>
-      <label className="block text-sm">
-        PLUS tier discount (%)
-        <input
-          type="number"
-          min={0}
-          max={100}
-          step="0.01"
-          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-          value={tierPlus}
-          onChange={(e) => setTierPlus(e.target.value)}
-        />
-      </label>
-      <label className="block text-sm">
-        EXECUTIVE tier discount (%)
-        <input
-          type="number"
-          min={0}
-          max={100}
-          step="0.01"
-          className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-          value={tierExec}
-          onChange={(e) => setTierExec(e.target.value)}
         />
       </label>
       <label className="block text-sm">

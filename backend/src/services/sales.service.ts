@@ -26,7 +26,6 @@
  * to the store operator. The co-op pays operators later (e.g. weekly bank transfer).
  */
 import {
-  MemberTier,
   PaymentMethod,
   PaymentStatus,
   Prisma,
@@ -42,6 +41,7 @@ import { prisma } from "../lib/prisma.js";
 import { getStripe, toStripeCents } from "../lib/stripe.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
+import { assertMemberActiveForSale } from "./membership.service.js";
 
 export { resolveStoreScope };
 
@@ -143,20 +143,6 @@ function stockNeededByProduct(items: SaleLineInput[]): Map<string, number> {
   return quantityByProductId;
 }
 
-function tierDiscountPercent(
-  tier: string | undefined,
-  store: {
-    tierDiscountStandard: Prisma.Decimal;
-    tierDiscountPlus: Prisma.Decimal;
-    tierDiscountExecutive: Prisma.Decimal;
-  },
-): Prisma.Decimal {
-  if (tier === "PLUS") return new Prisma.Decimal(store.tierDiscountPlus);
-  if (tier === "EXECUTIVE") return new Prisma.Decimal(store.tierDiscountExecutive);
-  if (tier === "STANDARD") return new Prisma.Decimal(store.tierDiscountStandard);
-  return new Prisma.Decimal(0);
-}
-
 function availableStock(stock: number, reserved: number): number {
   return stock - reserved;
 }
@@ -194,7 +180,8 @@ async function releaseReservationForSale(
  *
  * MONEY MATH (do not "simplify"):
  * 1) lineGross = price × qty
- * 2) discounts = member tier % of lineGross + optional manual $ (admin only)
+ * 2) discounts = optional manual $ (admin only) — capital contributions are NOT discounts
+ *    and NEVER flow through this function (see membership.service)
  * 3) lineNet = lineGross − discounts  (pre-tax)
  * 4) lineTax = taxExempt ? 0 : lineNet × store.taxRate / 100
  * 5) Sale.subtotal = Σ lineNet   ← PRE-TAX
@@ -203,6 +190,9 @@ async function releaseReservationForSale(
  * 8) operatorAmount = subtotal × operatorPercent / 100
  *    IMPORTANT: operator % applies to PRE-TAX subtotal only. Tax is not co-op/operator
  *    revenue — charging operatorPercent on post-tax total would overpay the operator.
+ *    Capital contributions are equity and earn ZERO operator percentage.
+ *
+ * Member attachment: status must be ACTIVE (memberships never expire).
  *
  * CASH: requires an open cash drawer (unless offlineSync); creates PAID immediately.
  * CARD: reserves stock and starts Checkout/Terminal (existing two-phase flow).
@@ -372,13 +362,9 @@ export async function createSale(
           operatorPercent: Prisma.Decimal;
           isActive: boolean;
           taxRate: Prisma.Decimal;
-          tierDiscountStandard: Prisma.Decimal;
-          tierDiscountPlus: Prisma.Decimal;
-          tierDiscountExecutive: Prisma.Decimal;
         }>
       >`
-        SELECT id, "operatorPercent", "isActive", "taxRate",
-               "tierDiscountStandard", "tierDiscountPlus", "tierDiscountExecutive"
+        SELECT id, "operatorPercent", "isActive", "taxRate"
         FROM "Store"
         WHERE id = ${storeId}
         FOR UPDATE
@@ -402,19 +388,15 @@ export async function createSale(
         }
       }
 
-      let memberTier: MemberTier | null = null;
       if (input.memberId) {
         const member = await tx.member.findUnique({ where: { id: input.memberId } });
         if (!member) {
           throw new AppError(404, "Member not found");
         }
-        if (member.expiresAt.getTime() < Date.now()) {
-          throw new AppError(400, "Member membership is expired");
-        }
-        memberTier = member.tier;
+        // Memberships NEVER expire — ACTIVE status is the only gate (replaces expiresAt).
+        assertMemberActiveForSale(member);
       }
 
-      const tierPct = tierDiscountPercent(memberTier ?? undefined, store);
       const taxRate = new Prisma.Decimal(store.taxRate);
 
       let subtotal = new Prisma.Decimal(0);
@@ -438,14 +420,13 @@ export async function createSale(
         const priceSnapshot = new Prisma.Decimal(product.price);
         const lineGross = moneyDec(priceSnapshot.mul(item.quantity));
 
-        const tierDiscount = moneyDec(lineGross.mul(tierPct).div(100));
         let manual = moneyDec(item.manualDiscount ?? 0);
-        if (manual.gt(lineGross.sub(tierDiscount))) {
-          throw new AppError(400, "manualDiscount exceeds line amount after tier discount", {
+        if (manual.gt(lineGross)) {
+          throw new AppError(400, "manualDiscount exceeds line amount", {
             productId: item.productId,
           });
         }
-        const lineDiscount = moneyDec(tierDiscount.add(manual));
+        const lineDiscount = moneyDec(manual);
         const lineNet = moneyDec(lineGross.sub(lineDiscount));
         const exempt = product.taxExempt;
         const lineTax = exempt ? moneyDec(0) : moneyDec(lineNet.mul(taxRate).div(100));

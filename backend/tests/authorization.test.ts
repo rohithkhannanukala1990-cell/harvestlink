@@ -62,6 +62,7 @@ describe("authorization", () => {
               role: Role.CASHIER,
               storeId: store.id,
               tier: "STANDARD",
+              membershipClassId: "mc_member_100",
             });
 
       expect(res.status, `${check.method.toUpperCase()} ${check.path}`).toBe(403);

@@ -18,6 +18,14 @@ export async function truncateAll(): Promise<void> {
       "PurchaseOrder",
       "SupplierProduct",
       "Supplier",
+      "MemberVote",
+      "BallotOption",
+      "Ballot",
+      "DividendAllocation",
+      "Dividend",
+      "BoardResolution",
+      "CapitalContribution",
+      "MemberEquityAccount",
       "SaleItem",
       "Sale",
       "StockAdjustment",
@@ -25,6 +33,7 @@ export async function truncateAll(): Promise<void> {
       "CashDrawer",
       "Product",
       "Member",
+      "MembershipClass",
       "User",
       "Store"
     RESTART IDENTITY CASCADE

@@ -1,7 +1,7 @@
 /**
  * createSale money math, stock/store/member guards, and last-unit concurrency.
  */
-import { PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
+import { PaymentMethod, PaymentStatus, Prisma, MemberStatus } from "@prisma/client";
 import { describe, expect, it } from "vitest";
 import { AppError } from "../src/lib/errors.js";
 import * as salesService from "../src/services/sales.service.js";
@@ -22,7 +22,9 @@ describe("createSale", () => {
       await prisma.$executeRawUnsafe(`
         TRUNCATE TABLE
           "AuditLog","ProcessedStripeEvent","InventoryWriteOff","SaleRefundLine","SaleRefund",
-          "StockReconciliation","SaleItem","Sale","StockAdjustment","Payout","CashDrawer","Product","Member","User","Store"
+          "StockReconciliation","MemberVote","BallotOption","Ballot","DividendAllocation","Dividend","BoardResolution",
+          "CapitalContribution","MemberEquityAccount","SaleItem","Sale","StockAdjustment","Payout","CashDrawer",
+          "Product","Member","MembershipClass","User","Store"
         RESTART IDENTITY CASCADE
       `);
 
@@ -105,11 +107,11 @@ describe("createSale", () => {
     });
   });
 
-  it("rejects expired member", async () => {
+  it("rejects non-ACTIVE members on sale", async () => {
     const { store, cashier } = await seedCashierStore();
     const product = await createProduct(store.id, { stock: 5 });
     const member = await createMember({
-      expiresAt: new Date(Date.now() - 60_000),
+      status: MemberStatus.SUSPENDED,
     });
 
     await expect(
@@ -120,7 +122,7 @@ describe("createSale", () => {
       }),
     ).rejects.toMatchObject({
       status: 400,
-      message: expect.stringContaining("expired"),
+      message: expect.stringContaining("not ACTIVE"),
     });
   });
 
