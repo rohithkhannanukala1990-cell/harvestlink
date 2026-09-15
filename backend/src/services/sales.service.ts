@@ -41,7 +41,6 @@ import { prisma } from "../lib/prisma.js";
 import { getStripe, toStripeCents } from "../lib/stripe.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
-import { assertMemberActiveForSale } from "./membership.service.js";
 
 export { resolveStoreScope };
 
@@ -145,6 +144,23 @@ function stockNeededByProduct(items: SaleLineInput[]): Map<string, number> {
 
 function availableStock(stock: number, reserved: number): number {
   return stock - reserved;
+}
+
+/**
+ * Member benefit % applied to lineGross before manual $.
+ *
+ * /// PLACEHOLDER: member discounts are being rebuilt as configurable benefits in R2. This returns
+ * /// zero so the discount arithmetic, field shapes, and manual-discount validation all stay
+ * /// intact, and R2 can plug the real benefits engine into this same seam. Do not delete the
+ * /// discount plumbing.
+ *
+ * Do not read removed Store.tierDiscount* columns or Member.tier — those are gone.
+ */
+function tierDiscountPercent(
+  _memberAttached: boolean,
+  _store: { id: string },
+): Prisma.Decimal {
+  return new Prisma.Decimal(0);
 }
 
 /**
@@ -388,15 +404,24 @@ export async function createSale(
         }
       }
 
+      let memberAttached = false;
       if (input.memberId) {
         const member = await tx.member.findUnique({ where: { id: input.memberId } });
         if (!member) {
           throw new AppError(404, "Member not found");
         }
-        // Memberships NEVER expire — ACTIVE status is the only gate (replaces expiresAt).
-        assertMemberActiveForSale(member);
+        // Memberships never expire — only ACTIVE members may be attached to a sale.
+        if (member.status !== "ACTIVE") {
+          throw new AppError(400, "Member is not ACTIVE and cannot be attached to a sale", {
+            memberNumber: member.memberNumber,
+            status: member.status,
+          });
+        }
+        memberAttached = true;
       }
 
+      // R2 will replace this placeholder; keep calling it so discount math stays wired.
+      const tierPct = tierDiscountPercent(memberAttached, store);
       const taxRate = new Prisma.Decimal(store.taxRate);
 
       let subtotal = new Prisma.Decimal(0);
@@ -421,12 +446,13 @@ export async function createSale(
         const lineGross = moneyDec(priceSnapshot.mul(item.quantity));
 
         let manual = moneyDec(item.manualDiscount ?? 0);
-        if (manual.gt(lineGross)) {
-          throw new AppError(400, "manualDiscount exceeds line amount", {
+        const tierDiscount = moneyDec(lineGross.mul(tierPct).div(100));
+        if (manual.gt(lineGross.sub(tierDiscount))) {
+          throw new AppError(400, "manualDiscount exceeds line amount after tier discount", {
             productId: item.productId,
           });
         }
-        const lineDiscount = moneyDec(manual);
+        const lineDiscount = moneyDec(tierDiscount.add(manual));
         const lineNet = moneyDec(lineGross.sub(lineDiscount));
         const exempt = product.taxExempt;
         const lineTax = exempt ? moneyDec(0) : moneyDec(lineNet.mul(taxRate).div(100));

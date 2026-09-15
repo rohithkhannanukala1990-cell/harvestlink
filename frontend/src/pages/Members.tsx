@@ -79,7 +79,6 @@ export function MembersPage() {
         body: {
           memberId: selectedId,
           amount: Number(contribAmount),
-          markPaid: true,
         },
       }),
     onSuccess: () => {
@@ -184,9 +183,13 @@ export function MembersPage() {
                   <span className="font-medium">{m.name}</span>
                   <span className="ml-2 font-mono text-xs text-stone-500">{m.memberNumber}</span>
                 </span>
-                <span className="text-sm text-stone-500">
-                  {m.status}
-                  {m.membershipClass ? ` · ${m.membershipClass.name}` : ""}
+                <span className="text-right text-sm text-stone-500">
+                  <span className="block">{m.status}</span>
+                  <span className="block text-xs">
+                    {m.membershipClass?.name ?? "—"}
+                    {" · "}
+                    {money(m.equityAccount?.totalContributed ?? 0)} contributed
+                  </span>
                 </span>
               </button>
             </li>
@@ -202,6 +205,10 @@ export function MembersPage() {
             {historyQuery.data && (
               <>
                 <p className="text-sm">
+                  Class: {historyQuery.data.member.membershipClass?.name ?? "—"}
+                  {" · "}
+                  Status: {historyQuery.data.member.status}
+                  {" · "}
                   Equity contributed:{" "}
                   {money(historyQuery.data.member.equityAccount?.totalContributed ?? 0)}
                   {" · "}

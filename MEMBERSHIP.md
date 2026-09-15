@@ -1,79 +1,36 @@
-# Harvestlink membership model
+# Harvestlink membership
 
-Harvestlink is a **registered cooperative**. Members are **owners**, not subscribers.
+Harvestlink is a registered cooperative. Members are **owners**, not subscribers.
 
-## What changed (and why)
+## Plain English
 
-The old model used a `MemberTier` enum (`STANDARD` / `PLUS` / `EXECUTIVE`) and a required
-`expiresAt` date. That came from a subscription-style design. It does **not** apply here.
+- **Owners, not subscribers.** Joining means buying a stake in the co-op with a one-time
+  lifetime capital contribution ($100 or $1,000). There is no monthly fee and no renewal date.
+- **Contributions are equity, not revenue.** Money paid for membership is ownership capital.
+  It must never be mixed into store sales, operator settlement, or P&L. Store operators earn
+  **no percentage** on capital contributions.
+- **Memberships never expire.** A member stays a member until they withdraw (or another soft
+  status change). POS only checks that status is `ACTIVE` — there is no expiry date.
+- **One member, one vote.** Voting power does not grow with how much capital someone put in.
+  A member who contributed $100 and a member who contributed $1,100 each get exactly one vote.
+- **Dividends need the board.** A dividend pool can only be declared after a board resolution
+  has been approved (`PASSED`). It is a board decision, not an admin shortcut.
 
-- Memberships are a **one-time lifetime capital contribution** ($100 or $1,000).
-- Memberships **never expire**.
-- Capital is **equity**, not store revenue. Operators earn **no percentage** on it.
-- Voting is **one member, one vote** — never weighted by how much someone contributed.
+## How capital upgrades work
 
-## Core concepts
+Paying more later (for example $100, then another $1,000) **adds** a new contribution row.
+Dividend weight uses the **sum** of paid capital. Voting stays at one.
 
-### MembershipClass
-
-Defines the buy-in: name, `contributionAmount`, `dividendWeight`, and `votingRights`.
-
-`votingRights` is **always 1** for every class. It exists as stored data so
-one-member-one-vote is explicit and auditable — not an assumption buried in code.
-
-Seeded classes:
-
-- `Member $100`
-- `Member $1,000`
-
-### Member
-
-Owners identified by `memberNumber` (POS card lookup). Status lifecycle:
+## Status lifecycle
 
 `PENDING` → `ACTIVE` → (`SUSPENDED` / `WITHDRAWN` / `DECEASED` / `TRANSFERRED`)
 
-**Members are never hard-deleted.** Withdrawal is: request → board review → refund capital →
-`WITHDRAWN`, preserving contribution and dividend history.
+Members are never hard-deleted. Withdrawal is: request → board review → refund capital under
+the bylaws → mark `WITHDRAWN`, keeping contribution and dividend history forever.
 
-POS attaches a member to a sale only when `status = ACTIVE` (no expiry check).
+## Developer rules
 
-### CapitalContribution
-
-Each payment of equity is a **new row**. Upgrading $100 → $1,000 **adds** a contribution;
-it does not replace the old one. Dividend weight uses **total** contributed capital; voting
-stays at 1.
-
-**Hard rule:** capital never flows through `createSale` or settlement. It is recorded only
-via `membership.service` / `/members/contributions`. Exclude it from sales reports, store
-revenue, operator settlement, and P&L.
-
-### MemberEquityAccount
-
-Running totals: `totalContributed`, `distributedToDate`, `currentBalance`.
-
-### BoardResolution → Dividend → DividendAllocation
-
-A dividend **cannot** be created without a board resolution that has `PASSED`.
-
-`allocationMethod` is configurable on purpose:
-
-- `BY_CAPITAL` — by investment (Harvestlink’s current terms)
-- `BY_PATRONAGE` — by how much the member buys (classic co-op)
-- `HYBRID` — blend
-
-Legal counsel may advise changing the method; never hardcode the formula in callers.
-
-**Tax forms:** whether a distribution needs **1099-PATR** vs **1099-DIV** depends on
-classification. Confirm with the co-op’s accountant before setting `taxFormIssued`.
-
-### Ballot / MemberVote
-
-One vote per ACTIVE eligible member. Enforced by a unique constraint on
-`(ballotId, memberId)` **and** application checks. Never weight votes by capital.
-
-## Developer checklist
-
-1. Need equity money? → `membership.service` only.
-2. Need POS member check? → `status === ACTIVE` only.
-3. Need a dividend? → require a passed `BoardResolution` first.
-4. Need to remove a member? → status change + refund flow, never `DELETE`.
+1. Equity money → `membership.service` / `/members/contributions` only — never `createSale`.
+2. POS member check → `status === ACTIVE` only.
+3. Dividends → require a `PASSED` `BoardResolution` first.
+4. Removing a member → status change + refund flow, never `DELETE`.

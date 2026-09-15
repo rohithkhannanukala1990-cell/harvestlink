@@ -61,7 +61,6 @@ describe("authorization", () => {
               password: "StrongPass123!",
               role: Role.CASHIER,
               storeId: store.id,
-              tier: "STANDARD",
               membershipClassId: "mc_member_100",
             });
 

@@ -163,7 +163,6 @@ membershipRouter.post(
         .object({
           memberId: z.string().min(1),
           amount: z.number().positive(),
-          markPaid: z.boolean().optional(),
           stripePaymentIntentId: z.string().nullable().optional(),
         })
         .safeParse(req.body);
@@ -171,10 +170,11 @@ membershipRouter.post(
         res.status(400).json({ error: "Invalid contribution", details: parsed.error.flatten() });
         return;
       }
-      const contribution = await membershipService.recordCapitalContribution(req.user!, {
-        ...parsed.data,
-        ipAddress: clientIp(req),
-      });
+      const contribution = await membershipService.recordCapitalContribution(
+        parsed.data.memberId,
+        parsed.data.amount,
+        parsed.data.stripePaymentIntentId,
+      );
       res.status(201).json({ contribution });
     } catch (error) {
       handleError(res, error);
@@ -270,7 +270,12 @@ membershipRouter.post(
         res.status(400).json({ error: "Invalid dividend", details: parsed.error.flatten() });
         return;
       }
-      const dividend = await membershipService.declareDividend(req.user!, parsed.data);
+      const dividend = await membershipService.declareDividend(
+        parsed.data.boardResolutionId,
+        parsed.data.fiscalYear,
+        parsed.data.totalPoolAmount,
+        parsed.data.allocationMethod,
+      );
       res.status(201).json({ dividend });
     } catch (error) {
       handleError(res, error);
@@ -283,7 +288,7 @@ membershipRouter.post(
   requireRole(Role.COOP_ADMIN),
   async (req, res) => {
     try {
-      const dividend = await membershipService.allocateDividend(req.user!, req.params.id!);
+      const dividend = await membershipService.allocateDividend(req.params.id!);
       res.status(200).json({ dividend });
     } catch (error) {
       handleError(res, error);
@@ -342,6 +347,19 @@ membershipRouter.post(
 );
 
 membershipRouter.get(
+  "/:id/equity",
+  requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const equity = await membershipService.getMemberEquity(req.params.id!);
+      res.status(200).json({ equity });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+membershipRouter.get(
   "/:id/purchase-history",
   requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
   async (req, res) => {
@@ -368,11 +386,7 @@ membershipRouter.post(
   requireRole(Role.COOP_ADMIN),
   async (req, res) => {
     try {
-      const member = await membershipService.approveMember(
-        req.user!,
-        req.params.id!,
-        clientIp(req),
-      );
+      const member = await membershipService.approveMember(req.params.id!, req.user!.id);
       res.status(200).json({ member });
     } catch (error) {
       handleError(res, error);
@@ -385,10 +399,16 @@ membershipRouter.post(
   requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
   async (req, res) => {
     try {
+      const parsed = z
+        .object({ reason: z.string().min(1) })
+        .safeParse(req.body ?? {});
+      if (!parsed.success) {
+        res.status(400).json({ error: "reason is required", details: parsed.error.flatten() });
+        return;
+      }
       const member = await membershipService.requestWithdrawal(
-        req.user!,
         req.params.id!,
-        clientIp(req),
+        parsed.data.reason,
       );
       res.status(200).json({ member });
     } catch (error) {

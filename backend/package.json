@@ -16,7 +16,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "prisma:seed": "tsx prisma/seed.ts"
+    "prisma:seed": "tsx prisma/seed.ts",
+    "db:backup": "node scripts/run-backup.mjs",
+    "db:migrate-members": "tsx scripts/migrate-members-to-coop.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

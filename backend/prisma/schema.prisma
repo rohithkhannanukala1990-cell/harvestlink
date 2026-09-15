@@ -286,35 +286,38 @@ model Member {
   name                    String
   /// Contact email (receipts, dividend notices).
   email                   String
-  /// Contact phone.
+  /// Contact phone for member services and certificate delivery.
   phone                   String       @default("")
-  /// Mailing address for certificates and tax forms.
+  /// Mailing address for equity certificates and tax forms (1099).
   mailingAddress          String       @default("")
-  /// Membership class (contribution amount / votingRights=1 / dividendWeight).
+  /// FK to MembershipClass (contribution amount / votingRights=1). Required after backfill.
   membershipClassId       String
-  /// Owner lifecycle. WITHDRAWN/SUSPENDED/etc. keep financial history intact.
+  /// Owner lifecycle (PENDING → ACTIVE → soft exit). Never hard-delete members.
   status                  MemberStatus @default(PENDING)
   /// When the member record was created (application / join date).
   joinedAt                DateTime     @default(now())
-  /// COOP_ADMIN (or authorized approver) who moved the member to ACTIVE.
+  /// User who approved this member into ACTIVE status (board / co-op admin).
   approvedByUserId        String?
-  /// When membership was approved / activated.
+  /// When membership was approved / activated (null while PENDING).
   approvedAt              DateTime?
-  /// Last 4 of SSN/ITIN, encrypted at rest — needed for dividend tax reporting
-  /// (1099-PATR vs 1099-DIV depends on classification; confirm with the co-op accountant).
-  taxIdLast4Encrypted     String?
-  /// Whether this member may cast ballots (usually true when status=ACTIVE).
-  isEligibleToVote        Boolean      @default(false)
-  /// Optional household primary (secondary shoppers linked to one voting owner).
+  /// Last 4 of SSN/ITIN for dividend tax reporting — encrypted at rest by membership.service
+  /// (AES-GCM). 1099-PATR vs 1099-DIV classification must be confirmed with the co-op accountant.
+  taxIdLast4              String?
+  /// Whether this member may cast ballots (one member, one vote — never weighted by capital).
+  isEligibleToVote        Boolean      @default(true)
+  /// Optional household primary: secondary shopper cards linked under one voting owner.
   householdPrimaryMemberId String?
 
   membershipClass MembershipClass @relation(fields: [membershipClassId], references: [id])
-  approvedBy      User?           @relation("MemberApprovedBy", fields: [approvedByUserId], references: [id])
-  householdPrimary Member?        @relation("MemberHousehold", fields: [householdPrimaryMemberId], references: [id])
-  householdMembers Member[]       @relation("MemberHousehold")
+  approvedBy      User?            @relation("MemberApprovedBy", fields: [approvedByUserId], references: [id])
+  householdPrimary Member?         @relation("MemberHousehold", fields: [householdPrimaryMemberId], references: [id])
+  householdMembers Member[]        @relation("MemberHousehold")
   sales            Sale[]
+  /// Equity buy-ins for this owner (CapitalContribution — never sales revenue).
   contributions    CapitalContribution[]
+  /// Running capital account (total in / distributed / balance).
   equityAccount    MemberEquityAccount?
+  /// Per-dividend payout lines for this member.
   dividendAllocations DividendAllocation[]
   votes            MemberVote[]
 
@@ -322,6 +325,8 @@ model Member {
   @@index([status])
   @@index([membershipClassId])
   @@index([email])
+  @@index([approvedByUserId])
+  @@index([householdPrimaryMemberId])
 }
 
 /// A capital contribution (equity buy-in). EQUITY, NOT REVENUE.
@@ -611,7 +616,7 @@ model SaleItem {
   priceSnapshot Decimal @db.Decimal(12, 2)
   /// Quantity of units sold on this line.
   quantity      Int
-  /// Discount dollars applied to this line (tier + manual), before tax.
+  /// Discount dollars applied to this line (member benefit placeholder + manual), before tax.
   discountAmount Decimal @default(0) @db.Decimal(12, 2)
   /// Optional reason when a STORE_ADMIN applied a manual line discount.
   discountReason String?

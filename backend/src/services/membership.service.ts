@@ -269,7 +269,7 @@ export async function createMember(
             status: activate ? MemberStatus.ACTIVE : MemberStatus.PENDING,
             approvedByUserId: activate ? actor.id : null,
             approvedAt: activate ? new Date() : null,
-            taxIdLast4Encrypted: taxEnc,
+            taxIdLast4: taxEnc,
             isEligibleToVote: activate,
             householdPrimaryMemberId: input.householdPrimaryMemberId ?? null,
           },
@@ -302,7 +302,7 @@ export async function getMemberByNumber(memberNumber: string) {
   return member;
 }
 
-/** Asserts ACTIVE for checkout attachment — replaces the old expiresAt check. */
+/** Asserts ACTIVE for checkout attachment. Memberships never expire — no expiresAt check. */
 export function assertMemberActiveForSale(member: { status: MemberStatus; memberNumber: string }): void {
   if (member.status !== MemberStatus.ACTIVE) {
     throw new AppError(400, "Member is not ACTIVE and cannot be attached to a sale", {
@@ -347,7 +347,7 @@ export async function updateMember(
       ...(input.status !== undefined ? { status: input.status } : {}),
       ...(input.taxIdLast4 !== undefined
         ? {
-            taxIdLast4Encrypted: input.taxIdLast4
+            taxIdLast4: input.taxIdLast4
               ? encryptTaxIdLast4(input.taxIdLast4.trim().slice(-4))
               : null,
           }
@@ -357,23 +357,37 @@ export async function updateMember(
   });
 }
 
+/**
+ * Approves a PENDING member application → ACTIVE.
+ *
+ * Sets approvedByUserId / approvedAt and restores voting eligibility.
+ * Memberships do NOT expire — ACTIVE is the only POS gate (no expiresAt).
+ * Does not invent capital; contributions are recorded separately via
+ * recordCapitalContribution after payment is verified.
+ */
 export async function approveMember(
-  actor: AuthUser,
-  id: string,
-  ipAddress?: string | null,
+  memberId: string,
+  approvedByUserId: string,
 ): Promise<Member> {
-  assertCoopAdmin(actor);
-  const existing = await prisma.member.findUnique({ where: { id } });
+  const existing = await prisma.member.findUnique({ where: { id: memberId } });
   if (!existing) throw new AppError(404, "Member not found");
-  if (existing.status !== MemberStatus.PENDING && existing.status !== MemberStatus.SUSPENDED) {
-    throw new AppError(409, "Only PENDING or SUSPENDED members can be approved to ACTIVE");
+  if (existing.status !== MemberStatus.PENDING) {
+    throw new AppError(409, "Only PENDING members can be approved to ACTIVE", {
+      status: existing.status,
+    });
   }
 
+  const approver = await prisma.user.findUnique({
+    where: { id: approvedByUserId },
+    select: { id: true },
+  });
+  if (!approver) throw new AppError(400, "approvedByUserId is not a valid user");
+
   const member = await prisma.member.update({
-    where: { id },
+    where: { id: memberId },
     data: {
       status: MemberStatus.ACTIVE,
-      approvedByUserId: actor.id,
+      approvedByUserId,
       approvedAt: new Date(),
       isEligibleToVote: true,
     },
@@ -381,37 +395,52 @@ export async function approveMember(
   });
 
   await writeAuditLog({
-    userId: actor.id,
+    userId: approvedByUserId,
     action: AuditAction.MEMBER_APPROVE,
     entityType: "Member",
-    entityId: id,
+    entityId: memberId,
     before: { status: existing.status },
-    after: { status: member.status },
-    ipAddress: ipAddress ?? null,
+    after: { status: member.status, approvedByUserId },
   });
 
   return member;
 }
 
 /**
- * Member requests withdrawal. Does NOT refund automatically — board review → refundCapital.
- * Preserves all CapitalContribution / DividendAllocation history.
+ * Creates a withdrawal request for board review (soft status change only).
+ *
+ * /// Members are NEVER hard-deleted. Their financial history must survive permanently. Withdrawal
+ * /// is: request, then board review, then refund of capital subject to the bylaws.
+ *
+ * Flow after this call:
+ * 1. Board reviews the reason (stored on the audit row).
+ * 2. COOP_ADMIN refunds PAID CapitalContribution rows (refundCapitalContribution).
+ * 3. finalizeWithdrawal marks the member WITHDRAWN once capital is cleared.
+ *
+ * The member is SUSPENDED (not deleted) so POS stops attaching them and voting stops,
+ * while CapitalContribution / DividendAllocation / Sale history remain intact.
  */
 export async function requestWithdrawal(
-  actor: AuthUser,
-  id: string,
-  ipAddress?: string | null,
+  memberId: string,
+  reason: string,
 ): Promise<Member> {
-  assertMemberAdmin(actor);
-  const existing = await prisma.member.findUnique({ where: { id } });
+  const trimmedReason = reason.trim();
+  if (!trimmedReason) {
+    throw new AppError(400, "Withdrawal reason is required for board review");
+  }
+
+  const existing = await prisma.member.findUnique({ where: { id: memberId } });
   if (!existing) throw new AppError(404, "Member not found");
   if (existing.status === MemberStatus.WITHDRAWN) {
     throw new AppError(409, "Member is already WITHDRAWN");
   }
+  if (existing.status === MemberStatus.SUSPENDED) {
+    throw new AppError(409, "Withdrawal request already pending board review");
+  }
 
-  // Soft-flag via SUSPENDED pending board; COOP_ADMIN finalizes WITHDRAWN after refund.
+  // Soft-flag via SUSPENDED pending board; never DELETE the Member row.
   const member = await prisma.member.update({
-    where: { id },
+    where: { id: memberId },
     data: {
       status: MemberStatus.SUSPENDED,
       isEligibleToVote: false,
@@ -420,13 +449,16 @@ export async function requestWithdrawal(
   });
 
   await writeAuditLog({
-    userId: actor.id,
+    userId: null,
     action: AuditAction.MEMBER_WITHDRAW_REQUEST,
     entityType: "Member",
-    entityId: id,
+    entityId: memberId,
     before: { status: existing.status },
-    after: { status: member.status, note: "Awaiting board review / capital refund" },
-    ipAddress: ipAddress ?? null,
+    after: {
+      status: member.status,
+      reason: trimmedReason,
+      note: "Awaiting board review / capital refund per bylaws — do not hard-delete",
+    },
   });
 
   return member;
@@ -468,61 +500,133 @@ export async function getPurchaseHistory(memberId: string, page: number, pageSiz
 // ─── Capital contributions (EQUITY — never createSale / settlement) ──────────
 
 /**
- * Records a capital contribution.
- * CRITICAL: This is equity, not revenue. Do not call from sales or settlement code.
- * Upgrading $100 → $1,000 ADDS a new row (never replaces prior contributions).
+ * Records a verified capital contribution and refreshes the member equity ledger
+ * in a single transaction. Always issues a certificateNumber for the paid stake.
+ *
+ * /// CRITICAL: This is EQUITY, not revenue. This function must NEVER call createSale, must never
+ * /// touch the settlement pipeline, and the store operator earns NO percentage on it. A member
+ * /// contributing capital is buying ownership, not buying groceries.
+ *
+ * Upgrading $100 → $1,000 ADDS a new CapitalContribution row; it never replaces prior rows.
+ * Dividend weight uses TOTAL contributed capital; voting stays one-member-one-vote.
+ *
+ * @param memberId Owner receiving the equity credit
+ * @param amount USD amount of this buy-in (must be positive)
+ * @param stripePaymentIntentId Optional Stripe PI when card-collected; cash/check omit this
  */
 export async function recordCapitalContribution(
-  actor: AuthUser,
-  input: {
-    memberId: string;
-    amount: number;
-    /** When true, mark PAID immediately (cash/check at the office). */
-    markPaid?: boolean;
-    stripePaymentIntentId?: string | null;
-    ipAddress?: string | null;
-  },
+  memberId: string,
+  amount: number,
+  stripePaymentIntentId?: string | null,
 ): Promise<CapitalContribution> {
-  assertCoopAdmin(actor);
-  if (!(input.amount > 0)) throw new AppError(400, "Contribution amount must be positive");
+  if (!(amount > 0)) throw new AppError(400, "Contribution amount must be positive");
 
-  const member = await prisma.member.findUnique({ where: { id: input.memberId } });
+  const member = await prisma.member.findUnique({ where: { id: memberId } });
   if (!member) throw new AppError(404, "Member not found");
 
+  // Single transaction: CapitalContribution (PAID) + MemberEquityAccount recompute.
+  // Intentionally does NOT import or call sales.service / settlement / createSale.
   const contribution = await prisma.$transaction(async (tx) => {
-    const markPaid = Boolean(input.markPaid);
-    const certificateNumber = markPaid ? await nextCertificateNumber(tx) : null;
+    const certificateNumber = await nextCertificateNumber(tx);
     const row = await tx.capitalContribution.create({
       data: {
-        memberId: input.memberId,
-        amount: money(input.amount),
-        paymentStatus: markPaid ? CapitalPaymentStatus.PAID : CapitalPaymentStatus.PENDING,
-        stripePaymentIntentId: input.stripePaymentIntentId ?? null,
-        receivedAt: markPaid ? new Date() : null,
+        memberId,
+        amount: money(amount),
+        paymentStatus: CapitalPaymentStatus.PAID,
+        stripePaymentIntentId: stripePaymentIntentId ?? null,
+        receivedAt: new Date(),
         certificateNumber,
       },
     });
-    if (markPaid) {
-      await refreshEquityAccount(tx, input.memberId);
-    }
+    await refreshEquityAccount(tx, memberId);
     return row;
   });
 
   await writeAuditLog({
-    userId: actor.id,
+    userId: null,
     action: AuditAction.CAPITAL_CONTRIBUTION,
     entityType: "CapitalContribution",
     entityId: contribution.id,
     after: {
-      memberId: input.memberId,
-      amount: money(input.amount).toFixed(2),
+      memberId,
+      amount: money(amount).toFixed(2),
       paymentStatus: contribution.paymentStatus,
-      note: "EQUITY — excluded from sales/settlement/P&L",
+      certificateNumber: contribution.certificateNumber,
+      stripePaymentIntentId: stripePaymentIntentId ?? null,
+      note: "EQUITY — excluded from sales/settlement/P&L; operator earns 0%",
     },
-    ipAddress: input.ipAddress ?? null,
   });
 
   return contribution;
+}
+
+/**
+ * Returns the member's equity snapshot: contribution history, totals, dividends, balance.
+ * Reads MemberEquityAccount (ledger) plus related CapitalContribution / DividendAllocation rows.
+ * Never invents capital — legacy members migrated without payment show zero until recorded.
+ */
+export async function getMemberEquity(memberId: string): Promise<{
+  memberId: string;
+  contributions: CapitalContribution[];
+  totalContributed: Prisma.Decimal;
+  dividendsReceived: Array<{
+    id: string;
+    dividendId: string;
+    amount: Prisma.Decimal;
+    paymentStatus: CapitalPaymentStatus;
+    taxFormIssued: boolean;
+  }>;
+  dividendsReceivedTotal: Prisma.Decimal;
+  currentBalance: Prisma.Decimal;
+  equityAccount: {
+    totalContributed: Prisma.Decimal;
+    distributedToDate: Prisma.Decimal;
+    currentBalance: Prisma.Decimal;
+    lastUpdatedAt: Date;
+  } | null;
+}> {
+  const member = await prisma.member.findUnique({
+    where: { id: memberId },
+    include: {
+      equityAccount: true,
+      contributions: { orderBy: { createdAt: "asc" } },
+      dividendAllocations: {
+        orderBy: { id: "asc" },
+        select: {
+          id: true,
+          dividendId: true,
+          amount: true,
+          paymentStatus: true,
+          taxFormIssued: true,
+        },
+      },
+    },
+  });
+  if (!member) throw new AppError(404, "Member not found");
+
+  const dividendsReceivedTotal = money(
+    member.dividendAllocations.reduce(
+      (sum, row) => sum.add(row.amount),
+      new Prisma.Decimal(0),
+    ),
+  );
+
+  return {
+    memberId,
+    contributions: member.contributions,
+    totalContributed: money(member.equityAccount?.totalContributed ?? 0),
+    dividendsReceived: member.dividendAllocations,
+    dividendsReceivedTotal,
+    currentBalance: money(member.equityAccount?.currentBalance ?? 0),
+    equityAccount: member.equityAccount
+      ? {
+          totalContributed: member.equityAccount.totalContributed,
+          distributedToDate: member.equityAccount.distributedToDate,
+          currentBalance: member.equityAccount.currentBalance,
+          lastUpdatedAt: member.equityAccount.lastUpdatedAt,
+        }
+      : null,
+  };
 }
 
 export async function markContributionPaid(
@@ -676,52 +780,83 @@ export async function passBoardResolution(
 }
 
 /**
- * Declares a dividend pool. HARD RULE: boardResolutionId required and must be PASSED.
- * allocationMethod is configurable — never assume BY_CAPITAL in callers.
+ * Declares a dividend pool tied to a board resolution.
+ *
+ * /// A Dividend CANNOT be created without a BoardResolution. Reject the call if the resolution
+ * /// does not exist or its outcome was not approved. Dividends are a board decision, never an
+ * /// admin button.
+ *
+ * allocationMethod is stored on the Dividend so allocateDividend can split later —
+ * callers must never hardcode BY_CAPITAL as the only formula.
  */
 export async function declareDividend(
-  actor: AuthUser,
-  input: {
-    boardResolutionId: string;
-    fiscalYear: number;
-    totalPoolAmount: number;
-    allocationMethod: DividendAllocationMethod;
-  },
+  boardResolutionId: string,
+  fiscalYear: number,
+  totalPoolAmount: number,
+  allocationMethod: DividendAllocationMethod,
 ): Promise<Dividend> {
-  assertCoopAdmin(actor);
   const resolution = await prisma.boardResolution.findUnique({
-    where: { id: input.boardResolutionId },
+    where: { id: boardResolutionId },
   });
-  if (!resolution) throw new AppError(404, "Board resolution not found");
-  if (resolution.outcome !== BoardResolutionOutcome.PASSED) {
-    throw new AppError(400, "Dividend requires a PASSED BoardResolution");
+  if (!resolution) {
+    throw new AppError(404, "Board resolution not found");
   }
-  if (!(input.totalPoolAmount > 0)) {
+  // Only PASSED resolutions authorize a pool — PENDING/FAILED/TABLED are rejected.
+  if (resolution.outcome !== BoardResolutionOutcome.PASSED) {
+    throw new AppError(
+      400,
+      "Dividend requires a BoardResolution whose outcome is PASSED (approved)",
+      { outcome: resolution.outcome },
+    );
+  }
+  if (!(totalPoolAmount > 0)) {
     throw new AppError(400, "totalPoolAmount must be positive");
+  }
+  if (!Number.isInteger(fiscalYear) || fiscalYear < 1900) {
+    throw new AppError(400, "fiscalYear must be a valid calendar year");
   }
 
   return prisma.dividend.create({
     data: {
-      boardResolutionId: input.boardResolutionId,
-      fiscalYear: input.fiscalYear,
-      totalPoolAmount: money(input.totalPoolAmount),
-      allocationMethod: input.allocationMethod,
+      boardResolutionId,
+      fiscalYear,
+      totalPoolAmount: money(totalPoolAmount),
+      allocationMethod,
       status: DividendStatus.DECLARED,
     },
   });
 }
 
+/** UTC calendar bounds for a fiscal year used in patronage weighting. */
+function fiscalYearBounds(fiscalYear: number): { start: Date; endExclusive: Date } {
+  return {
+    start: new Date(Date.UTC(fiscalYear, 0, 1, 0, 0, 0, 0)),
+    endExclusive: new Date(Date.UTC(fiscalYear + 1, 0, 1, 0, 0, 0, 0)),
+  };
+}
+
 /**
- * Allocates the dividend pool across ACTIVE members.
- * BY_CAPITAL uses MemberEquityAccount.totalContributed (sum of PAID capital).
- * BY_PATRONAGE uses lifetime PAID sale totals for the member.
- * HYBRID = 50/50 blend of normalized capital + patronage weights.
+ * Default HYBRID mix: 50% capital / 50% patronage. Override via capitalShare (0..1).
+ * Normalized per factor so dollar scales do not dominate each other before blending.
+ */
+const DEFAULT_HYBRID_CAPITAL_SHARE = 0.5;
+
+/**
+ * Splits a declared dividend pool across ACTIVE members into DividendAllocation rows.
+ *
+ * - BY_CAPITAL: proportional to each member's totalContributed (PAID capital)
+ * - BY_PATRONAGE: proportional to each member's purchases (sale subtotals) in that fiscal year
+ * - HYBRID: configurable blend of the two after independent normalization
+ *
+ * /// Voting is NEVER weighted by any of this. One member, one vote, always.
+ *
+ * Allocation does not pay anyone and does not change voting power. Tax-form flags stay
+ * false until ops confirms 1099-PATR vs 1099-DIV with the co-op accountant.
  */
 export async function allocateDividend(
-  actor: AuthUser,
   dividendId: string,
+  options?: { hybridCapitalShare?: number },
 ): Promise<Dividend> {
-  assertCoopAdmin(actor);
   const dividend = await prisma.dividend.findUnique({ where: { id: dividendId } });
   if (!dividend) throw new AppError(404, "Dividend not found");
   if (dividend.status !== DividendStatus.DECLARED) {
@@ -733,10 +868,14 @@ export async function allocateDividend(
     include: { equityAccount: true },
   });
 
+  // Patronage = PRE-TAX sale subtotals attached to the member in the dividend's fiscal year.
+  // Not lifetime — bylaws typically allocate patronage for a specific year.
+  const { start, endExclusive } = fiscalYearBounds(dividend.fiscalYear);
   const patronageRows = await prisma.sale.groupBy({
     by: ["memberId"],
     where: {
       memberId: { not: null },
+      createdAt: { gte: start, lt: endExclusive },
       paymentStatus: { in: ["PAID", "REFUNDED", "REFUNDING"] },
     },
     _sum: { subtotal: true },
@@ -745,31 +884,47 @@ export async function allocateDividend(
     patronageRows.map((r) => [r.memberId!, Number(r._sum.subtotal ?? 0)]),
   );
 
+  const capitalByMember = new Map(
+    members.map((m) => [m.id, Number(m.equityAccount?.totalContributed ?? 0)]),
+  );
+
+  const capitalShareRaw = options?.hybridCapitalShare ?? DEFAULT_HYBRID_CAPITAL_SHARE;
+  if (capitalShareRaw < 0 || capitalShareRaw > 1) {
+    throw new AppError(400, "hybridCapitalShare must be between 0 and 1");
+  }
+
+  // Independent totals for normalizing HYBRID factors (avoids $ patronage drowning $ capital).
+  const totalCapital = [...capitalByMember.values()].reduce((s, v) => s + v, 0);
+  const totalPatronage = [...patronageByMember.values()].reduce((s, v) => s + v, 0);
+
   type WeightRow = { memberId: string; weight: Prisma.Decimal };
   const weights: WeightRow[] = [];
 
   for (const m of members) {
-    const capital = Number(m.equityAccount?.totalContributed ?? 0);
+    const capital = capitalByMember.get(m.id) ?? 0;
     const patronage = patronageByMember.get(m.id) ?? 0;
     let weight = 0;
+
     if (dividend.allocationMethod === DividendAllocationMethod.BY_CAPITAL) {
+      // Proportional to total contributed capital (equity), not sales.
       weight = capital;
     } else if (dividend.allocationMethod === DividendAllocationMethod.BY_PATRONAGE) {
+      // Proportional to that fiscal year's purchases only.
       weight = patronage;
     } else {
-      // HYBRID — equal blend after independent normalization would need two passes;
-      // use raw sum of capital + patronage as a pragmatic hybrid weight.
-      weight = capital + patronage;
+      // HYBRID: configurable split between normalized capital and patronage shares.
+      const capitalNorm = totalCapital > 0 ? capital / totalCapital : 0;
+      const patronageNorm = totalPatronage > 0 ? patronage / totalPatronage : 0;
+      weight =
+        capitalShareRaw * capitalNorm + (1 - capitalShareRaw) * patronageNorm;
     }
+
     if (weight > 0) {
       weights.push({ memberId: m.id, weight: new Prisma.Decimal(weight) });
     }
   }
 
-  const totalWeight = weights.reduce(
-    (s, w) => s.add(w.weight),
-    new Prisma.Decimal(0),
-  );
+  const totalWeight = weights.reduce((s, w) => s.add(w.weight), new Prisma.Decimal(0));
   if (totalWeight.lte(0)) {
     throw new AppError(400, "No members have positive weight for this allocation method");
   }
@@ -796,6 +951,7 @@ export async function allocateDividend(
     });
   });
 
+  // Voting is NEVER derived from these weights — ballots remain one-member-one-vote.
   return prisma.dividend.findUniqueOrThrow({
     where: { id: dividendId },
     include: { allocations: true },
