@@ -65,6 +65,16 @@ export function AppLayout() {
               Members
             </NavLink>
             {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+              <NavLink to="/suppliers" className={linkClass}>
+                Suppliers
+              </NavLink>
+            )}
+            {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+              <NavLink to="/purchase-orders" className={linkClass}>
+                POs
+              </NavLink>
+            )}
+            {isRole("STORE_ADMIN", "COOP_ADMIN") && (
               <NavLink to="/settlement" className={linkClass}>
                 Settlement
               </NavLink>

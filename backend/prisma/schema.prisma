@@ -81,6 +81,8 @@ model Store {
   cashDrawers CashDrawer[]
   /// Offline / sync stock conflicts awaiting human review.
   stockReconciliations StockReconciliation[]
+  /// Purchase orders targeted at this store (null on PO = co-op central buy).
+  purchaseOrders PurchaseOrder[]
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -116,6 +118,10 @@ model User {
   drawersOpened CashDrawer[] @relation("DrawerOpenedBy")
   /// Cash drawers this user closed.
   drawersClosed CashDrawer[] @relation("DrawerClosedBy")
+  /// Purchase orders this user created.
+  purchaseOrdersCreated PurchaseOrder[] @relation("PurchaseOrderCreatedBy")
+  /// Goods receipts this user recorded at the dock.
+  goodsReceiptsReceived GoodsReceipt[] @relation("GoodsReceiptReceivedBy")
 
   @@index([storeId])
 }
@@ -161,6 +167,12 @@ model Product {
   stockAdjustments StockAdjustment[]
   /// Offline sync conflicts that drove this product's stock negative.
   stockReconciliations StockReconciliation[]
+  /// Supplier catalog links (case packs / costs) for this SKU.
+  supplierProducts SupplierProduct[]
+  /// Purchase-order lines that order this product.
+  purchaseOrderLines PurchaseOrderLine[]
+  /// Goods-receipt lines that received this product into stock.
+  goodsReceiptLines GoodsReceiptLine[]
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
@@ -502,6 +514,211 @@ model StockReconciliation {
   @@index([storeId])
   @@index([storeId, resolvedAt])
   @@index([saleId])
+  @@index([productId])
+}
+
+/// Lifecycle of a purchase order from draft through receiving.
+enum PurchaseOrderStatus {
+  DRAFT
+  SUBMITTED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+/// Vendor that sells goods to the co-op / stores (network-wide; not store-scoped).
+model Supplier {
+  /// Primary key uniquely identifying this supplier.
+  id            String   @id @default(cuid())
+  /// Legal / trade name shown on POs and receiving screens.
+  name          String
+  /// Primary contact person at the vendor.
+  contactName   String   @default("")
+  /// Vendor billing / order email.
+  email         String   @default("")
+  /// Vendor phone for order follow-up.
+  phone         String   @default("")
+  /// Mailing / remit-to address.
+  address       String   @default("")
+  /// Payment terms string (e.g. NET30, COD, NET15).
+  paymentTerms  String   @default("NET30")
+  /// Typical days from order submit to delivery (used for expectedDate suggestions).
+  leadTimeDays  Int      @default(7)
+  /// When false, supplier cannot be selected on new POs.
+  isActive      Boolean  @default(true)
+  /// Free-form ops notes (dock hours, pallet requirements, etc.).
+  notes         String   @default("")
+  /// When this supplier record was created.
+  createdAt     DateTime @default(now())
+  /// When supplier fields were last updated.
+  updatedAt     DateTime @updatedAt
+
+  /// Catalog links from this supplier to store products.
+  products       SupplierProduct[]
+  /// Purchase orders placed with this supplier.
+  purchaseOrders PurchaseOrder[]
+
+  @@index([isActive])
+  @@index([name])
+}
+
+/// Links a Supplier to a store Product with pack/cost terms.
+/// A product may have several suppliers; at most one should be isPreferred per product.
+model SupplierProduct {
+  /// Primary key uniquely identifying this supplier–product link.
+  id           String   @id @default(cuid())
+  /// Vendor side of the link.
+  supplierId   String
+  /// Store catalog product being supplied.
+  productId    String
+  /// Vendor's own SKU / item code for ordering.
+  supplierSku  String   @default("")
+  /// Units per case (order quantities often round up to whole cases).
+  caseSize     Int      @default(1)
+  /// Cost for one full case (informational; unitCost is used on PO lines).
+  caseCost     Decimal  @db.Decimal(12, 2)
+  /// Cost per sellable unit from this supplier (default PO line unitCost).
+  unitCost     Decimal  @db.Decimal(12, 2)
+  /// Minimum order quantity in units (enforced on reorder suggestions).
+  minOrderQty  Int      @default(1)
+  /// When true, reorder suggestions prefer this supplier for the product.
+  isPreferred  Boolean  @default(false)
+  /// When this link was created.
+  createdAt    DateTime @default(now())
+  /// When pack/cost fields were last updated.
+  updatedAt    DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, productId])
+  @@index([productId])
+  @@index([supplierId])
+  @@index([productId, isPreferred])
+}
+
+/// A purchase order to a supplier — store-scoped or co-op central (storeId null).
+model PurchaseOrder {
+  /// Primary key uniquely identifying this PO.
+  id              String              @id @default(cuid())
+  /// Human-readable sequential number (e.g. PO-000042) for dock paperwork.
+  poNumber        String              @unique
+  /// Vendor fulfilling this order.
+  supplierId      String
+  /// Destination store; null = co-op-level central buy (lines still reference store products).
+  storeId         String?
+  /// Draft → submitted → receiving lifecycle.
+  status          PurchaseOrderStatus @default(DRAFT)
+  /// Expected delivery date (from lead time or manually set).
+  expectedDate    DateTime?
+  /// When the PO left DRAFT (submitted to supplier / locked for edit).
+  submittedAt     DateTime?
+  /// User who created the draft.
+  createdByUserId String
+  /// Sum of line totals (orderedQty × unitCost) before tax/shipping.
+  subtotal        Decimal             @default(0) @db.Decimal(12, 2)
+  /// Tax on the PO (entered by buyer; not computed from store sales tax).
+  tax             Decimal             @default(0) @db.Decimal(12, 2)
+  /// Freight / shipping charged on the PO.
+  shipping        Decimal             @default(0) @db.Decimal(12, 2)
+  /// subtotal + tax + shipping — amount expected on the supplier invoice.
+  total           Decimal             @default(0) @db.Decimal(12, 2)
+  /// When the PO row was created.
+  createdAt       DateTime            @default(now())
+  /// When totals/status/lines were last updated.
+  updatedAt       DateTime            @updatedAt
+
+  supplier  Supplier            @relation(fields: [supplierId], references: [id])
+  store     Store?              @relation(fields: [storeId], references: [id])
+  createdBy User                @relation("PurchaseOrderCreatedBy", fields: [createdByUserId], references: [id])
+  lines     PurchaseOrderLine[]
+  receipts  GoodsReceipt[]
+
+  @@index([supplierId])
+  @@index([storeId])
+  @@index([status])
+  @@index([createdByUserId])
+  @@index([createdAt])
+}
+
+/// One ordered SKU on a purchase order.
+model PurchaseOrderLine {
+  /// Primary key uniquely identifying this PO line.
+  id          String  @id @default(cuid())
+  /// Parent purchase order.
+  poId        String
+  /// Product being ordered (store catalog row).
+  productId   String
+  /// Units requested from the supplier.
+  orderedQty  Int
+  /// Cumulative units accepted into stock across all goods receipts.
+  receivedQty Int     @default(0)
+  /// Negotiated / expected unit cost at order time (snapshot).
+  unitCost    Decimal @db.Decimal(12, 2)
+  /// orderedQty × unitCost at last recalculation.
+  lineTotal   Decimal @db.Decimal(12, 2)
+  /// When true, this line was closed short (short-receipt acknowledged).
+  shortClosed Boolean @default(false)
+
+  po               PurchaseOrder      @relation(fields: [poId], references: [id], onDelete: Cascade)
+  product          Product            @relation(fields: [productId], references: [id])
+  goodsReceiptLines GoodsReceiptLine[]
+
+  @@index([poId])
+  @@index([productId])
+}
+
+/// A dock receiving event against a submitted (or partially received) PO.
+model GoodsReceipt {
+  /// Primary key uniquely identifying this receipt.
+  id               String   @id @default(cuid())
+  /// Purchase order being received against.
+  poId             String
+  /// User who recorded the receipt (typically store admin at the back door).
+  receivedByUserId String
+  /// When goods were physically received.
+  receivedAt       DateTime @default(now())
+  /// Supplier invoice number on the paperwork, when known.
+  invoiceNumber    String?
+  /// Free-form notes (damaged pallet, partial truck, etc.).
+  notes            String?
+  /// When this receipt row was created.
+  createdAt        DateTime @default(now())
+
+  po         PurchaseOrder      @relation(fields: [poId], references: [id], onDelete: Cascade)
+  receivedBy User               @relation("GoodsReceiptReceivedBy", fields: [receivedByUserId], references: [id])
+  lines      GoodsReceiptLine[]
+
+  @@index([poId])
+  @@index([receivedByUserId])
+  @@index([receivedAt])
+}
+
+/// Per-line quantities accepted/rejected on a goods receipt.
+model GoodsReceiptLine {
+  /// Primary key uniquely identifying this receipt line.
+  id                String  @id @default(cuid())
+  /// Parent goods receipt.
+  receiptId         String
+  /// PO line this receipt applies to.
+  poLineId          String
+  /// Product received (denormalized from PO line for reporting).
+  productId         String
+  /// Units accepted into sellable stock on this receipt.
+  quantityReceived  Int
+  /// Units rejected (damage / wrong item) — do NOT increment Product.stock.
+  quantityRejected  Int     @default(0)
+  /// Required when quantityRejected > 0.
+  rejectionReason   String?
+  /// Actual invoiced unit cost on this receipt (may differ from PO unitCost).
+  unitCostActual    Decimal @db.Decimal(12, 2)
+
+  receipt GoodsReceipt      @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  poLine  PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+  product Product           @relation(fields: [productId], references: [id])
+
+  @@index([receiptId])
+  @@index([poLineId])
   @@index([productId])
 }
 

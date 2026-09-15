@@ -12,6 +12,7 @@ import { drawerRouter } from "./routes/drawer.routes.js";
 import { inventoryRouter } from "./routes/inventory.routes.js";
 import { membershipRouter } from "./routes/membership.routes.js";
 import { reportsRouter } from "./routes/reports.routes.js";
+import { purchasingRouter } from "./routes/purchasing.routes.js";
 import { salesRouter } from "./routes/sales.routes.js";
 import { settlementRouter } from "./routes/settlement.routes.js";
 import { storesRouter } from "./routes/stores.routes.js";
@@ -65,6 +66,7 @@ export function createApp(): Express {
   app.use("/stores", storesRouter);
   app.use("/drawer", drawerRouter);
   app.use("/reports", reportsRouter);
+  app.use("/purchasing", purchasingRouter);
 
   return app;
 }

@@ -153,3 +153,80 @@ export type AuditLogEntry = {
   ipAddress: string | null;
   createdAt: string;
 };
+
+export type PurchaseOrderStatus =
+  | "DRAFT"
+  | "SUBMITTED"
+  | "PARTIALLY_RECEIVED"
+  | "RECEIVED"
+  | "CANCELLED";
+
+export type Supplier = {
+  id: string;
+  name: string;
+  contactName: string;
+  email: string;
+  phone: string;
+  address: string;
+  paymentTerms: string;
+  leadTimeDays: number;
+  isActive: boolean;
+  notes: string;
+  products?: Array<{
+    id: string;
+    supplierSku: string;
+    caseSize: number;
+    caseCost: string | number;
+    unitCost: string | number;
+    minOrderQty: number;
+    isPreferred: boolean;
+    product: { id: string; sku: string; name: string; storeId: string };
+  }>;
+};
+
+export type PurchaseOrderLine = {
+  id: string;
+  productId: string;
+  orderedQty: number;
+  receivedQty: number;
+  unitCost: string | number;
+  lineTotal: string | number;
+  shortClosed?: boolean;
+  product?: { id: string; sku: string; name: string; storeId: string; stock?: number };
+};
+
+export type PurchaseOrder = {
+  id: string;
+  poNumber: string;
+  supplierId: string;
+  storeId: string | null;
+  status: PurchaseOrderStatus;
+  expectedDate: string | null;
+  submittedAt: string | null;
+  subtotal: string | number;
+  tax: string | number;
+  shipping: string | number;
+  total: string | number;
+  createdAt: string;
+  supplier?: { id: string; name: string };
+  store?: { id: string; name: string } | null;
+  lines: PurchaseOrderLine[];
+};
+
+export type ReorderSuggestion = {
+  supplierId: string;
+  supplierName: string;
+  suggestedSubtotal: string;
+  lines: Array<{
+    productId: string;
+    sku: string;
+    name: string;
+    available: number;
+    reorderAt: number;
+    caseSize: number;
+    minOrderQty: number;
+    unitCost: string;
+    suggestedQty: number;
+    lineTotal: string;
+  }>;
+};

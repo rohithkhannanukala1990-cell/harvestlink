@@ -15,9 +15,13 @@ import { LoginPage } from "./pages/Login.tsx";
 import { MembersPage } from "./pages/Members.tsx";
 import { NetworkOverviewPage } from "./pages/NetworkOverview.tsx";
 import { POSPage } from "./pages/POS.tsx";
+import { PurchaseOrderEditPage } from "./pages/PurchaseOrderEdit.tsx";
+import { PurchaseOrdersPage } from "./pages/PurchaseOrders.tsx";
+import { ReceiveGoodsPage } from "./pages/ReceiveGoods.tsx";
 import { SalesHistoryPage } from "./pages/SalesHistory.tsx";
 import { SettingsPage } from "./pages/Settings.tsx";
 import { SettlementPage } from "./pages/Settlement.tsx";
+import { SuppliersPage } from "./pages/Suppliers.tsx";
 
 function RequireAuth() {
   const { token, user } = useAuth();
@@ -55,6 +59,12 @@ export default function App() {
             <Route path="settlement" element={<SettlementPage />} />
             <Route path="daily-close" element={<DailyClosePage />} />
             <Route path="settings" element={<SettingsPage />} />
+            <Route path="suppliers" element={<SuppliersPage />} />
+            <Route path="suppliers/:id" element={<SuppliersPage />} />
+            <Route path="purchase-orders" element={<PurchaseOrdersPage />} />
+            <Route path="purchase-orders/new" element={<PurchaseOrderEditPage />} />
+            <Route path="purchase-orders/:id" element={<PurchaseOrderEditPage />} />
+            <Route path="purchase-orders/:id/receive" element={<ReceiveGoodsPage />} />
           </Route>
         </Route>
       </Route>

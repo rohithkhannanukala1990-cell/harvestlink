@@ -32,6 +32,10 @@ describe("authorization", () => {
       { method: "patch", path: "/members/fake-member-id" },
       { method: "post", path: "/drawer/close" },
       { method: "get", path: "/reports/daily-close?date=2026-01-01" },
+      { method: "get", path: "/purchasing/suppliers" },
+      { method: "get", path: "/purchasing/purchase-orders" },
+      { method: "post", path: "/purchasing/purchase-orders" },
+      { method: "get", path: "/purchasing/reorder-suggestions" },
     ];
 
     for (const check of checks) {
