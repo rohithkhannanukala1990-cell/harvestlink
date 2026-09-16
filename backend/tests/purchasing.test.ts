@@ -60,6 +60,65 @@ describe("purchasing receiveGoods", () => {
     expect(adj?.delta).toBe(6);
   });
 
+  it("receiving 50 units creates one Lot with quantityRemaining 50 and increases Product.stock by 50", async () => {
+    const { store, storeAdmin } = await seedCashierStore();
+    const product = await createProduct(store.id, {
+      stock: 10,
+      cost: 1,
+      price: 3,
+      sku: "LOT50",
+    });
+    const supplier = await purchasing.createSupplier(asAuthUser(storeAdmin), {
+      name: "Lot Farms",
+    });
+    const po = await purchasing.createPurchaseOrder(asAuthUser(storeAdmin), {
+      supplierId: supplier.id,
+      storeId: store.id,
+      lines: [{ productId: product.id, orderedQty: 50, unitCost: 1.5 }],
+    });
+    await purchasing.submitPurchaseOrder(asAuthUser(storeAdmin), po.id);
+
+    const before = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(before.stock).toBe(10);
+
+    await purchasing.receiveGoods(asAuthUser(storeAdmin), po.id, {
+      invoiceNumber: "INV-LOT-50",
+      lines: [
+        {
+          poLineId: po.lines[0]!.id,
+          quantityReceived: 50,
+          unitCostActual: 1.5,
+          lotNumber: "PACK-2026-001",
+          expiryDate: new Date("2026-12-31"),
+          countryOfOrigin: "US",
+        },
+      ],
+    });
+
+    const after = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(after.stock).toBe(60); // +50 exactly
+
+    const lots = await prisma.lot.findMany({ where: { productId: product.id } });
+    // Opening test lot (stock:10) + receipt lot for the 50 units.
+    expect(lots).toHaveLength(2);
+    const receiptLot = lots.find((l) => l.lotNumber === "PACK-2026-001");
+    expect(receiptLot).toBeTruthy();
+    expect(receiptLot!.quantityRemaining).toBe(50);
+    expect(receiptLot!.quantityReceived).toBe(50);
+    expect(receiptLot!.quantityReserved).toBe(0);
+    expect(receiptLot!.unitCost.toFixed(2)).toBe("1.50");
+    expect(receiptLot!.status).toBe("ACTIVE");
+    expect(receiptLot!.supplierId).toBe(supplier.id);
+    expect(receiptLot!.countryOfOrigin).toBe("US");
+
+    const adj = await prisma.stockAdjustment.findFirst({
+      where: { productId: product.id, reason: "RECEIPT", lotId: receiptLot!.id },
+    });
+    expect(adj?.delta).toBe(50);
+    expect(adj?.previousStock).toBe(10);
+    expect(adj?.newStock).toBe(60);
+  });
+
   it("rejects over-receipt without acknowledgeOverReceipt", async () => {
     const { store, storeAdmin } = await seedCashierStore();
     const product = await createProduct(store.id, { stock: 0, cost: 1 });

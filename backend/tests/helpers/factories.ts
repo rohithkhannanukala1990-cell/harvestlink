@@ -1,7 +1,7 @@
 /**
  * Factories for money-path tests — store, users, products, members.
  */
-import { MemberStatus, Prisma, Role, type Member, type Product, type Store, type User } from "@prisma/client";
+import { MemberStatus, LotStatus, Prisma, Role, type Member, type Product, type Store, type User } from "@prisma/client";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { prisma } from "./db.js";
@@ -49,21 +49,47 @@ export async function createProduct(
     stock: number;
     reserved: number;
     reorderAt: number;
+    /** Skip seeding a matching ACTIVE lot (rare; prefer stock:0 instead). */
+    skipLot?: boolean;
   }>,
 ): Promise<Product> {
-  return prisma.product.create({
+  const stock = input?.stock ?? 10;
+  const reserved = input?.reserved ?? 0;
+  const cost = new Prisma.Decimal(input?.cost ?? 4);
+  const sku = input?.sku ?? `SKU-${Math.random().toString(36).slice(2, 8)}`;
+
+  const product = await prisma.product.create({
     data: {
       storeId,
-      sku: input?.sku ?? `SKU-${Math.random().toString(36).slice(2, 8)}`,
+      sku,
       name: input?.name ?? "Test Product",
       category: "Test",
       price: new Prisma.Decimal(input?.price ?? 10),
-      cost: new Prisma.Decimal(input?.cost ?? 4),
-      stock: input?.stock ?? 10,
-      reserved: input?.reserved ?? 0,
+      cost,
+      stock,
+      reserved,
       reorderAt: input?.reorderAt ?? 2,
     },
   });
+
+  // Keep Product.stock / Product.reserved rollups consistent with lot rows so sale FEFO works.
+  if (!input?.skipLot && (stock !== 0 || reserved !== 0)) {
+    await prisma.lot.create({
+      data: {
+        lotNumber: `TEST-${sku}`,
+        productId: product.id,
+        storeId,
+        quantityReceived: Math.max(stock, 0),
+        quantityRemaining: stock,
+        quantityReserved: reserved,
+        unitCost: cost,
+        receivedAt: new Date(),
+        status: LotStatus.ACTIVE,
+      },
+    });
+  }
+
+  return product;
 }
 
 export async function createMember(input?: {

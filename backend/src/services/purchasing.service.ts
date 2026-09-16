@@ -1,14 +1,19 @@
 /**
  * Procurement / purchasing for Harvestlink — suppliers, POs, goods receiving.
  *
- * Receiving increments Product.stock in the same transaction as StockAdjustment
- * (reason RECEIPT) and GoodsReceipt rows. Over/short receipts require explicit
- * acknowledgement — never silently accept a qty mismatch vs the PO.
+ * Receiving creates a Lot for accepted units AND increments Product.stock in the same
+ * transaction as StockAdjustment (reason RECEIPT) and GoodsReceipt rows.
+ * Product.stock remains a cached rollup of ACTIVE lots for POS speed — any code that
+ * changes one MUST change the other in the same transaction.
+ * Over/short receipts require explicit acknowledgement — never silently accept a qty
+ * mismatch vs the PO.
  *
- * When unitCostActual differs from Product.cost, cost is updated with a weighted
- * average so margin reporting (Phase 21) reflects true landed cost.
+ * When unitCostActual differs from Product.cost, product cost is updated with a weighted
+ * average so margin reporting (Phase 21) reflects true landed cost. Lot.unitCost stores
+ * the actual invoiced cost for THIS receipt (never averaged away).
  */
 import {
+  LotStatus,
   Prisma,
   PurchaseOrderStatus,
   Role,
@@ -550,6 +555,14 @@ export type ReceiveLineInput = {
   quantityRejected?: number;
   rejectionReason?: string;
   unitCostActual: number;
+  /** Dock / supplier lot number; when omitted, auto-generated as {SKU}-{YYYYMMDD}-{receiptId short}. */
+  lotNumber?: string | null;
+  /** Sell-by / use-by for the received lot. */
+  expiryDate?: Date | string | null;
+  /** Harvest date for produce lots. */
+  harvestDate?: Date | string | null;
+  /** Country of origin (COOL). */
+  countryOfOrigin?: string | null;
   /**
    * Required when quantityReceived exceeds remaining ordered qty on the line.
    * Over-receipt is allowed only with this explicit flag — never silently.
@@ -573,15 +586,20 @@ export type ReceiveGoodsInput = {
 /**
  * Records a goods receipt against a PO.
  *
- * Stock math (per accepted unit):
- *   previousStock → previousStock + quantityReceived
- *   StockAdjustment.reason = "RECEIPT"
+ * Accepted units (qtyIn > 0), in the SAME transaction:
+ *   1. Create GoodsReceiptLine (+ optional lot metadata)
+ *   2. Create Lot (quantityRemaining = qtyIn, unitCost = unitCostActual)
+ *   3. Increment Product.stock by qtyIn
+ *      /// Product.stock remains a cached rollup of its ACTIVE lots, kept for POS speed. Lots are the
+ *      /// source of truth. Any code that changes one MUST change the other in the same transaction.
+ *   4. Write StockAdjustment (reason RECEIPT) with lotId
  *
- * Weighted-average cost when unitCostActual ≠ Product.cost:
+ * Rejected units create no lot — they never entered sellable stock.
+ *
+ * Weighted-average Product.cost when unitCostActual ≠ Product.cost:
  *   newCost = (previousStock × oldCost + quantityReceived × unitCostActual)
  *             / (previousStock + quantityReceived)
  *   If previousStock ≤ 0, newCost = unitCostActual (no reliable weight).
- *   This cost feeds margin reporting in Phase 21 — do not skip the update.
  */
 export async function receiveGoods(
   actor: AuthUser,
@@ -624,6 +642,9 @@ export async function receiveGoods(
       },
     });
 
+    const receivedAt = receipt.receivedAt;
+    const yyyymmdd = receivedAt.toISOString().slice(0, 10).replace(/-/g, "");
+
     for (const raw of input.lines) {
       const poLine = lineById.get(raw.poLineId);
       if (!poLine) {
@@ -652,7 +673,6 @@ export async function receiveGoods(
 
       const remaining = Math.max(0, poLine.orderedQty - poLine.receivedQty);
       if (qtyIn > remaining) {
-        // Over-receipt: never accept silently.
         if (!raw.acknowledgeOverReceipt) {
           throw new AppError(
             409,
@@ -689,8 +709,12 @@ export async function receiveGoods(
       }
 
       const unitCostActual = money(raw.unitCostActual);
+      const expiryDate = parseOptionalDate(raw.expiryDate);
+      const harvestDate = parseOptionalDate(raw.harvestDate);
+      const countryOfOrigin = raw.countryOfOrigin?.trim() || null;
+      const suppliedLotNumber = raw.lotNumber?.trim() || null;
 
-      await tx.goodsReceiptLine.create({
+      const receiptLine = await tx.goodsReceiptLine.create({
         data: {
           receiptId: receipt.id,
           poLineId: poLine.id,
@@ -699,6 +723,10 @@ export async function receiveGoods(
           quantityRejected: qtyReject,
           rejectionReason: qtyReject > 0 ? raw.rejectionReason!.trim() : null,
           unitCostActual,
+          lotNumber: suppliedLotNumber,
+          expiryDate,
+          harvestDate,
+          countryOfOrigin,
         },
       });
 
@@ -707,14 +735,59 @@ export async function receiveGoods(
         data: { receivedQty: nextReceived, shortClosed },
       });
 
-      // Accepted units only — rejected stay out of sellable stock.
+      // Accepted units only — rejected stay out of sellable stock (no Lot).
       if (qtyIn > 0) {
         const product = await tx.product.findUnique({ where: { id: poLine.productId } });
         if (!product) throw new AppError(404, "Product not found", { productId: poLine.productId });
 
+        // Auto: {SKU}-{YYYYMMDD}-{receiptId short}; append line short on collision.
+        let lotNumber =
+          suppliedLotNumber ?? `${product.sku}-${yyyymmdd}-${receipt.id.slice(-8)}`;
+        const collision = await tx.lot.findUnique({
+          where: {
+            productId_lotNumber_storeId: {
+              productId: product.id,
+              lotNumber,
+              storeId: product.storeId,
+            },
+          },
+          select: { id: true },
+        });
+        if (collision) {
+          lotNumber = `${lotNumber}-${receiptLine.id.slice(-4)}`;
+        }
+
+        const lot = await tx.lot.create({
+          data: {
+            lotNumber,
+            productId: product.id,
+            storeId: product.storeId,
+            supplierId: po.supplierId,
+            goodsReceiptLineId: receiptLine.id,
+            harvestDate,
+            packDate: null,
+            expiryDate,
+            quantityReceived: qtyIn,
+            quantityRemaining: qtyIn,
+            quantityReserved: 0,
+            status: LotStatus.ACTIVE,
+            countryOfOrigin,
+            receivedAt,
+            unitCost: unitCostActual,
+          },
+        });
+
+        if (!suppliedLotNumber) {
+          await tx.goodsReceiptLine.update({
+            where: { id: receiptLine.id },
+            data: { lotNumber },
+          });
+        }
+
         const previousStock = product.stock;
         const newStock = previousStock + qtyIn;
 
+        // Product.stock is a cached rollup — must move with the Lot in this same transaction.
         await tx.product.update({
           where: { id: product.id },
           data: { stock: newStock },
@@ -729,12 +802,11 @@ export async function receiveGoods(
             newStock,
             delta: qtyIn,
             reason: "RECEIPT",
+            lotId: lot.id,
           },
         });
 
         // Weighted-average cost — drives margin reporting (Phase 21).
-        // Formula: newCost = (oldStock × oldCost + qty × actual) / (oldStock + qty)
-        // When oldStock ≤ 0 (empty/negative), there is no meaningful weight → use actual.
         if (!unitCostActual.eq(product.cost)) {
           let newCost: Prisma.Decimal;
           if (previousStock <= 0) {
@@ -758,7 +830,6 @@ export async function receiveGoods(
         }
       }
 
-      // Refresh local copy for status derivation.
       poLine.receivedQty = nextReceived;
       poLine.shortClosed = shortClosed;
     }
@@ -808,7 +879,6 @@ export async function receiveGoods(
         reason: "WEIGHTED_AVG_ON_RECEIPT",
         quantityReceived: change.quantityReceived,
         unitCostActual: change.unitCostActual,
-        // newCost = (oldStock × oldCost + qty × actual) / (oldStock + qty)
         formula: "(oldStock*oldCost + qty*unitCostActual)/(oldStock+qty)",
       },
       ipAddress: input.ipAddress ?? null,
@@ -816,6 +886,15 @@ export async function receiveGoods(
   }
 
   return result;
+}
+
+function parseOptionalDate(value: Date | string | null | undefined): Date | null {
+  if (value == null || value === "") return null;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) {
+    throw new AppError(400, "Invalid date value on receipt line");
+  }
+  return d;
 }
 
 // ─── Reorder suggestions ─────────────────────────────────────────────────────

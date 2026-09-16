@@ -23,8 +23,8 @@ describe("createSale", () => {
         TRUNCATE TABLE
           "AuditLog","ProcessedStripeEvent","InventoryWriteOff","SaleRefundLine","SaleRefund",
           "StockReconciliation","MemberVote","BallotOption","Ballot","DividendAllocation","Dividend","BoardResolution",
-          "CapitalInvestment","MembershipFee","MemberEquityAccount","SaleItem","Sale","StockAdjustment","Payout","CashDrawer",
-          "Product","Member","CooperativeSettings","User","Store"
+          "CapitalInvestment","MembershipFee","MemberEquityAccount","SaleItemLot","SaleItem","Sale","StockAdjustment","Payout","CashDrawer",
+          "Lot","Product","Member","CooperativeSettings","User","Store"
         RESTART IDENTITY CASCADE
       `);
 
@@ -85,6 +85,74 @@ describe("createSale", () => {
         paymentMethod: PaymentMethod.TERMINAL,
       }),
     ).rejects.toMatchObject({ status: 409, message: expect.stringContaining("Insufficient stock") });
+  });
+
+  it("never allocates a QUARANTINED lot", async () => {
+    const { store, cashier } = await seedCashierStore();
+    const product = await createProduct(store.id, {
+      stock: 0,
+      price: 10,
+      skipLot: true,
+    });
+    await prisma.lot.create({
+      data: {
+        lotNumber: "Q-1",
+        productId: product.id,
+        storeId: store.id,
+        quantityReceived: 5,
+        quantityRemaining: 5,
+        quantityReserved: 0,
+        unitCost: new Prisma.Decimal(4),
+        receivedAt: new Date(),
+        status: "QUARANTINED",
+      },
+    });
+
+    await expect(
+      salesService.createSale(store.id, asAuthUser(cashier), {
+        items: [{ productId: product.id, quantity: 1 }],
+        paymentMethod: PaymentMethod.TERMINAL,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Product unavailable — stock is quarantined or recalled",
+    });
+
+    const lot = await prisma.lot.findFirstOrThrow({ where: { productId: product.id } });
+    expect(lot.quantityReserved).toBe(0);
+    expect(lot.status).toBe("QUARANTINED");
+  });
+
+  it("returns quarantined/recalled error when only RECALLED stock remains", async () => {
+    const { store, cashier } = await seedCashierStore();
+    const product = await createProduct(store.id, {
+      stock: 0,
+      sku: "RECALL1",
+      skipLot: true,
+    });
+    await prisma.lot.create({
+      data: {
+        lotNumber: "R-1",
+        productId: product.id,
+        storeId: store.id,
+        quantityReceived: 3,
+        quantityRemaining: 3,
+        quantityReserved: 0,
+        unitCost: new Prisma.Decimal(2),
+        receivedAt: new Date(),
+        status: "RECALLED",
+      },
+    });
+
+    await expect(
+      salesService.createSale(store.id, asAuthUser(cashier), {
+        items: [{ productId: product.id, quantity: 1 }],
+        paymentMethod: PaymentMethod.TERMINAL,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Product unavailable — stock is quarantined or recalled",
+    });
   });
 
   it("rejects inactive store", async () => {
@@ -222,10 +290,171 @@ describe("createSale", () => {
     expect(updated.stock).toBe(1);
     expect(updated.reserved).toBe(1);
 
+    const lots = await prisma.lot.findMany({ where: { productId: product.id, status: "ACTIVE" } });
+    expect(lots.reduce((s, l) => s + l.quantityRemaining, 0)).toBe(updated.stock);
+    expect(lots.reduce((s, l) => s + l.quantityReserved, 0)).toBe(updated.reserved);
+
     const pendingCount = await prisma.sale.count({
       where: { storeId: store.id, paymentStatus: PaymentStatus.PENDING },
     });
     expect(pendingCount).toBe(1);
+  });
+
+  it("allows only one of two concurrent createSale calls for the last unit on a single named lot", async () => {
+    // Same concurrency discipline as above, but the race is explicitly on ONE Lot row (not a product rollup).
+    const { store, cashier } = await seedCashierStore();
+    const secondCashier = await createUser({
+      email: "cashier2-lot@test.local",
+      role: Role.CASHIER,
+      storeId: store.id,
+    });
+    const product = await createProduct(store.id, {
+      stock: 0,
+      reserved: 0,
+      skipLot: true,
+      sku: "ONELOT",
+    });
+    const lot = await prisma.lot.create({
+      data: {
+        lotNumber: "SOLE-UNIT",
+        productId: product.id,
+        storeId: store.id,
+        quantityReceived: 1,
+        quantityRemaining: 1,
+        quantityReserved: 0,
+        unitCost: new Prisma.Decimal(4),
+        receivedAt: new Date(),
+        status: "ACTIVE",
+      },
+    });
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { stock: 1, reserved: 0 },
+    });
+
+    const results = await Promise.allSettled([
+      salesService.createSale(store.id, asAuthUser(cashier), {
+        items: [{ productId: product.id, quantity: 1 }],
+        paymentMethod: PaymentMethod.TERMINAL,
+      }),
+      salesService.createSale(store.id, asAuthUser(secondCashier), {
+        items: [{ productId: product.id, quantity: 1 }],
+        paymentMethod: PaymentMethod.TERMINAL,
+      }),
+    ]);
+
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
+
+    const lotAfter = await prisma.lot.findUniqueOrThrow({ where: { id: lot.id } });
+    expect(lotAfter.quantityRemaining).toBe(1);
+    expect(lotAfter.quantityReserved).toBe(1);
+
+    const productAfter = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(productAfter.stock).toBe(1);
+    expect(productAfter.reserved).toBe(1);
+  });
+
+  it("keeps Product.stock/reserved equal to SUM of ACTIVE lot remaining/reserved", async () => {
+    const { store, cashier, storeAdmin } = await seedCashierStore();
+    await prisma.cashDrawer.create({
+      data: {
+        storeId: store.id,
+        openedByUserId: storeAdmin.id,
+        openingFloat: new Prisma.Decimal(100),
+      },
+    });
+    const product = await createProduct(store.id, { stock: 5, price: 10 });
+
+    await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [{ productId: product.id, quantity: 2 }],
+      paymentMethod: PaymentMethod.TERMINAL,
+    });
+
+    let p = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    let lots = await prisma.lot.findMany({
+      where: { productId: product.id, status: "ACTIVE" },
+    });
+    expect(lots.reduce((s, l) => s + l.quantityRemaining, 0)).toBe(p.stock);
+    expect(lots.reduce((s, l) => s + l.quantityReserved, 0)).toBe(p.reserved);
+
+    const { sale } = await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [{ productId: product.id, quantity: 1 }],
+      paymentMethod: PaymentMethod.CASH,
+    });
+    expect(sale.paymentStatus).toBe(PaymentStatus.PAID);
+
+    p = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    lots = await prisma.lot.findMany({
+      where: { productId: product.id, status: "ACTIVE" },
+    });
+    expect(lots.reduce((s, l) => s + l.quantityRemaining, 0)).toBe(p.stock);
+    expect(lots.reduce((s, l) => s + l.quantityReserved, 0)).toBe(p.reserved);
+  });
+
+  it("allocates across lots in FEFO order when a line spans multiple lots", async () => {
+    const { store, cashier, storeAdmin } = await seedCashierStore();
+    await prisma.cashDrawer.create({
+      data: {
+        storeId: store.id,
+        openedByUserId: storeAdmin.id,
+        openingFloat: new Prisma.Decimal(50),
+      },
+    });
+    const product = await createProduct(store.id, { stock: 0, price: 10, cost: 2, skipLot: true });
+    const later = await prisma.lot.create({
+      data: {
+        lotNumber: "LATER",
+        productId: product.id,
+        storeId: store.id,
+        quantityReceived: 3,
+        quantityRemaining: 3,
+        quantityReserved: 0,
+        unitCost: new Prisma.Decimal(2),
+        expiryDate: new Date("2027-06-01"),
+        receivedAt: new Date("2026-01-01"),
+        status: "ACTIVE",
+      },
+    });
+    const sooner = await prisma.lot.create({
+      data: {
+        lotNumber: "SOONER",
+        productId: product.id,
+        storeId: store.id,
+        quantityReceived: 2,
+        quantityRemaining: 2,
+        quantityReserved: 0,
+        unitCost: new Prisma.Decimal(3),
+        expiryDate: new Date("2026-10-01"),
+        receivedAt: new Date("2026-02-01"),
+        status: "ACTIVE",
+      },
+    });
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { stock: 5 },
+    });
+
+    const { sale } = await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [{ productId: product.id, quantity: 4 }],
+      paymentMethod: PaymentMethod.CASH,
+    });
+
+    const allocs = await prisma.saleItemLot.findMany({
+      where: { saleItem: { saleId: sale.id } },
+      orderBy: { quantity: "desc" },
+    });
+    expect(allocs).toHaveLength(2);
+    const byLot = new Map(allocs.map((a) => [a.lotId, a]));
+    expect(byLot.get(sooner.id)?.quantity).toBe(2);
+    expect(byLot.get(later.id)?.quantity).toBe(2);
+
+    const soonerAfter = await prisma.lot.findUniqueOrThrow({ where: { id: sooner.id } });
+    const laterAfter = await prisma.lot.findUniqueOrThrow({ where: { id: later.id } });
+    expect(soonerAfter.quantityRemaining).toBe(0);
+    expect(soonerAfter.status).toBe("DEPLETED");
+    expect(laterAfter.quantityRemaining).toBe(1);
+    expect(laterAfter.status).toBe("ACTIVE");
   });
 
   it("returns the same sale when idempotencyKey is replayed", async () => {
@@ -277,6 +506,8 @@ describe("createSale", () => {
     expect(stockReconciliationQueued).toBe(true);
     const updated = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
     expect(updated.stock).toBe(-2);
+    const lot = await prisma.lot.findFirstOrThrow({ where: { productId: product.id } });
+    expect(lot.quantityRemaining).toBe(-2);
     const flags = await prisma.stockReconciliation.findMany({ where: { saleId: sale.id } });
     expect(flags).toHaveLength(1);
     expect(flags[0]?.reason).toBe("OFFLINE_SALE_NEGATIVE_STOCK");

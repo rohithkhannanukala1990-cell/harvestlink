@@ -54,6 +54,15 @@ describe("refundSale", () => {
     expect(after1.stock).toBe(beforeStock1 + 2);
     expect(after2.stock).toBe(beforeStock2 + 1);
 
+    for (const productId of [p1.id, p2.id]) {
+      const product = await prisma.product.findUniqueOrThrow({ where: { id: productId } });
+      const lots = await prisma.lot.findMany({
+        where: { productId, status: "ACTIVE" },
+      });
+      expect(lots.reduce((s, l) => s + l.quantityRemaining, 0)).toBe(product.stock);
+      expect(lots.reduce((s, l) => s + l.quantityReserved, 0)).toBe(product.reserved);
+    }
+
     const summary = await settlementService.getStoreSettlementSummary(store.id);
     expect(summary.operatorAccrued).toBe("0.00");
     expect(summary.grossSales).toBe("0.00");

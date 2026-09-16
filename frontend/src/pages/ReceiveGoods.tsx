@@ -14,6 +14,9 @@ type LineDraft = {
   quantityRejected: string;
   rejectionReason: string;
   unitCostActual: string;
+  lotNumber: string;
+  expiryDate: string;
+  countryOfOrigin: string;
   acknowledgeOverReceipt: boolean;
   closeShort: boolean;
   acknowledgeShortReceipt: boolean;
@@ -46,6 +49,9 @@ export function ReceiveGoodsPage() {
           quantityRejected: "0",
           rejectionReason: "",
           unitCostActual: String(line.unitCost),
+          lotNumber: "",
+          expiryDate: "",
+          countryOfOrigin: "",
           acknowledgeOverReceipt: false,
           closeShort: false,
           acknowledgeShortReceipt: false,
@@ -122,6 +128,9 @@ export function ReceiveGoodsPage() {
           quantityRejected: Number(d.quantityRejected) || 0,
           rejectionReason: d.rejectionReason || undefined,
           unitCostActual: Number(d.unitCostActual),
+          lotNumber: d.lotNumber.trim() || undefined,
+          expiryDate: d.expiryDate || undefined,
+          countryOfOrigin: d.countryOfOrigin.trim() || undefined,
           acknowledgeOverReceipt: d.acknowledgeOverReceipt || undefined,
           closeShort: d.closeShort || undefined,
           acknowledgeShortReceipt: d.acknowledgeShortReceipt || undefined,
@@ -208,6 +217,11 @@ export function ReceiveGoodsPage() {
               {draft?.quantityReceived && (
                 <div className="mt-1 text-base font-medium">
                   Receiving {draft.quantityReceived}
+                  {draft.lotNumber ? (
+                    <span className="ml-2 font-mono text-sm text-stone-600">
+                      lot {draft.lotNumber}
+                    </span>
+                  ) : null}
                 </div>
               )}
             </button>
@@ -241,6 +255,63 @@ export function ReceiveGoodsPage() {
                 {key}
               </button>
             ))}
+          </div>
+
+          <div className="space-y-3 border-t border-stone-200 pt-3">
+            <p className="text-sm font-medium text-stone-700">Lot on the box</p>
+            <label className="block text-sm">
+              Lot / batch number
+              <input
+                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl font-mono"
+                value={activeDraft.lotNumber}
+                onChange={(e) =>
+                  setDrafts((prev) => ({
+                    ...prev,
+                    [activeLine.id]: {
+                      ...prev[activeLine.id]!,
+                      lotNumber: e.target.value,
+                    },
+                  }))
+                }
+                placeholder="Scan or type lot #"
+                autoComplete="off"
+              />
+            </label>
+            <label className="block text-sm">
+              Expiry / use-by date
+              <input
+                type="date"
+                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl"
+                value={activeDraft.expiryDate}
+                onChange={(e) =>
+                  setDrafts((prev) => ({
+                    ...prev,
+                    [activeLine.id]: {
+                      ...prev[activeLine.id]!,
+                      expiryDate: e.target.value,
+                    },
+                  }))
+                }
+              />
+            </label>
+            <label className="block text-sm">
+              Country of origin
+              <input
+                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl uppercase"
+                value={activeDraft.countryOfOrigin}
+                onChange={(e) =>
+                  setDrafts((prev) => ({
+                    ...prev,
+                    [activeLine.id]: {
+                      ...prev[activeLine.id]!,
+                      countryOfOrigin: e.target.value,
+                    },
+                  }))
+                }
+                placeholder="e.g. US"
+                maxLength={3}
+              />
+            </label>
           </div>
 
           <label className="block text-sm">

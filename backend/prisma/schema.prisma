@@ -129,6 +129,17 @@ enum PaymentMethod {
   CASH
 }
 
+/// Lifecycle of an inventory lot (batch of a product at a store).
+/// Available to sell from a lot = quantityRemaining - quantityReserved, and ONLY when
+/// status = ACTIVE. QUARANTINED and RECALLED lots are never sellable.
+enum LotStatus {
+  ACTIVE
+  QUARANTINED
+  RECALLED
+  EXPIRED
+  DEPLETED
+}
+
 /// A physical retail location in the co-op network, including the operator commission rate for that store.
 model Store {
   /// Primary key uniquely identifying this store.
@@ -167,6 +178,8 @@ model Store {
   payouts Payout[]
   /// Manual stock adjustments recorded for products at this store.
   stockAdjustments StockAdjustment[]
+  /// Inventory lots (batches) received / held at this store.
+  lots Lot[]
   /// Cash drawer shifts for this store.
   cashDrawers CashDrawer[]
   /// Offline / sync stock conflicts awaiting human review.
@@ -220,6 +233,8 @@ model User {
   membershipFeesConfirmed MembershipFee[] @relation("MembershipFeeConfirmedBy")
   /// CapitalInvestment rows this user confirmed as received.
   capitalInvestmentsConfirmed CapitalInvestment[] @relation("CapitalInvestmentConfirmedBy")
+  /// Recalls this user initiated (regulatory — never delete these rows).
+  recallsInitiated Recall[] @relation("RecallInitiatedBy")
 
   @@index([storeId])
 }
@@ -271,6 +286,8 @@ model Product {
   purchaseOrderLines PurchaseOrderLine[]
   /// Goods-receipt lines that received this product into stock.
   goodsReceiptLines GoodsReceiptLine[]
+  /// Inventory lots for this product (lot tracking — additive; stock fields unchanged).
+  lots Lot[]
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
@@ -297,16 +314,20 @@ model StockAdjustment {
   delta         Int
   /// Human-readable explanation required for audit (e.g. "cycle count", "damaged goods").
   reason        String
+  /// Lot this adjustment applied to (RECEIPT creates a lot; null for pre-lot / non-lot adjustments).
+  lotId         String?
   /// When the adjustment was recorded.
   createdAt     DateTime @default(now())
 
   product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
   store      Store   @relation(fields: [storeId], references: [id])
   adjustedBy User    @relation("StockAdjustedBy", fields: [adjustedById], references: [id])
+  lot        Lot?    @relation(fields: [lotId], references: [id])
 
   @@index([productId])
   @@index([storeId])
   @@index([adjustedById])
+  @@index([lotId])
 }
 
 /// Co-op-wide settings (singleton in practice). Voting threshold lives here — never hardcoded.
@@ -490,6 +511,8 @@ model Member {
   votes            MemberVote[]
   /// Checkout applications of MemberBenefit for this owner (cap + cost tracking).
   benefitUsages  MemberBenefitUsage[]
+  /// Recall outreach rows for this member (regulatory retention — never delete).
+  recallNotifications RecallNotification[]
 
   @@index([memberNumber])
   @@index([status])
@@ -789,10 +812,14 @@ model Sale {
   /// Speeds store sales reporting and settlement queries.
   @@index([storeId])
   @@index([cashierId])
+  /// Recall contact expansion: sales → member (name/email/phone/mailingAddress).
   @@index([memberId])
+  /// Forward recall filters PAID/REFUNDED/REFUNDING sales; expiry job uses PENDING + reservationExpiresAt.
   @@index([paymentStatus])
   /// Cleanup job finds expired PENDING reservations via this index.
   @@index([reservationExpiresAt])
+  /// Store-scoped recall / settlement: filter by store then payment status in one pass.
+  @@index([storeId, paymentStatus])
 }
 
 /// A single line on a sale; product name/price/SKU are snapshotted so history stays accurate after catalog changes.
@@ -836,10 +863,39 @@ model SaleItem {
   benefit MemberBenefit? @relation(fields: [benefitId], references: [id])
   /// Refund line allocations against this item.
   refundLines SaleRefundLine[]
+  /// Lot allocations for this line (FEFO; one row per lot when a line spans lots).
+  lotAllocations SaleItemLot[]
 
   @@index([saleId])
   @@index([productId])
   @@index([benefitId])
+}
+
+/// Which lot(s) fulfilled a SaleItem, and at what unit cost.
+/// One SaleItem may have several rows when a line spans lots (FEFO split).
+/// unitCostSnapshot freezes lot cost at sale time — the same snapshot discipline already used
+/// for price and operatorPercent. This is what makes historical margin accurate.
+model SaleItemLot {
+  /// Primary key uniquely identifying this allocation row.
+  id               String  @id @default(cuid())
+  /// Parent sale line.
+  saleItemId       String
+  /// Lot that supplied these units.
+  lotId            String
+  /// Units taken from this lot for the sale line.
+  quantity         Int
+  /// Lot.unitCost frozen at sale time (margin / COGS).
+  unitCostSnapshot Decimal @db.Decimal(12, 2)
+
+  saleItem SaleItem @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
+  lot      Lot      @relation(fields: [lotId], references: [id])
+
+  /// Backward trace: sale line → lot allocations that fulfilled it.
+  @@index([saleItemId])
+  /// Forward recall: lot → every sale allocation. Must stay indexed — incomplete customer lists are the failure mode that matters.
+  @@index([lotId])
+  /// Covering pair for forward join SaleItemLot → SaleItem without heap lookups on the allocation row.
+  @@index([lotId, saleItemId])
 }
 
 /// Status of a SaleRefund attempt (DB-first refund protocol).
@@ -895,24 +951,29 @@ model SaleRefundLine {
   @@index([saleItemId])
 }
 
-/// Audit row when a refund does not restock (damaged / discarded goods).
-/// Physical Product.stock is left unchanged; this records why units did not return to sellable.
+/// Audit row when inventory leaves sellable stock without a normal sale.
+/// Refund path: restock=false (sale / saleRefundId set). Expiry job: reason EXPIRED (lotId set).
 model InventoryWriteOff {
   id           String   @id @default(cuid())
   storeId      String
   productId    String
-  saleId       String
-  saleItemId   String
-  saleRefundId String
+  /// Lot written off (expiry / quarantine disposition); null for legacy refund-only rows.
+  lotId        String?
+  /// Sale that triggered the write-off; null for non-sale write-offs (e.g. lot expiry).
+  saleId       String?
+  saleItemId   String?
+  saleRefundId String?
   quantity     Int
   reason       String
   createdAt    DateTime @default(now())
 
-  saleRefund SaleRefund @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
+  saleRefund SaleRefund? @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
+  lot        Lot?        @relation(fields: [lotId], references: [id])
 
   @@index([storeId])
   @@index([productId])
   @@index([saleRefundId])
+  @@index([lotId])
 }
 
 /// A record of money actually paid from the co-op account to a store operator.
@@ -1039,6 +1100,8 @@ model Supplier {
   products       SupplierProduct[]
   /// Purchase orders placed with this supplier.
   purchaseOrders PurchaseOrder[]
+  /// Inventory lots sourced from this supplier (null on Lot when unknown / legacy).
+  lots Lot[]
 
   @@index([isActive])
   @@index([name])
@@ -1193,15 +1256,193 @@ model GoodsReceiptLine {
   /// Required when quantityRejected > 0.
   rejectionReason   String?
   /// Actual invoiced unit cost on this receipt (may differ from PO unitCost).
-  unitCostActual    Decimal @db.Decimal(12, 2)
+  unitCostActual    Decimal   @db.Decimal(12, 2)
+  /// Supplier / dock lot number for the accepted units; null → auto-generated on receive.
+  lotNumber         String?
+  /// Sell-by / use-by date for the received lot (FEFO); null if unknown / N/A.
+  expiryDate        DateTime?
+  /// Harvest date for produce lots; null if N/A.
+  harvestDate       DateTime?
+  /// Country of origin (COOL); null if unknown.
+  countryOfOrigin   String?
 
   receipt GoodsReceipt      @relation(fields: [receiptId], references: [id], onDelete: Cascade)
   poLine  PurchaseOrderLine @relation(fields: [poLineId], references: [id])
   product Product           @relation(fields: [productId], references: [id])
+  /// Lots created from this receipt line (one receipt line may seed one or more lots).
+  lots    Lot[]
 
+  /// Backward: receipt → lines.
   @@index([receiptId])
+  /// Backward: receipt line → PO line → purchase order.
   @@index([poLineId])
   @@index([productId])
+}
+
+/// A tracked inventory lot (batch) of a product at a store.
+/// Available to sell from a lot = quantityRemaining - quantityReserved, and ONLY when
+/// status = ACTIVE. QUARANTINED and RECALLED lots are never sellable.
+/// Lot-level unitCost is the foundation for accurate margin — product.cost alone averages away truth.
+model Lot {
+  /// Primary key uniquely identifying this lot.
+  id                 String    @id @default(cuid())
+  /// Human-readable lot / batch code (unique per product+store).
+  lotNumber          String
+  /// Product this lot belongs to.
+  productId          String
+  /// Store holding this lot's physical inventory.
+  storeId            String
+  /// Supplier this lot came from; null for legacy stock with no known supplier.
+  supplierId         String?
+  /// Goods-receipt line that created this lot; null for opening / legacy stock.
+  goodsReceiptLineId String?
+  /// When the crop / product was harvested (farm / produce lots); null if N/A.
+  harvestDate        DateTime?
+  /// When the product was packed; null if N/A.
+  packDate           DateTime?
+  /// Sell-by / use-by date for FEFO and expiry alerts; null if no expiry.
+  expiryDate         DateTime?
+  /// Units originally received into this lot.
+  quantityReceived   Int
+  /// Units still physically in this lot (before subtracting quantityReserved).
+  quantityRemaining  Int
+  /// Units spoken for by unpaid PENDING sales against this lot (default 0).
+  quantityReserved   Int       @default(0)
+  /// Lot lifecycle — only ACTIVE is sellable.
+  status             LotStatus @default(ACTIVE)
+  /// Country of origin label (COOL); null when unknown.
+  countryOfOrigin    String?
+  /// When this lot was received into the store.
+  receivedAt         DateTime
+  /// Cost basis for THIS lot (per unit).
+  /// Lot-level cost is the foundation for accurate margin. Two lots of the same product bought at
+  /// different prices have different costs; a single product-level cost averages away the truth.
+  unitCost           Decimal   @db.Decimal(12, 2)
+  /// When this lot row was created.
+  createdAt          DateTime  @default(now())
+  /// When this lot was last updated.
+  updatedAt          DateTime  @updatedAt
+
+  product          Product           @relation(fields: [productId], references: [id])
+  store            Store             @relation(fields: [storeId], references: [id])
+  supplier         Supplier?         @relation(fields: [supplierId], references: [id])
+  goodsReceiptLine GoodsReceiptLine? @relation(fields: [goodsReceiptLineId], references: [id])
+  /// Stock adjustments that reference this lot (e.g. RECEIPT).
+  stockAdjustments StockAdjustment[]
+  /// Sale line allocations drawn from this lot.
+  saleItemLots SaleItemLot[]
+  /// Write-offs that reference this lot (e.g. EXPIRED).
+  inventoryWriteOffs InventoryWriteOff[]
+  /// Recall line items that quarantine / recall this lot.
+  recallLots RecallLot[]
+
+  /// One lot number per product per store.
+  @@unique([productId, lotNumber, storeId])
+  /// FEFO picking query: active lots for a product ordered by expiry.
+  @@index([productId, status, expiryDate])
+  /// Recall / quarantine sweeps by status.
+  @@index([status])
+  /// Near-expiry alert queries.
+  @@index([expiryDate])
+  /// Current-location / store-scoped lot lists (traceability + POS).
+  @@index([storeId])
+  /// Backward shortcut: lot → supplier without joining the goods receipt.
+  @@index([supplierId])
+  /// Backward trace: lot → goods receipt line → PO → supplier/FPO.
+  @@index([goodsReceiptLineId])
+}
+
+/// How serious a recall is — drives regulator / public-notice obligations.
+enum RecallSeverity {
+  ADVISORY
+  VOLUNTARY
+  MANDATORY
+}
+
+/// Recall lifecycle. Records are NEVER deleted (regulatory retention) — CANCELLED is archive.
+enum RecallStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+/// Channel used to notify a member about a recall.
+enum RecallNotificationChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+/// A product recall campaign. Quarantine happens at initiate; RECALLED + notifications at activate.
+/// Never delete — archive via CANCELLED / COMPLETED only.
+model Recall {
+  id                 String         @id @default(cuid())
+  /// Human-readable recall id (e.g. REC-20260915-0001).
+  recallNumber       String         @unique
+  initiatedByUserId  String
+  initiatedAt        DateTime       @default(now())
+  reason             String
+  severity           RecallSeverity
+  status             RecallStatus   @default(DRAFT)
+  /// When regulators were notified (null until recorded).
+  regulatorNotifiedAt DateTime?
+  closedAt           DateTime?
+  /// Public-facing notice text (press / store posting).
+  publicNotice       String?        @db.Text
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  initiatedBy   User                 @relation("RecallInitiatedBy", fields: [initiatedByUserId], references: [id])
+  lots          RecallLot[]
+  notifications RecallNotification[]
+
+  @@index([status])
+  @@index([initiatedAt])
+  @@index([initiatedByUserId])
+}
+
+/// Lots under a recall, with shelf snapshot and recovery/disposal tracking.
+model RecallLot {
+  id                 String @id @default(cuid())
+  recallId           String
+  lotId              String
+  /// quantityRemaining on the lot at initiate (quarantine snapshot).
+  quantityAtRecall   Int
+  /// Units returned by customers / pulled from circulation after activate.
+  quantityRecovered  Int    @default(0)
+  /// Units destroyed / disposed (never restocked).
+  quantityDisposed   Int    @default(0)
+
+  recall Recall @relation(fields: [recallId], references: [id])
+  lot    Lot    @relation(fields: [lotId], references: [id])
+
+  /// One lot per recall.
+  @@unique([recallId, lotId])
+  /// Store banner / active-recall-for-store: find recalls by lot.
+  @@index([lotId])
+  @@index([recallId])
+}
+
+/// Outreach row for one member on one channel. Never delete — acknowledgement is evidence.
+model RecallNotification {
+  id                 String                     @id @default(cuid())
+  recallId           String
+  memberId           String
+  channel            RecallNotificationChannel
+  sentAt             DateTime?
+  acknowledgedAt     DateTime?
+  /// Units this member purchased from recalled lot(s) at activate time.
+  quantityPurchased  Int
+
+  recall Recall @relation(fields: [recallId], references: [id])
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@unique([recallId, memberId, channel])
+  /// Dispatch / ack sweeps by recall.
+  @@index([recallId])
+  /// Member notification history.
+  @@index([memberId])
 }
 
 /// Idempotency log for Stripe webhook deliveries.

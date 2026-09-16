@@ -76,6 +76,34 @@ inventoryRouter.get("/", async (req, res) => {
   }
 });
 
+inventoryRouter.get("/expiring", async (req, res) => {
+  try {
+    const storeId = inventoryService.resolveStoreScope(
+      req.user!,
+      typeof req.query.storeId === "string" ? req.query.storeId : undefined,
+    );
+    const daysRaw = typeof req.query.days === "string" ? Number(req.query.days) : 30;
+    const days = Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : NaN;
+    const lots = await inventoryService.listExpiringLots(storeId, days);
+    res.status(200).json({ lots, days });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+inventoryRouter.get("/:id/lots", async (req, res) => {
+  try {
+    const storeId = inventoryService.resolveStoreScope(
+      req.user!,
+      typeof req.query.storeId === "string" ? req.query.storeId : undefined,
+    );
+    const lots = await inventoryService.listLotsForProduct(storeId, req.params.id);
+    res.status(200).json({ lots });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
 inventoryRouter.post("/", requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN), async (req, res) => {
   try {
     const parsed = createProductSchema.safeParse(req.body);

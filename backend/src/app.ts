@@ -10,13 +10,16 @@ import { authRouter } from "./routes/auth.routes.js";
 import { auditRouter } from "./routes/audit.routes.js";
 import { drawerRouter } from "./routes/drawer.routes.js";
 import { inventoryRouter } from "./routes/inventory.routes.js";
+import { lotsRouter } from "./routes/lots.routes.js";
 import { membershipRouter } from "./routes/membership.routes.js";
 import { reportsRouter } from "./routes/reports.routes.js";
 import { purchasingRouter } from "./routes/purchasing.routes.js";
+import { recallRouter } from "./routes/recall.routes.js";
 import { salesRouter } from "./routes/sales.routes.js";
 import { settlementRouter } from "./routes/settlement.routes.js";
 import { storesRouter } from "./routes/stores.routes.js";
 import { stripeWebhookHandler } from "./routes/stripe.webhook.js";
+import { traceabilityRouter } from "./routes/traceability.routes.js";
 import { globalApiLimiter } from "./middleware/rateLimit.middleware.js";
 
 export function createApp(): Express {
@@ -60,6 +63,8 @@ export function createApp(): Express {
   app.use("/auth", authRouter);
   app.use("/audit", auditRouter);
   app.use("/products", inventoryRouter);
+  app.use("/inventory", inventoryRouter);
+  app.use("/lots", lotsRouter);
   app.use("/sales", salesRouter);
   app.use("/members", membershipRouter);
   app.use("/settlement", settlementRouter);
@@ -67,6 +72,8 @@ export function createApp(): Express {
   app.use("/drawer", drawerRouter);
   app.use("/reports", reportsRouter);
   app.use("/purchasing", purchasingRouter);
+  app.use("/traceability", traceabilityRouter);
+  app.use("/recalls", recallRouter);
 
   return app;
 }

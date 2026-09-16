@@ -25,8 +25,29 @@ export function AppLayout() {
     enabled: !!user,
   });
 
+  const bannerStoreId = isRole("COOP_ADMIN") ? activeStoreId : user?.storeId ?? null;
+
+  const recallsBannerQuery = useQuery({
+    queryKey: ["recalls", "active-for-store", bannerStoreId],
+    queryFn: () =>
+      apiRequest<{
+        recalls: Array<{
+          recallId: string;
+          recallNumber: string;
+          status: string;
+          severity: string;
+          reason: string;
+          lotNumbers: string[];
+        }>;
+      }>(`/recalls/active-for-store?storeId=${encodeURIComponent(bannerStoreId!)}`),
+    enabled: !!user && !!bannerStoreId,
+    refetchInterval: 60_000,
+  });
+
   const activeStoreName =
     storesQuery.data?.stores.find((s) => s.id === activeStoreId)?.name ?? null;
+
+  const activeRecalls = recallsBannerQuery.data?.recalls ?? [];
 
   return (
     <div className="min-h-screen bg-stone-100 text-stone-900">
@@ -46,6 +67,11 @@ export function AppLayout() {
                 Audit
               </NavLink>
             )}
+            {isRole("COOP_ADMIN") && (
+              <NavLink to="/recalls" className={linkClass}>
+                Recalls
+              </NavLink>
+            )}
             <NavLink to="/" end className={linkClass}>
               Dashboard
             </NavLink>
@@ -60,6 +86,9 @@ export function AppLayout() {
             </NavLink>
             <NavLink to="/inventory" className={linkClass}>
               Inventory
+            </NavLink>
+            <NavLink to="/lots" className={linkClass}>
+              Lots
             </NavLink>
             <NavLink to="/members" className={linkClass}>
               Members
@@ -129,6 +158,28 @@ export function AppLayout() {
           </div>
         </div>
       </header>
+      {activeRecalls.length > 0 && (
+        <div className="border-b border-red-800 bg-red-700 text-white" role="alert">
+          <div className="mx-auto max-w-7xl px-4 py-3 text-sm">
+            <p className="font-semibold tracking-wide">ACTIVE PRODUCT RECALL</p>
+            <ul className="mt-1 space-y-1">
+              {activeRecalls.map((r) => (
+                <li key={r.recallId}>
+                  <span className="font-medium">{r.recallNumber}</span>
+                  {" · "}
+                  {r.severity} · {r.status} — {r.reason}
+                  {r.lotNumbers.length > 0 && (
+                    <span className="opacity-90"> (lots: {r.lotNumbers.join(", ")})</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1 text-red-100">
+              Do not sell affected lots. Quarantined / recalled stock is blocked at POS.
+            </p>
+          </div>
+        </div>
+      )}
       <main className="mx-auto max-w-7xl px-4 py-6">
         <Outlet />
       </main>

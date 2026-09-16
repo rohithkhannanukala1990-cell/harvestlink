@@ -226,7 +226,16 @@ export function POSPage() {
       }
     },
     onError: (err) => {
-      setMessage(err instanceof ApiError ? err.message : "Checkout failed");
+      const msg = err instanceof ApiError ? err.message : "Checkout failed";
+      if (/quarantined or recalled/i.test(msg)) {
+        setMessage(
+          "BLOCKED — this product’s remaining stock is quarantined or recalled and cannot be sold. Remove it from the cart and choose another item.",
+        );
+      } else if (/insufficient stock/i.test(msg)) {
+        setMessage(`Insufficient stock — ${msg}`);
+      } else {
+        setMessage(msg);
+      }
     },
   });
 
@@ -461,7 +470,18 @@ export function POSPage() {
               ? "Checkout"
               : "Queue cash sale"}
         </button>
-        {message && <p className="text-sm text-stone-600">{message}</p>}
+        {message && (
+          <p
+            className={
+              message.startsWith("BLOCKED")
+                ? "rounded-lg border-2 border-red-700 bg-red-50 px-3 py-2 text-sm font-medium text-red-950"
+                : "text-sm text-stone-600"
+            }
+            role={message.startsWith("BLOCKED") ? "alert" : undefined}
+          >
+            {message}
+          </p>
+        )}
       </aside>
     </div>
   );

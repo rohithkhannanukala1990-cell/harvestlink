@@ -2,7 +2,7 @@
  * Daily close (Z-report) for Harvestlink store operators.
  * Summarizes a UTC calendar day: tenders, tax, refunds, operator accrual, cash variance, cashiers.
  */
-import { PaymentMethod, PaymentStatus, Prisma, Role } from "@prisma/client";
+import { PaymentStatus, Prisma, Role } from "@prisma/client";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";

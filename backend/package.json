@@ -18,7 +18,9 @@
     "prisma:studio": "prisma studio",
     "prisma:seed": "tsx prisma/seed.ts",
     "db:backup": "node scripts/run-backup.mjs",
-    "db:migrate-members": "tsx scripts/migrate-members-to-coop.ts"
+    "db:migrate-members": "tsx scripts/migrate-members-to-coop.ts",
+    "db:migrate-legacy-lots": "tsx scripts/migrate-legacy-lots.ts",
+    "verify:stock": "tsx scripts/verify-stock.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

@@ -7,7 +7,7 @@
  * Manual stock adjustments always require a logged reason — shrink, damage, and recount
  * deltas must be auditable so settlement and shrinkage reports stay trustworthy.
  */
-import { Prisma, type Product } from "@prisma/client";
+import { LotStatus, Prisma, Role, type Product } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
@@ -20,6 +20,19 @@ export type ProductWithLowStock = Product & {
   /** Sellable units = stock - reserved (what POS / UI should show). */
   available: number;
   lowStock: boolean;
+};
+
+export type ExpiringLotView = {
+  id: string;
+  lotNumber: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  quantityRemaining: number;
+  quantityReserved: number;
+  expiryDate: Date;
+  unitCost: string;
+  daysUntilExpiry: number;
 };
 
 export type CreateProductInput = {
@@ -78,6 +91,56 @@ export async function listProducts(storeId: string): Promise<ProductWithLowStock
   });
 
   return products.map(toProductView);
+}
+
+/**
+ * ACTIVE lots whose expiryDate falls on or before (now + days).
+ * Includes overdue lots still ACTIVE (expiry job not yet run) so stores can act.
+ */
+export async function listExpiringLots(
+  storeId: string,
+  days: number,
+): Promise<ExpiringLotView[]> {
+  if (!Number.isInteger(days) || days < 0) {
+    throw new AppError(400, "days must be a non-negative integer");
+  }
+
+  const store = await prisma.store.findUnique({ where: { id: storeId } });
+  if (!store) {
+    throw new AppError(404, "Store not found");
+  }
+
+  const now = new Date();
+  const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+
+  const lots = await prisma.lot.findMany({
+    where: {
+      storeId,
+      status: LotStatus.ACTIVE,
+      expiryDate: { not: null, lte: until },
+    },
+    include: {
+      product: { select: { sku: true, name: true } },
+    },
+    orderBy: [{ expiryDate: "asc" }, { receivedAt: "asc" }],
+  });
+
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return lots.map((lot) => {
+    const expiryDate = lot.expiryDate!;
+    return {
+      id: lot.id,
+      lotNumber: lot.lotNumber,
+      productId: lot.productId,
+      sku: lot.product.sku,
+      productName: lot.product.name,
+      quantityRemaining: lot.quantityRemaining,
+      quantityReserved: lot.quantityReserved,
+      expiryDate,
+      unitCost: lot.unitCost.toFixed(2),
+      daysUntilExpiry: Math.ceil((expiryDate.getTime() - now.getTime()) / msPerDay),
+    };
+  });
 }
 
 /**
@@ -286,3 +349,214 @@ export async function adjustStock(
     },
   };
 }
+
+export type LotListItem = {
+  id: string;
+  lotNumber: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  storeId: string;
+  status: LotStatus;
+  quantityReceived: number;
+  quantityRemaining: number;
+  quantityReserved: number;
+  expiryDate: Date | null;
+  receivedAt: Date;
+  unitCost: string;
+  countryOfOrigin: string | null;
+  supplier: { id: string; name: string } | null;
+  daysUntilExpiry: number | null;
+};
+
+function toLotListItem(
+  lot: {
+    id: string;
+    lotNumber: string;
+    productId: string;
+    storeId: string;
+    status: LotStatus;
+    quantityReceived: number;
+    quantityRemaining: number;
+    quantityReserved: number;
+    expiryDate: Date | null;
+    receivedAt: Date;
+    unitCost: Prisma.Decimal;
+    countryOfOrigin: string | null;
+    product: { sku: string; name: string };
+    supplier: { id: string; name: string } | null;
+  },
+  now = new Date(),
+): LotListItem {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return {
+    id: lot.id,
+    lotNumber: lot.lotNumber,
+    productId: lot.productId,
+    sku: lot.product.sku,
+    productName: lot.product.name,
+    storeId: lot.storeId,
+    status: lot.status,
+    quantityReceived: lot.quantityReceived,
+    quantityRemaining: lot.quantityRemaining,
+    quantityReserved: lot.quantityReserved,
+    expiryDate: lot.expiryDate,
+    receivedAt: lot.receivedAt,
+    unitCost: lot.unitCost.toFixed(2),
+    countryOfOrigin: lot.countryOfOrigin,
+    supplier: lot.supplier,
+    daysUntilExpiry: lot.expiryDate
+      ? Math.ceil((lot.expiryDate.getTime() - now.getTime()) / msPerDay)
+      : null,
+  };
+}
+
+/**
+ * Lots for one product (Inventory expand). Ordered FEFO.
+ */
+export async function listLotsForProduct(
+  storeId: string,
+  productId: string,
+): Promise<LotListItem[]> {
+  await getScopedProduct(productId, storeId);
+  const lots = await prisma.lot.findMany({
+    where: { storeId, productId },
+    include: {
+      product: { select: { sku: true, name: true } },
+      supplier: { select: { id: true, name: true } },
+    },
+    orderBy: [{ expiryDate: "asc" }, { receivedAt: "asc" }],
+  });
+  return lots.map((l) => toLotListItem(l));
+}
+
+export type ListLotsFilter = {
+  storeId: string;
+  q?: string;
+  status?: LotStatus;
+  /** Only lots with expiryDate on or before this instant (near-expiry / overdue). */
+  expiryBefore?: Date;
+  /** Only lots with expiryDate on or after this instant. */
+  expiryAfter?: Date;
+  productId?: string;
+};
+
+/**
+ * Store-scoped lot search for the Lots page.
+ */
+export async function listLots(filter: ListLotsFilter): Promise<LotListItem[]> {
+  const store = await prisma.store.findUnique({ where: { id: filter.storeId } });
+  if (!store) throw new AppError(404, "Store not found");
+
+  const q = filter.q?.trim();
+  const lots = await prisma.lot.findMany({
+    where: {
+      storeId: filter.storeId,
+      ...(filter.status ? { status: filter.status } : {}),
+      ...(filter.productId ? { productId: filter.productId } : {}),
+      ...(filter.expiryBefore || filter.expiryAfter
+        ? {
+            expiryDate: {
+              ...(filter.expiryAfter ? { gte: filter.expiryAfter } : {}),
+              ...(filter.expiryBefore ? { lte: filter.expiryBefore } : {}),
+            },
+          }
+        : {}),
+      ...(q
+        ? {
+            OR: [
+              { lotNumber: { contains: q, mode: "insensitive" } },
+              { product: { sku: { contains: q, mode: "insensitive" } } },
+              { product: { name: { contains: q, mode: "insensitive" } } },
+            ],
+          }
+        : {}),
+    },
+    include: {
+      product: { select: { sku: true, name: true } },
+      supplier: { select: { id: true, name: true } },
+    },
+    orderBy: [{ expiryDate: "asc" }, { lotNumber: "asc" }],
+    take: 200,
+  });
+  return lots.map((l) => toLotListItem(l));
+}
+
+/**
+ * Standalone quarantine (STORE_ADMIN+). Leaves sellable rollup immediately.
+ * Prefer a full Recall for regulatory campaigns — this is the ops "pull it now" action.
+ */
+export async function quarantineLot(
+  actor: AuthUser,
+  storeId: string,
+  lotId: string,
+  reason: string,
+  ipAddress?: string | null,
+): Promise<LotListItem> {
+  if (actor.role !== Role.STORE_ADMIN && actor.role !== Role.COOP_ADMIN) {
+    throw new AppError(403, "Only STORE_ADMIN or COOP_ADMIN can quarantine lots");
+  }
+  const trimmed = reason.trim();
+  if (!trimmed) throw new AppError(400, "Quarantine reason is required");
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const lot = await tx.lot.findFirst({
+      where: { id: lotId, storeId },
+      include: {
+        product: { select: { sku: true, name: true } },
+        supplier: { select: { id: true, name: true } },
+      },
+    });
+    if (!lot) throw new AppError(404, "Lot not found for this store");
+    if (lot.status === LotStatus.QUARANTINED) {
+      return lot;
+    }
+    if (lot.status !== LotStatus.ACTIVE) {
+      throw new AppError(409, "Only ACTIVE lots can be quarantined", {
+        status: lot.status,
+      });
+    }
+    if (lot.quantityReserved > 0) {
+      throw new AppError(
+        409,
+        "Cannot quarantine lot with open reservations — finalize or expire pending sales first",
+        { quantityReserved: lot.quantityReserved },
+      );
+    }
+
+    const writeOffQty = Math.max(0, lot.quantityRemaining);
+    const next = await tx.lot.update({
+      where: { id: lot.id },
+      data: { status: LotStatus.QUARANTINED },
+      include: {
+        product: { select: { sku: true, name: true } },
+        supplier: { select: { id: true, name: true } },
+      },
+    });
+    if (writeOffQty > 0) {
+      await tx.product.update({
+        where: { id: lot.productId },
+        data: { stock: { decrement: writeOffQty } },
+      });
+    }
+
+    await writeAuditLog(
+      {
+        userId: actor.id,
+        storeId,
+        action: AuditAction.LOT_QUARANTINE,
+        entityType: "Lot",
+        entityId: lot.id,
+        before: { status: LotStatus.ACTIVE, quantityRemaining: lot.quantityRemaining },
+        after: { status: LotStatus.QUARANTINED, reason: trimmed },
+        ipAddress: ipAddress ?? null,
+      },
+      { tx },
+    );
+
+    return next;
+  });
+
+  return toLotListItem(updated);
+}
+

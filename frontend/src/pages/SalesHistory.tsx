@@ -1,5 +1,5 @@
 /**
- * Sales history with receipt reprint / email.
+ * Sales history with receipt reprint / email and sale detail (lots visible here, not on POS).
  */
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -14,6 +14,7 @@ export function SalesHistoryPage() {
   const { activeStoreId } = useAuth();
   const q = storeQuery(activeStoreId);
   const [message, setMessage] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   const salesQuery = useQuery({
     queryKey: ["sales", "history", activeStoreId],
@@ -24,10 +25,16 @@ export function SalesHistoryPage() {
       ),
   });
 
+  const detailQuery = useQuery({
+    queryKey: ["sales", detailId, activeStoreId],
+    enabled: !!detailId && !!activeStoreId,
+    queryFn: () =>
+      apiRequest<{ sale: Sale }>(`/sales/${detailId}${q ? `?${q}` : ""}`),
+  });
+
   function openReceipt(saleId: string) {
     const token = getToken();
     const url = `${API_BASE}/sales/${saleId}/receipt${q ? `?${q}` : ""}`;
-    // Receipt is HTML with Bearer auth — open via fetch blob for reprint.
     void fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text());
@@ -61,6 +68,8 @@ export function SalesHistoryPage() {
     return <p className="text-stone-600">Select a store to view sales.</p>;
   }
 
+  const detail = detailQuery.data?.sale;
+
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold tracking-tight">Sales history</h1>
@@ -79,7 +88,7 @@ export function SalesHistoryPage() {
           </thead>
           <tbody className="divide-y">
             {(salesQuery.data?.sales ?? []).map((sale) => (
-              <tr key={sale.id}>
+              <tr key={sale.id} className={detailId === sale.id ? "bg-stone-50" : ""}>
                 <td className="px-3 py-2 whitespace-nowrap">
                   {new Date(sale.paidAt ?? sale.createdAt).toLocaleString()}
                 </td>
@@ -88,6 +97,13 @@ export function SalesHistoryPage() {
                 <td className="px-3 py-2">{money(sale.total)}</td>
                 <td className="px-3 py-2">{money(sale.taxAmount ?? 0)}</td>
                 <td className="px-3 py-2 space-x-2">
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => setDetailId(detailId === sale.id ? null : sale.id)}
+                  >
+                    {detailId === sale.id ? "Hide" : "Detail"}
+                  </button>
                   {(sale.paymentStatus === "PAID" || sale.paymentStatus === "REFUNDED") && (
                     <>
                       <button
@@ -112,6 +128,40 @@ export function SalesHistoryPage() {
           </tbody>
         </table>
       </div>
+
+      {detailId && (
+        <section className="rounded-lg border border-stone-200 bg-white p-4">
+          <h2 className="text-lg font-medium">Sale detail</h2>
+          {detailQuery.isLoading && <p className="mt-2 text-sm text-stone-500">Loading…</p>}
+          {detail && (
+            <ul className="mt-3 space-y-3 text-sm">
+              {detail.items.map((item) => (
+                <li key={item.id} className="border-b border-stone-100 pb-2">
+                  <div className="font-medium">
+                    {item.nameSnapshot}{" "}
+                    <span className="font-normal text-stone-500">
+                      ×{item.quantity} @ {money(item.priceSnapshot)}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-stone-600">
+                    {item.lotAllocations && item.lotAllocations.length > 0 ? (
+                      item.lotAllocations.map((a) => (
+                        <div key={a.id} className="font-mono text-xs">
+                          Lot {a.lot?.lotNumber ?? a.lotId}
+                          {a.quantity !== item.quantity ? ` ×${a.quantity}` : ""}
+                          {a.lot?.status ? ` · ${a.lot.status}` : ""}
+                        </div>
+                      ))
+                    ) : (
+                      <span className="text-xs text-stone-400">No lot allocation recorded</span>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
     </div>
   );
 }

@@ -1,20 +1,16 @@
 /**
  * Inventory management page.
  *
- * APIs:
- * - GET /products — list (CASHIER can view; STORE_ADMIN / COOP_ADMIN manage)
- * - POST /products — create (STORE_ADMIN, COOP_ADMIN)
- * - PATCH /products/:id — edit (STORE_ADMIN, COOP_ADMIN)
- * - DELETE /products/:id — remove (STORE_ADMIN, COOP_ADMIN)
- *
- * Cashiers see a read-only table; mutation controls are hidden for CASHIER.
+ * Expand a product to see lots — lot number, qty, expiry, supplier, status.
+ * Near-expiry and quarantined/recalled lots are colour-coded.
  */
-import { useState, type FormEvent } from "react";
+import { Fragment, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest, money } from "../api/client";
-import type { Product } from "../api/types";
+import type { Lot, Product } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import { formatExpiry, lotRowClass, lotStatusBadge } from "../lib/lotDisplay";
 
 const emptyForm = {
   sku: "",
@@ -27,6 +23,59 @@ const emptyForm = {
   taxExempt: false,
 };
 
+function ProductLots({ productId }: { productId: string }) {
+  const { activeStoreId } = useAuth();
+  const q = storeQuery(activeStoreId);
+  const lotsQuery = useQuery({
+    queryKey: ["products", productId, "lots", activeStoreId],
+    enabled: !!activeStoreId,
+    queryFn: () =>
+      apiRequest<{ lots: Lot[] }>(`/products/${productId}/lots${q ? `?${q}` : ""}`),
+  });
+
+  if (lotsQuery.isLoading) {
+    return <p className="px-3 py-2 text-sm text-stone-500">Loading lots…</p>;
+  }
+  const lots = lotsQuery.data?.lots ?? [];
+  if (!lots.length) {
+    return <p className="px-3 py-2 text-sm text-stone-500">No lots for this product.</p>;
+  }
+
+  return (
+    <table className="min-w-full text-left text-xs">
+      <thead className="text-stone-500">
+        <tr>
+          <th className="px-3 py-1">Lot #</th>
+          <th className="px-3 py-1">Qty</th>
+          <th className="px-3 py-1">Expiry</th>
+          <th className="px-3 py-1">Supplier</th>
+          <th className="px-3 py-1">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {lots.map((lot) => (
+          <tr key={lot.id} className={`border-t border-stone-100 ${lotRowClass(lot)}`}>
+            <td className="px-3 py-1.5 font-mono">{lot.lotNumber}</td>
+            <td className="px-3 py-1.5">
+              {lot.quantityRemaining}
+              {lot.quantityReserved > 0 ? (
+                <span className="ml-1 text-stone-500">({lot.quantityReserved} held)</span>
+              ) : null}
+            </td>
+            <td className="px-3 py-1.5">
+              {formatExpiry(lot.expiryDate, lot.daysUntilExpiry)}
+            </td>
+            <td className="px-3 py-1.5">{lot.supplier?.name ?? "—"}</td>
+            <td className="px-3 py-1.5">
+              <span className={lotStatusBadge(lot.status)}>{lot.status}</span>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 export function InventoryPage() {
   const { activeStoreId, isRole } = useAuth();
   const canEdit = isRole("STORE_ADMIN", "COOP_ADMIN");
@@ -35,6 +84,7 @@ export function InventoryPage() {
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<Product | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const productsQuery = useQuery({
     queryKey: ["products", activeStoreId],
@@ -116,6 +166,10 @@ export function InventoryPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-semibold tracking-tight">Inventory</h1>
+      <p className="text-sm text-stone-600">
+        Expand a product to see lots. Amber = near expiry (≤14 days). Red = quarantined /
+        recalled.
+      </p>
 
       {canEdit && (
         <form
@@ -184,6 +238,7 @@ export function InventoryPage() {
         <table className="min-w-full text-left text-sm">
           <thead className="border-b border-stone-200 bg-stone-50 text-stone-600">
             <tr>
+              <th className="px-3 py-2 w-8" />
               <th className="px-3 py-2">SKU</th>
               <th className="px-3 py-2">Name</th>
               <th className="px-3 py-2">Category</th>
@@ -195,46 +250,68 @@ export function InventoryPage() {
             </tr>
           </thead>
           <tbody>
-            {(productsQuery.data?.products ?? []).map((p) => (
-              <tr key={p.id} className="border-b border-stone-100">
-                <td className="px-3 py-2 font-mono text-xs">{p.sku}</td>
-                <td className="px-3 py-2">{p.name}</td>
-                <td className="px-3 py-2">{p.category}</td>
-                <td className="px-3 py-2">{money(p.price)}</td>
-                <td className="px-3 py-2">{p.taxExempt ? "Exempt" : "Taxable"}</td>
-                <td className="px-3 py-2">
-                  {p.available ?? p.stock}
-                  {(p.reserved ?? 0) > 0 ? (
-                    <span className="ml-1 text-xs text-stone-400">
-                      ({p.reserved} reserved)
-                    </span>
-                  ) : null}
-                </td>
-                <td className="px-3 py-2">
-                  {p.lowStock ? (
-                    <span className="text-amber-700">Low</span>
-                  ) : (
-                    <span className="text-stone-500">OK</span>
+            {(productsQuery.data?.products ?? []).map((p) => {
+              const open = expandedId === p.id;
+              return (
+                <Fragment key={p.id}>
+                  <tr className="border-b border-stone-100">
+                    <td className="px-3 py-2">
+                      <button
+                        type="button"
+                        className="font-mono text-stone-500"
+                        aria-expanded={open}
+                        onClick={() => setExpandedId(open ? null : p.id)}
+                      >
+                        {open ? "▾" : "▸"}
+                      </button>
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">{p.sku}</td>
+                    <td className="px-3 py-2">{p.name}</td>
+                    <td className="px-3 py-2">{p.category}</td>
+                    <td className="px-3 py-2">{money(p.price)}</td>
+                    <td className="px-3 py-2">{p.taxExempt ? "Exempt" : "Taxable"}</td>
+                    <td className="px-3 py-2">
+                      {p.available ?? p.stock}
+                      {(p.reserved ?? 0) > 0 ? (
+                        <span className="ml-1 text-xs text-stone-400">
+                          ({p.reserved} reserved)
+                        </span>
+                      ) : null}
+                    </td>
+                    <td className="px-3 py-2">
+                      {p.lowStock ? (
+                        <span className="text-amber-700">Low</span>
+                      ) : (
+                        <span className="text-stone-500">OK</span>
+                      )}
+                    </td>
+                    {canEdit && (
+                      <td className="space-x-2 px-3 py-2">
+                        <button type="button" className="underline" onClick={() => startEdit(p)}>
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="text-red-700 underline"
+                          onClick={() => {
+                            if (confirm(`Delete ${p.name}?`)) deleteMutation.mutate(p.id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                  {open && (
+                    <tr className="border-b border-stone-200 bg-stone-50">
+                      <td colSpan={canEdit ? 9 : 8} className="px-0 py-0">
+                        <ProductLots productId={p.id} />
+                      </td>
+                    </tr>
                   )}
-                </td>
-                {canEdit && (
-                  <td className="space-x-2 px-3 py-2">
-                    <button type="button" className="underline" onClick={() => startEdit(p)}>
-                      Edit
-                    </button>
-                    <button
-                      type="button"
-                      className="text-red-700 underline"
-                      onClick={() => {
-                        if (confirm(`Delete ${p.name}?`)) deleteMutation.mutate(p.id);
-                      }}
-                    >
-                      Delete
-                    </button>
-                  </td>
-                )}
-              </tr>
-            ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>

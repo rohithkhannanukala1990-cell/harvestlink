@@ -12,12 +12,14 @@ import { DashboardPage } from "./pages/Dashboard.tsx";
 import { DrawerPage } from "./pages/Drawer.tsx";
 import { InventoryPage } from "./pages/Inventory.tsx";
 import { LoginPage } from "./pages/Login.tsx";
+import { LotsPage } from "./pages/Lots.tsx";
 import { MembersPage } from "./pages/Members.tsx";
 import { NetworkOverviewPage } from "./pages/NetworkOverview.tsx";
 import { POSPage } from "./pages/POS.tsx";
 import { PurchaseOrderEditPage } from "./pages/PurchaseOrderEdit.tsx";
 import { PurchaseOrdersPage } from "./pages/PurchaseOrders.tsx";
 import { ReceiveGoodsPage } from "./pages/ReceiveGoods.tsx";
+import { RecallsPage } from "./pages/Recalls.tsx";
 import { SalesHistoryPage } from "./pages/SalesHistory.tsx";
 import { SettingsPage } from "./pages/Settings.tsx";
 import { SettlementPage } from "./pages/Settlement.tsx";
@@ -50,10 +52,12 @@ export default function App() {
           <Route path="sales" element={<SalesHistoryPage />} />
           <Route path="drawer" element={<DrawerPage />} />
           <Route path="inventory" element={<InventoryPage />} />
+          <Route path="lots" element={<LotsPage />} />
           <Route path="members" element={<MembersPage />} />
           <Route element={<RequireRoles roles={["COOP_ADMIN"]} />}>
             <Route path="network" element={<NetworkOverviewPage />} />
             <Route path="audit" element={<AuditPage />} />
+            <Route path="recalls" element={<RecallsPage />} />
           </Route>
           <Route element={<RequireRoles roles={["STORE_ADMIN", "COOP_ADMIN"]} />}>
             <Route path="settlement" element={<SettlementPage />} />

@@ -46,7 +46,8 @@ type BenefitCacheEntry = {
 const activeBenefitsCache = new Map<string, BenefitCacheEntry>();
 
 /** Clears cached active benefits so the next checkout reloads from the DB. */
-export function invalidateBenefitCache(_unused?: string): void {
+export function invalidateBenefitCache(_storeId?: string): void {
+  void _storeId;
   activeBenefitsCache.clear();
 }
 

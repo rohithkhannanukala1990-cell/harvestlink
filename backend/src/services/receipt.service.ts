@@ -18,7 +18,15 @@ export async function buildReceiptHtml(saleId: string, storeId: string): Promise
   const sale = await prisma.sale.findFirst({
     where: { id: saleId, storeId },
     include: {
-      items: true,
+      items: {
+        include: {
+          lotAllocations: {
+            include: {
+              lot: { select: { lotNumber: true } },
+            },
+          },
+        },
+      },
       store: true,
       member: true,
       cashier: { select: { email: true } },
@@ -36,8 +44,21 @@ export async function buildReceiptHtml(saleId: string, storeId: string): Promise
   const lines = sale.items
     .map((item) => {
       const gross = Number(item.priceSnapshot) * item.quantity;
+      const lotLabel =
+        item.lotAllocations.length === 0
+          ? ""
+          : item.lotAllocations
+              .map((a) =>
+                a.quantity === item.quantity
+                  ? a.lot.lotNumber
+                  : `${a.lot.lotNumber}×${a.quantity}`,
+              )
+              .join(", ");
       return `<tr>
-        <td>${escapeHtml(item.nameSnapshot)}</td>
+        <td>
+          ${escapeHtml(item.nameSnapshot)}
+          ${lotLabel ? `<div class="lot">Lot: ${escapeHtml(lotLabel)}</div>` : ""}
+        </td>
         <td>${item.quantity}</td>
         <td>$${money(item.priceSnapshot)}</td>
         <td>$${money(item.discountAmount)}</td>
@@ -59,8 +80,9 @@ export async function buildReceiptHtml(saleId: string, storeId: string): Promise
     body { font-family: Georgia, "Times New Roman", serif; max-width: 28rem; margin: 1.5rem auto; color: #1c1917; }
     h1 { font-size: 1.35rem; margin: 0; }
     .muted { color: #57534e; font-size: 0.9rem; }
+    .lot { font-size: 0.8rem; color: #57534e; margin-top: 0.15rem; }
     table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }
-    th, td { text-align: left; padding: 0.35rem 0.25rem; border-bottom: 1px solid #e7e5e4; }
+    th, td { text-align: left; padding: 0.35rem 0.25rem; border-bottom: 1px solid #e7e5e4; vertical-align: top; }
     th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #78716c; }
     .totals td { border: 0; }
     .totals .label { text-align: right; padding-right: 0.75rem; }
@@ -90,6 +112,9 @@ export async function buildReceiptHtml(saleId: string, storeId: string): Promise
     Member: ${sale.member ? escapeHtml(sale.member.memberNumber) : "—"}
   </p>
   <p class="policy">${escapeHtml(sale.store.refundPolicy)}</p>
+  <p class="muted" style="font-size:0.75rem;margin-top:1rem;">
+    Keep this receipt. Lot numbers identify your purchase if a recall is issued.
+  </p>
   <script>/* printable */</script>
 </body>
 </html>`;

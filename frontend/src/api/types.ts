@@ -104,6 +104,46 @@ export type SaleItem = {
   discountAmount?: string | number;
   taxAmount?: string | number;
   taxExempt?: boolean;
+  lotAllocations?: SaleItemLot[];
+};
+
+export type SaleItemLot = {
+  id: string;
+  lotId: string;
+  quantity: number;
+  unitCostSnapshot?: string | number;
+  lot?: {
+    id: string;
+    lotNumber: string;
+    status?: LotStatus;
+    expiryDate?: string | null;
+  };
+};
+
+export type LotStatus =
+  | "ACTIVE"
+  | "QUARANTINED"
+  | "RECALLED"
+  | "EXPIRED"
+  | "DEPLETED";
+
+export type Lot = {
+  id: string;
+  lotNumber: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  storeId: string;
+  status: LotStatus;
+  quantityReceived: number;
+  quantityRemaining: number;
+  quantityReserved: number;
+  expiryDate: string | null;
+  receivedAt: string;
+  unitCost: string;
+  countryOfOrigin: string | null;
+  supplier: { id: string; name: string } | null;
+  daysUntilExpiry: number | null;
 };
 
 export type SettlementSummary = {
