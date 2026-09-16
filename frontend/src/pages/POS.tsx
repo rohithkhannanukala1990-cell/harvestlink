@@ -343,31 +343,56 @@ export function POSPage() {
           {products.map((p) => {
             const qty = p.available ?? p.stock;
             const sellBlocked = qty <= 0;
+            const blockedByRecall = Boolean(p.blockedByQuarantineOrRecall);
+            const unavailableLabel = blockedByRecall
+              ? "Unavailable — stock is quarantined or recalled"
+              : sellBlocked
+                ? "Out of stock"
+                : null;
             return (
               <button
                 key={p.id}
                 type="button"
-                onClick={() => addToCart(p)}
+                onClick={() => {
+                  if (!sellBlocked) addToCart(p);
+                }}
                 disabled={sellBlocked}
                 aria-disabled={sellBlocked}
-                title={
+                title={unavailableLabel ?? undefined}
+                className={`min-h-[44px] rounded-lg border p-4 text-left shadow-card ${
                   sellBlocked
-                    ? "Out of sellable stock (quarantined/recalled units are not available)"
-                    : undefined
-                }
-                className="min-h-[44px] rounded-lg border border-border-hairline bg-surface-raised p-4 text-left shadow-card hover:border-border-strong disabled:cursor-not-allowed disabled:opacity-40"
+                    ? "cursor-not-allowed border-border-hairline bg-surface-sunken opacity-50"
+                    : "border-border-hairline bg-surface-raised hover:border-border-strong"
+                } ${
+                  blockedByRecall ? "border-state-danger/40" : ""
+                }`}
               >
                 <div className="font-semibold text-ink">{p.name}</div>
                 <div className="text-sm text-ink-muted">{p.sku}</div>
                 <div className="mt-2 flex justify-between text-sm">
                   <Money value={p.price} />
                   <span
-                    className={`tabular ${p.lowStock ? "text-state-warning" : "text-ink-muted"}`}
+                    className={`tabular ${p.lowStock && !sellBlocked ? "text-state-warning" : "text-ink-muted"}`}
                   >
                     qty {qty}
                   </span>
                 </div>
-                {p.lowStock ? (
+                {unavailableLabel ? (
+                  <p
+                    className={`mt-2 text-xs font-semibold ${
+                      blockedByRecall ? "text-state-danger" : "text-ink-muted"
+                    }`}
+                    role={blockedByRecall ? "status" : undefined}
+                  >
+                    {unavailableLabel}
+                  </p>
+                ) : null}
+                {blockedByRecall ? (
+                  <div className="mt-2">
+                    <StatusBadge label="Quarantined" tone="danger" />
+                  </div>
+                ) : null}
+                {!sellBlocked && p.lowStock ? (
                   <div className="mt-2">
                     <StatusBadge label="Low stock" tone="warning" />
                   </div>
@@ -452,7 +477,11 @@ export function POSPage() {
               </p>
               {member && (
                 <p className="text-sm font-semibold text-brand-terracotta-ink">
-                  Member savings: <Money value={memberSavings} />
+                  Member savings:{" "}
+                  <Money
+                    value={memberSavings}
+                    className="font-semibold text-brand-terracotta-ink"
+                  />
                 </p>
               )}
             </div>

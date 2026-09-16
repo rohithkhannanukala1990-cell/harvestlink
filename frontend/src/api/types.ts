@@ -34,6 +34,11 @@ export type Product = {
   reserved?: number;
   /** Sellable = stock - reserved (prefer this in POS). */
   available?: number;
+  /**
+   * True when sellable qty is 0 but QUARANTINED/RECALLED lots still hold units.
+   * POS must show a recall/quarantine message, not a generic out-of-stock cue.
+   */
+  blockedByQuarantineOrRecall?: boolean;
   reorderAt: number;
   taxExempt?: boolean;
   lowStock?: boolean;

@@ -20,6 +20,11 @@ export type ProductWithLowStock = Product & {
   /** Sellable units = stock - reserved (what POS / UI should show). */
   available: number;
   lowStock: boolean;
+  /**
+   * When available is 0 but QUARANTINED/RECALLED lots still hold units,
+   * POS must show a recall message — not a generic out-of-stock cue.
+   */
+  blockedByQuarantineOrRecall: boolean;
 };
 
 export type ExpiringLotView = {
@@ -65,13 +70,17 @@ export type AdjustStockInput = {
   ipAddress?: string | null;
 };
 
-function toProductView(product: Product): ProductWithLowStock {
+function toProductView(
+  product: Product,
+  blockedByQuarantineOrRecall = false,
+): ProductWithLowStock {
   const available = product.stock - product.reserved;
   return {
     ...product,
     available,
     // Reorder alerts use available stock so reserved holds do not hide a true low-stock state.
     lowStock: available <= product.reorderAt,
+    blockedByQuarantineOrRecall: available <= 0 && blockedByQuarantineOrRecall,
   };
 }
 
@@ -90,7 +99,22 @@ export async function listProducts(storeId: string): Promise<ProductWithLowStock
     orderBy: [{ category: "asc" }, { name: "asc" }],
   });
 
-  return products.map(toProductView);
+  const blockedLots = await prisma.lot.groupBy({
+    by: ["productId"],
+    where: {
+      storeId,
+      status: { in: [LotStatus.QUARANTINED, LotStatus.RECALLED] },
+      quantityRemaining: { gt: 0 },
+    },
+    _sum: { quantityRemaining: true },
+  });
+  const blockedProductIds = new Set(
+    blockedLots
+      .filter((row) => (row._sum.quantityRemaining ?? 0) > 0)
+      .map((row) => row.productId),
+  );
+
+  return products.map((p) => toProductView(p, blockedProductIds.has(p.id)));
 }
 
 /**

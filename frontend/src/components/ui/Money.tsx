@@ -35,7 +35,13 @@ export function Money({
   className = "",
 }: MoneyProps) {
   return (
-    <span className={`tabular ${toneClass[tone]} ${className}`.trim()}>
+    <span
+      className={
+        className
+          ? `tabular ${className}`.trim()
+          : `tabular ${toneClass[tone]}`.trim()
+      }
+    >
       {formatMoney(value)}
     </span>
   );
