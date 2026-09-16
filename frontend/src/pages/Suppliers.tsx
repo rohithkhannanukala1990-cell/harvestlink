@@ -4,10 +4,21 @@
 import { useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { Product, Supplier } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  Money,
+  PageHeader,
+  SelectField,
+  StatusBadge,
+  type DataTableColumn,
+} from "../components/ui";
 
 export function SuppliersPage() {
   const { id } = useParams();
@@ -39,54 +50,76 @@ function SupplierList() {
     onError: (err) => setError(err instanceof ApiError ? err.message : "Create failed"),
   });
 
+  const suppliers = listQuery.data?.suppliers ?? [];
+
+  const columns: DataTableColumn<Supplier>[] = [
+    {
+      id: "name",
+      header: "Name",
+      cell: (s) => (
+        <Link
+          className="font-semibold text-ink underline decoration-brand-terracotta-ink/40"
+          to={`/suppliers/${s.id}`}
+        >
+          {s.name}
+        </Link>
+      ),
+    },
+    { id: "terms", header: "Terms", cell: (s) => s.paymentTerms },
+    {
+      id: "lead",
+      header: "Lead days",
+      numeric: true,
+      cell: (s) => <span className="tabular">{s.leadTimeDays}</span>,
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (s) =>
+        s.isActive ? (
+          <StatusBadge label="Active" tone="success" />
+        ) : (
+          <StatusBadge label="Closed" tone="neutral" />
+        ),
+    },
+  ];
+
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Suppliers</h1>
-      <form
-        className="flex flex-wrap gap-2 rounded-lg border border-stone-200 bg-white p-4"
-        onSubmit={(e: FormEvent) => {
-          e.preventDefault();
-          createMutation.mutate();
-        }}
-      >
-        <input
-          className="min-w-[220px] flex-1 rounded border border-stone-300 px-3 py-2"
-          placeholder="New supplier name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          required
-        />
-        <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
-          Add supplier
-        </button>
-        {error && <p className="w-full text-sm text-red-700">{error}</p>}
-      </form>
-      <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-        <table className="min-w-full text-left text-sm">
-          <thead className="border-b bg-stone-50 text-stone-600">
-            <tr>
-              <th className="px-3 py-2">Name</th>
-              <th className="px-3 py-2">Terms</th>
-              <th className="px-3 py-2">Lead days</th>
-              <th className="px-3 py-2">Status</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {(listQuery.data?.suppliers ?? []).map((s) => (
-              <tr key={s.id}>
-                <td className="px-3 py-2">
-                  <Link className="font-medium text-stone-900 underline" to={`/suppliers/${s.id}`}>
-                    {s.name}
-                  </Link>
-                </td>
-                <td className="px-3 py-2">{s.paymentTerms}</td>
-                <td className="px-3 py-2">{s.leadTimeDays}</td>
-                <td className="px-3 py-2">{s.isActive ? "Active" : "Inactive"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <PageHeader title="Suppliers" />
+      <Card title="Add supplier">
+        <form
+          className="flex flex-wrap gap-2"
+          onSubmit={(e: FormEvent) => {
+            e.preventDefault();
+            createMutation.mutate();
+          }}
+        >
+          <Field
+            label="New supplier name"
+            className="min-w-[220px] flex-1"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+          />
+          <div className="flex items-end">
+            <Button type="submit" loading={createMutation.isPending}>
+              Add supplier
+            </Button>
+          </div>
+          {error && (
+            <p className="w-full text-sm text-state-danger" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+      </Card>
+      <DataTable
+        columns={columns}
+        rows={suppliers}
+        rowKey={(s) => s.id}
+        emptyMessage="No suppliers yet"
+      />
     </div>
   );
 }
@@ -180,73 +213,84 @@ function SupplierDetail({ id }: { id: string }) {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <Link to="/suppliers" className="text-sm text-stone-600 underline">
-          ← Suppliers
-        </Link>
-        <h1 className="text-2xl font-semibold tracking-tight">{supplier?.name ?? "…"}</h1>
-      </div>
-      {message && <p className="text-sm text-stone-600">{message}</p>}
+      <PageHeader
+        title={supplier?.name ?? "…"}
+        description={
+          <Link to="/suppliers" className="text-brand-terracotta-ink underline">
+            ← Suppliers
+          </Link>
+        }
+      />
+      {message && <p className="text-sm text-ink-muted">{message}</p>}
 
-      <form
-        className="grid gap-3 rounded-lg border border-stone-200 bg-white p-4 sm:grid-cols-2"
-        onSubmit={(e) => {
-          e.preventDefault();
-          saveMutation.mutate();
-        }}
-      >
-        {(
-          [
-            ["contactName", "Contact"],
-            ["email", "Email"],
-            ["phone", "Phone"],
-            ["address", "Address"],
-            ["paymentTerms", "Payment terms"],
-            ["leadTimeDays", "Lead time (days)"],
-          ] as const
-        ).map(([key, label]) => (
-          <label key={key} className="text-sm">
-            {label}
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
+      <Card title="Supplier details">
+        <form
+          className="grid gap-3 sm:grid-cols-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            saveMutation.mutate();
+          }}
+        >
+          {(
+            [
+              ["contactName", "Contact"],
+              ["email", "Email"],
+              ["phone", "Phone"],
+              ["address", "Address"],
+              ["paymentTerms", "Payment terms"],
+              ["leadTimeDays", "Lead time (days)"],
+            ] as const
+          ).map(([key, label]) => (
+            <Field
+              key={key}
+              label={label}
               value={form[key]}
               onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
             />
+          ))}
+          <label className="flex flex-col gap-1.5 text-sm sm:col-span-2">
+            <span className="font-semibold text-ink">Notes</span>
+            <textarea
+              className="w-full rounded-md border border-border-strong bg-surface-raised px-3 py-2 text-sm text-ink"
+              rows={2}
+              value={form.notes}
+              onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
+            />
           </label>
-        ))}
-        <label className="text-sm sm:col-span-2">
-          Notes
-          <textarea
-            className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
-            rows={2}
-            value={form.notes}
-            onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
-          />
-        </label>
-        <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white sm:col-span-2">
-          Save supplier
-        </button>
-      </form>
+          <div className="sm:col-span-2">
+            <Button type="submit" loading={saveMutation.isPending}>
+              Save supplier
+            </Button>
+          </div>
+        </form>
+      </Card>
 
-      <section className="space-y-3 rounded-lg border border-stone-200 bg-white p-4">
-        <h2 className="font-medium">Linked products</h2>
-        <ul className="space-y-2 text-sm">
+      <Card title="Linked products">
+        <ul className="mb-4 space-y-2 text-sm">
           {(supplier?.products ?? []).map((p) => (
-            <li key={p.id} className="flex flex-wrap justify-between gap-2 border-b border-stone-100 pb-2">
-              <span>
+            <li
+              key={p.id}
+              className="flex flex-wrap justify-between gap-2 border-b border-border-hairline pb-2"
+            >
+              <span className="text-ink">
                 {p.product.sku} — {p.product.name}
                 {p.isPreferred ? " · preferred" : ""}
               </span>
-              <span>
-                unit {money(p.unitCost)} · case {p.caseSize} · min {p.minOrderQty}
+              <span className="text-ink-muted">
+                unit <Money value={p.unitCost} /> · case{" "}
+                <span className="tabular">{p.caseSize}</span> · min{" "}
+                <span className="tabular">{p.minOrderQty}</span>
               </span>
             </li>
           ))}
+          {(supplier?.products ?? []).length === 0 && (
+            <li className="text-ink-muted">No products linked yet.</li>
+          )}
         </ul>
 
-        <div className="grid gap-2 border-t border-stone-100 pt-3 sm:grid-cols-3">
-          <select
-            className="rounded border border-stone-300 px-2 py-2"
+        <div className="grid gap-2 border-t border-border-hairline pt-3 sm:grid-cols-3">
+          <SelectField
+            label="Product"
             value={link.productId}
             onChange={(e) => setLink((l) => ({ ...l, productId: e.target.value }))}
           >
@@ -256,20 +300,18 @@ function SupplierDetail({ id }: { id: string }) {
                 {p.sku} — {p.name}
               </option>
             ))}
-          </select>
-          <input
-            className="rounded border border-stone-300 px-2 py-2"
-            placeholder="Unit cost"
+          </SelectField>
+          <Field
+            label="Unit cost"
             value={link.unitCost}
             onChange={(e) => setLink((l) => ({ ...l, unitCost: e.target.value }))}
           />
-          <input
-            className="rounded border border-stone-300 px-2 py-2"
-            placeholder="Case size"
+          <Field
+            label="Case size"
             value={link.caseSize}
             onChange={(e) => setLink((l) => ({ ...l, caseSize: e.target.value }))}
           />
-          <label className="flex items-center gap-2 text-sm sm:col-span-2">
+          <label className="flex items-center gap-2 text-sm text-ink sm:col-span-2">
             <input
               type="checkbox"
               checked={link.isPreferred}
@@ -277,16 +319,18 @@ function SupplierDetail({ id }: { id: string }) {
             />
             Preferred supplier for this product
           </label>
-          <button
-            type="button"
-            className="rounded bg-stone-800 px-4 py-2 text-white"
-            disabled={!link.productId || !link.unitCost}
-            onClick={() => linkMutation.mutate()}
-          >
-            Link product
-          </button>
+          <div className="flex items-end">
+            <Button
+              type="button"
+              disabled={!link.productId || !link.unitCost}
+              loading={linkMutation.isPending}
+              onClick={() => linkMutation.mutate()}
+            >
+              Link product
+            </Button>
+          </div>
         </div>
-      </section>
+      </Card>
     </div>
   );
 }

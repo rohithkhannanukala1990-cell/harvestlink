@@ -1,5 +1,5 @@
 /**
- * App shell with role-aware navigation for Harvestlink pages.
+ * App shell with role-aware navigation for HarvestLinx pages.
  *
  * COOP_ADMIN gets a persistent "Switch store" control so POS / Inventory / Settlement
  * hit the intended storeId after Network Overview. Multi-store switching was deferred
@@ -12,8 +12,10 @@ import type { Store } from "../api/types.ts";
 import { useAuth } from "../auth/AuthContext.tsx";
 
 const linkClass = ({ isActive }: { isActive: boolean }) =>
-  `rounded px-3 py-2 text-sm font-medium ${
-    isActive ? "bg-stone-800 text-white" : "text-stone-700 hover:bg-stone-200"
+  `inline-flex min-h-[44px] items-center rounded-md px-3 py-2 text-sm text-ink-inverse ${
+    isActive
+      ? "bg-brand-green font-bold underline decoration-2 underline-offset-4"
+      : "font-medium text-ink-inverse/80 hover:bg-brand-green/35 hover:text-ink-inverse"
   }`;
 
 export function AppLayout() {
@@ -50,11 +52,14 @@ export function AppLayout() {
   const activeRecalls = recallsBannerQuery.data?.recalls ?? [];
 
   return (
-    <div className="min-h-screen bg-stone-100 text-stone-900">
-      <header className="border-b border-stone-200 bg-white">
+    <div className="min-h-screen bg-surface-page text-ink">
+      {/* Canopy carries ink-inverse only — never ink / muted on this field. */}
+      <header className="bg-surface-canopy text-ink-inverse">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-4 px-4 py-3">
-          <Link to="/" className="text-lg font-semibold tracking-tight">
-            Harvestlink
+          <Link to="/" className="text-lg font-extrabold tracking-tight text-ink-inverse">
+            {/* Plain-type stand-in — replace with the real logo file when available; do not redraw the mark. */}
+            <span>Harvest</span>
+            <span className="text-brand-terracotta">Linx</span>
           </Link>
           <nav className="flex flex-wrap gap-1">
             {isRole("COOP_ADMIN") && (
@@ -119,12 +124,12 @@ export function AppLayout() {
               </NavLink>
             )}
           </nav>
-          <div className="ml-auto flex flex-wrap items-center gap-3 text-sm">
+          <div className="ml-auto flex flex-wrap items-center gap-3 text-sm text-ink-inverse">
             {isRole("COOP_ADMIN") && (
-              <label className="flex items-center gap-2 rounded border border-stone-300 bg-stone-50 px-2 py-1">
-                <span className="font-medium text-stone-700">Switch store</span>
+              <label className="flex items-center gap-2 rounded-md border border-ink-inverse/30 bg-brand-green/40 px-2 py-1">
+                <span className="font-medium">Switch store</span>
                 <select
-                  className="rounded border border-stone-300 bg-white px-2 py-1"
+                  className="rounded border border-ink-inverse/30 bg-surface-canopy px-2 py-1 text-ink-inverse"
                   value={activeStoreId ?? ""}
                   onChange={(e) => setStoreId(e.target.value)}
                   aria-label="Switch store"
@@ -139,27 +144,31 @@ export function AppLayout() {
                   ))}
                 </select>
                 {activeStoreName && (
-                  <span className="hidden text-stone-500 sm:inline">
+                  <span className="hidden opacity-80 sm:inline">
                     Viewing: {activeStoreName}
                   </span>
                 )}
               </label>
             )}
-            <span className="text-stone-600">
+            <span className="text-ink-inverse/80">
               {user?.email} · {user?.role}
             </span>
             <button
               type="button"
               onClick={logout}
-              className="rounded border border-stone-300 px-3 py-1 hover:bg-stone-50"
+              className="inline-flex min-h-[44px] items-center rounded-md border border-ink-inverse/40 px-3 font-medium text-ink-inverse hover:bg-brand-green/40"
             >
               Log out
             </button>
           </div>
         </div>
       </header>
+      {/* ACTIVE recall banner — shown on every page for the affected store (Inventory, Lots, POS, receiving included). */}
       {activeRecalls.length > 0 && (
-        <div className="border-b border-red-800 bg-red-700 text-white" role="alert">
+        <div
+          className="border-b border-state-danger bg-state-danger text-ink-inverse"
+          role="alert"
+        >
           <div className="mx-auto max-w-7xl px-4 py-3 text-sm">
             <p className="font-semibold tracking-wide">ACTIVE PRODUCT RECALL</p>
             <ul className="mt-1 space-y-1">
@@ -174,7 +183,7 @@ export function AppLayout() {
                 </li>
               ))}
             </ul>
-            <p className="mt-1 text-red-100">
+            <p className="mt-1 opacity-90">
               Do not sell affected lots. Quarantined / recalled stock is blocked at POS.
             </p>
           </div>

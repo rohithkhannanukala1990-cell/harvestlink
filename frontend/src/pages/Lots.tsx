@@ -7,7 +7,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
 import type { Lot, LotStatus } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
-import { formatExpiry, lotRowClass, lotStatusBadge } from "../lib/lotDisplay";
+import { formatExpiry } from "../lib/lotDisplay";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  LotStatusBadge,
+  PageHeader,
+  SelectField,
+  isLotBlockedFromSale,
+  type DataTableColumn,
+} from "../components/ui";
 
 type TraceForward = {
   lotId: string;
@@ -83,37 +94,120 @@ export function LotsPage() {
   });
 
   if (!activeStoreId) {
-    return <p className="text-stone-600">Select a store to browse lots.</p>;
+    return <p className="text-ink-muted">Select a store to browse lots.</p>;
   }
+
+  const lots = lotsQuery.data?.lots ?? [];
+
+  const columns: DataTableColumn<Lot>[] = [
+    {
+      id: "lot",
+      header: "Lot #",
+      cell: (lot) => <span className="font-mono text-xs">{lot.lotNumber}</span>,
+    },
+    {
+      id: "product",
+      header: "Product",
+      cell: (lot) => (
+        <div>
+          <div>{lot.productName}</div>
+          <div className="font-mono text-xs text-ink-muted">{lot.sku}</div>
+        </div>
+      ),
+    },
+    {
+      id: "qty",
+      header: "Qty",
+      numeric: true,
+      cell: (lot) => <span className="tabular">{lot.quantityRemaining}</span>,
+    },
+    {
+      id: "expiry",
+      header: "Expiry",
+      cell: (lot) => formatExpiry(lot.expiryDate, lot.daysUntilExpiry),
+    },
+    {
+      id: "supplier",
+      header: "Supplier",
+      cell: (lot) => lot.supplier?.name ?? "—",
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (lot) => (
+        <LotStatusBadge
+          status={lot.status}
+          nearExpiry={
+            lot.status === "ACTIVE" &&
+            lot.daysUntilExpiry != null &&
+            lot.daysUntilExpiry <= 14
+          }
+        />
+      ),
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (lot) => {
+        const blocked = isLotBlockedFromSale(lot.status);
+        return (
+          <span className="inline-flex flex-wrap items-center gap-2 whitespace-nowrap">
+            <Button type="button" variant="quiet" onClick={() => setTraceLotId(lot.id)}>
+              Trace
+            </Button>
+            {canQuarantine && (
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={blocked || lot.status !== "ACTIVE" || quarantine.isPending}
+                title={
+                  blocked
+                    ? "Already quarantined or recalled — not for sale"
+                    : "Quarantine lot"
+                }
+                onClick={() => quarantine.mutate(lot)}
+              >
+                Quarantine
+              </Button>
+            )}
+            {isRole("COOP_ADMIN") && (
+              <Link
+                className="text-sm font-semibold text-brand-terracotta-ink underline"
+                to="/recalls"
+              >
+                Recall
+              </Link>
+            )}
+          </span>
+        );
+      },
+    },
+  ];
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Lots</h1>
-        <p className="mt-1 text-sm text-stone-600">
-          Search by lot number or product. Trace opens the forward recall list. Quarantine pulls
-          stock from sale immediately.
-        </p>
-      </div>
+      <PageHeader
+        title="Lots"
+        description="Search by lot number or product. Trace opens the forward recall list. Quarantine pulls stock from sale immediately."
+      />
 
       {message && (
-        <p className="rounded border border-stone-200 bg-white px-3 py-2 text-sm">{message}</p>
+        <p className="rounded-md border border-border-hairline bg-surface-raised px-3 py-2 text-sm text-ink">
+          {message}
+        </p>
       )}
 
-      <div className="flex flex-wrap gap-3 rounded-lg border border-stone-200 bg-white p-4">
-        <label className="text-sm">
-          Search
-          <input
-            className="mt-1 block min-w-[14rem] rounded border border-stone-300 px-3 py-2"
+      <Card>
+        <div className="flex flex-wrap gap-3">
+          <Field
+            label="Search"
+            className="min-w-[14rem]"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Lot #, SKU, name"
           />
-        </label>
-        <label className="text-sm">
-          Status
-          <select
-            className="mt-1 block rounded border border-stone-300 px-3 py-2"
+          <SelectField
+            label="Status"
             value={status}
             onChange={(e) => setStatus(e.target.value as LotStatus | "")}
           >
@@ -122,12 +216,9 @@ export function LotsPage() {
                 {s || "All"}
               </option>
             ))}
-          </select>
-        </label>
-        <label className="text-sm">
-          Expiry within
-          <select
-            className="mt-1 block rounded border border-stone-300 px-3 py-2"
+          </SelectField>
+          <SelectField
+            label="Expiry within"
             value={expiryWithinDays}
             onChange={(e) => setExpiryWithinDays(e.target.value)}
           >
@@ -136,113 +227,59 @@ export function LotsPage() {
             <option value="14">14 days</option>
             <option value="30">30 days</option>
             <option value="0">Overdue / today</option>
-          </select>
-        </label>
-      </div>
+          </SelectField>
+        </div>
+      </Card>
 
-      <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-        <table className="min-w-full text-left text-sm">
-          <thead className="border-b bg-stone-50 text-stone-600">
-            <tr>
-              <th className="px-3 py-2">Lot #</th>
-              <th className="px-3 py-2">Product</th>
-              <th className="px-3 py-2">Qty</th>
-              <th className="px-3 py-2">Expiry</th>
-              <th className="px-3 py-2">Supplier</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(lotsQuery.data?.lots ?? []).map((lot) => (
-              <tr key={lot.id} className={`border-b border-stone-100 ${lotRowClass(lot)}`}>
-                <td className="px-3 py-2 font-mono text-xs">{lot.lotNumber}</td>
-                <td className="px-3 py-2">
-                  <div>{lot.productName}</div>
-                  <div className="font-mono text-xs text-stone-500">{lot.sku}</div>
-                </td>
-                <td className="px-3 py-2">{lot.quantityRemaining}</td>
-                <td className="px-3 py-2">
-                  {formatExpiry(lot.expiryDate, lot.daysUntilExpiry)}
-                </td>
-                <td className="px-3 py-2">{lot.supplier?.name ?? "—"}</td>
-                <td className="px-3 py-2">
-                  <span className={lotStatusBadge(lot.status)}>{lot.status}</span>
-                </td>
-                <td className="space-x-2 px-3 py-2 whitespace-nowrap">
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => setTraceLotId(lot.id)}
-                  >
-                    Trace
-                  </button>
-                  {canQuarantine && lot.status === "ACTIVE" && (
-                    <button
-                      type="button"
-                      className="text-red-800 underline"
-                      onClick={() => quarantine.mutate(lot)}
-                    >
-                      Quarantine
-                    </button>
-                  )}
-                  {isRole("COOP_ADMIN") && (
-                    <Link className="underline" to="/recalls">
-                      Recall
-                    </Link>
-                  )}
-                </td>
-              </tr>
-            ))}
-            {!lotsQuery.isLoading && (lotsQuery.data?.lots ?? []).length === 0 && (
-              <tr>
-                <td colSpan={7} className="px-3 py-6 text-stone-500">
-                  No lots match.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        rows={lots}
+        rowKey={(lot) => lot.id}
+        emptyMessage={lotsQuery.isLoading ? "Loading…" : "No lots match."}
+      />
 
       {traceLotId && (
-        <section className="rounded-lg border border-stone-300 bg-white p-4">
-          <div className="flex items-center justify-between gap-3">
-            <h2 className="text-lg font-medium">Forward trace</h2>
-            <button
-              type="button"
-              className="text-sm underline"
-              onClick={() => setTraceLotId(null)}
-            >
+        <Card
+          title="Forward trace"
+          actions={
+            <Button type="button" variant="quiet" onClick={() => setTraceLotId(null)}>
               Close
-            </button>
-          </div>
-          {traceQuery.isLoading && <p className="mt-2 text-sm text-stone-500">Loading…</p>}
+            </Button>
+          }
+        >
+          {traceQuery.isLoading && <p className="text-sm text-ink-muted">Loading…</p>}
           {traceQuery.data && (
-            <div className="mt-3 space-y-3 text-sm">
+            <div className="space-y-3 text-sm text-ink">
               <p>
                 Lot <span className="font-mono">{traceQuery.data.lotNumber}</span> — sold{" "}
-                {traceQuery.data.quantitySold}, remaining {traceQuery.data.quantityRemaining}
+                <span className="tabular">{traceQuery.data.quantitySold}</span>, remaining{" "}
+                <span className="tabular">{traceQuery.data.quantityRemaining}</span>
               </p>
               <div>
-                <h3 className="font-medium">Affected members ({traceQuery.data.members.length})</h3>
+                <h3 className="font-semibold">
+                  Affected members (
+                  <span className="tabular">{traceQuery.data.members.length}</span>)
+                </h3>
                 <ul className="mt-1 list-inside list-disc">
                   {traceQuery.data.members.map((m) => (
                     <li key={m.memberId}>
-                      {m.name} · {m.email} · {m.quantityPurchased} unit(s)
+                      {m.name} · {m.email} ·{" "}
+                      <span className="tabular">{m.quantityPurchased}</span> unit(s)
                     </li>
                   ))}
                   {traceQuery.data.members.length === 0 && (
-                    <li className="list-none text-stone-500">No member purchases yet.</li>
+                    <li className="list-none text-ink-muted">No member purchases yet.</li>
                   )}
                 </ul>
               </div>
               <div>
-                <h3 className="font-medium">Sales ({traceQuery.data.sales.length})</h3>
+                <h3 className="font-semibold">
+                  Sales (<span className="tabular">{traceQuery.data.sales.length}</span>)
+                </h3>
                 <ul className="mt-1 list-inside list-disc font-mono text-xs">
                   {traceQuery.data.sales.map((s) => (
                     <li key={s.saleId}>
-                      {s.saleId} ×{s.quantityFromLot}
+                      {s.saleId} ×<span className="tabular">{s.quantityFromLot}</span>
                     </li>
                   ))}
                 </ul>
@@ -250,11 +287,11 @@ export function LotsPage() {
             </div>
           )}
           {traceQuery.isError && (
-            <p className="mt-2 text-sm text-red-700">
+            <p className="text-sm text-state-danger" role="alert">
               {(traceQuery.error as Error).message}
             </p>
           )}
-        </section>
+        </Card>
       )}
     </div>
   );

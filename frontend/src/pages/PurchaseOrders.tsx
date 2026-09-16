@@ -4,9 +4,19 @@
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { PurchaseOrder, PurchaseOrderStatus, ReorderSuggestion } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import {
+  Button,
+  Card,
+  DataTable,
+  Money,
+  PageHeader,
+  StatusBadge,
+  type DataTableColumn,
+  type StatusTone,
+} from "../components/ui";
 
 const STATUSES: Array<PurchaseOrderStatus | "ALL"> = [
   "ALL",
@@ -16,6 +26,18 @@ const STATUSES: Array<PurchaseOrderStatus | "ALL"> = [
   "RECEIVED",
   "CANCELLED",
 ];
+
+function poStatusBadge(status: PurchaseOrderStatus) {
+  const map: Record<PurchaseOrderStatus, { label: string; tone: StatusTone }> = {
+    DRAFT: { label: "Pending", tone: "warning" },
+    SUBMITTED: { label: "Confirmed", tone: "success" },
+    PARTIALLY_RECEIVED: { label: "Pending", tone: "warning" },
+    RECEIVED: { label: "Delivered", tone: "success" },
+    CANCELLED: { label: "Cancelled", tone: "neutral" },
+  };
+  const entry = map[status];
+  return <StatusBadge label={entry.label} tone={entry.tone} />;
+}
 
 export function PurchaseOrdersPage() {
   const { activeStoreId } = useAuth();
@@ -66,18 +88,68 @@ export function PurchaseOrdersPage() {
     onError: (err) => setMessage(err instanceof ApiError ? err.message : "Create failed"),
   });
 
+  const orders = listQuery.data?.purchaseOrders ?? [];
+
+  const columns: DataTableColumn<PurchaseOrder>[] = [
+    {
+      id: "po",
+      header: "PO #",
+      cell: (po) => <span className="font-mono text-xs">{po.poNumber}</span>,
+    },
+    {
+      id: "supplier",
+      header: "Supplier",
+      cell: (po) => po.supplier?.name ?? po.supplierId,
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (po) => poStatusBadge(po.status),
+    },
+    {
+      id: "total",
+      header: "Total",
+      numeric: true,
+      cell: (po) => <Money value={po.total} />,
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (po) => (
+        <span className="inline-flex flex-wrap gap-2">
+          <Link
+            className="inline-flex min-h-[44px] items-center rounded-md border border-border-strong bg-surface-raised px-3 text-sm font-semibold text-ink"
+            to={`/purchase-orders/${po.id}`}
+          >
+            Open
+          </Link>
+          {(po.status === "SUBMITTED" || po.status === "PARTIALLY_RECEIVED") && (
+            <Link
+              className="inline-flex min-h-[44px] items-center rounded-md bg-brand-green px-3 text-sm font-semibold text-ink-inverse"
+              to={`/purchase-orders/${po.id}/receive`}
+            >
+              Receive
+            </Link>
+          )}
+        </span>
+      ),
+    },
+  ];
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-2xl font-semibold tracking-tight">Purchase orders</h1>
-        <Link
-          to="/purchase-orders/new"
-          className="rounded bg-stone-900 px-4 py-2 text-sm text-white"
-        >
-          New PO
-        </Link>
-      </div>
-      {message && <p className="text-sm text-stone-600">{message}</p>}
+      <PageHeader
+        title="Purchase orders"
+        actions={
+          <Link
+            to="/purchase-orders/new"
+            className="inline-flex min-h-[44px] items-center rounded-md bg-brand-green px-4 text-sm font-semibold text-ink-inverse"
+          >
+            New PO
+          </Link>
+        }
+      />
+      {message && <p className="text-sm text-ink-muted">{message}</p>}
 
       <div className="flex flex-wrap gap-2">
         {STATUSES.map((s) => (
@@ -85,8 +157,10 @@ export function PurchaseOrdersPage() {
             key={s}
             type="button"
             onClick={() => setStatus(s)}
-            className={`rounded px-3 py-1 text-sm ${
-              status === s ? "bg-stone-900 text-white" : "bg-white border border-stone-300"
+            className={`min-h-[44px] rounded-md px-3 py-2 text-sm font-semibold ${
+              status === s
+                ? "bg-surface-canopy text-ink-inverse"
+                : "border border-border-strong bg-surface-raised text-ink"
             }`}
           >
             {s === "PARTIALLY_RECEIVED" ? "PARTIAL" : s}
@@ -94,74 +168,65 @@ export function PurchaseOrdersPage() {
         ))}
       </div>
 
-      <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-        <table className="min-w-full text-left text-sm">
-          <thead className="border-b bg-stone-50 text-stone-600">
-            <tr>
-              <th className="px-3 py-2">PO #</th>
-              <th className="px-3 py-2">Supplier</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Total</th>
-              <th className="px-3 py-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {(listQuery.data?.purchaseOrders ?? []).map((po) => (
-              <tr key={po.id}>
-                <td className="px-3 py-2 font-mono text-xs">{po.poNumber}</td>
-                <td className="px-3 py-2">{po.supplier?.name ?? po.supplierId}</td>
-                <td className="px-3 py-2">{po.status}</td>
-                <td className="px-3 py-2">{money(po.total)}</td>
-                <td className="px-3 py-2 space-x-2">
-                  <Link className="underline" to={`/purchase-orders/${po.id}`}>
-                    Open
-                  </Link>
-                  {(po.status === "SUBMITTED" || po.status === "PARTIALLY_RECEIVED") && (
-                    <Link className="font-medium text-emerald-800 underline" to={`/purchase-orders/${po.id}/receive`}>
-                      Receive
-                    </Link>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        rows={orders}
+        rowKey={(po) => po.id}
+        emptyMessage="No purchase orders"
+      />
 
       {activeStoreId && (
-        <section className="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
-          <h2 className="font-medium">Low-stock reorder suggestions</h2>
+        <Card
+          title={
+            <span className="inline-flex items-center gap-2">
+              Low-stock reorder suggestions
+              <StatusBadge label="Low stock" tone="warning" />
+            </span>
+          }
+        >
           {(suggestionsQuery.data?.suggestions ?? []).length === 0 ? (
-            <p className="text-sm text-stone-600">No products at/below reorder point with a preferred supplier.</p>
+            <p className="text-sm text-ink-muted">
+              No products at/below reorder point with a preferred supplier.
+            </p>
           ) : (
-            (suggestionsQuery.data?.suggestions ?? []).map((s) => (
-              <div key={s.supplierId} className="rounded border border-amber-200 bg-white p-3">
-                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <div className="font-medium">{s.supplierName}</div>
-                    <div className="text-sm text-stone-600">
-                      {s.lines.length} SKUs · {money(s.suggestedSubtotal)}
+            <div className="space-y-3">
+              {(suggestionsQuery.data?.suggestions ?? []).map((s) => (
+                <div
+                  key={s.supplierId}
+                  className="rounded-md border border-border-hairline bg-surface-sunken p-3"
+                >
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-semibold text-ink">{s.supplierName}</div>
+                      <div className="text-sm text-ink-muted">
+                        <span className="tabular">{s.lines.length}</span> SKUs ·{" "}
+                        <Money value={s.suggestedSubtotal} />
+                      </div>
                     </div>
+                    <Button
+                      type="button"
+                      loading={createFromSuggestion.isPending}
+                      onClick={() => createFromSuggestion.mutate(s)}
+                    >
+                      Create draft PO
+                    </Button>
                   </div>
-                  <button
-                    type="button"
-                    className="rounded bg-stone-900 px-3 py-2 text-sm text-white"
-                    onClick={() => createFromSuggestion.mutate(s)}
-                  >
-                    Create draft PO
-                  </button>
+                  <ul className="text-xs text-ink-muted">
+                    {s.lines.map((l) => (
+                      <li key={l.productId}>
+                        {l.sku} avail{" "}
+                        <span className="tabular">
+                          {l.available}/{l.reorderAt}
+                        </span>{" "}
+                        → order <span className="tabular">{l.suggestedQty}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
-                <ul className="text-xs text-stone-600">
-                  {s.lines.map((l) => (
-                    <li key={l.productId}>
-                      {l.sku} avail {l.available}/{l.reorderAt} → order {l.suggestedQty}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ))
+              ))}
+            </div>
           )}
-        </section>
+        </Card>
       )}
     </div>
   );

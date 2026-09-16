@@ -6,6 +6,17 @@ import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
+import { Button, Card, Field } from "../components/ui";
+
+/** Plain-type stand-in — replace with the real logo file when available; do not redraw the mark. */
+function Wordmark({ className = "" }: { className?: string }) {
+  return (
+    <p className={`text-2xl font-extrabold tracking-tight text-ink ${className}`.trim()}>
+      <span>Harvest</span>
+      <span className="text-brand-terracotta">Linx</span>
+    </p>
+  );
+}
 
 export function LoginPage() {
   const { login, changePassword, token, user, logout } = useAuth();
@@ -62,113 +73,95 @@ export function LoginPage() {
 
   if (needsPasswordChange) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-stone-100 px-4">
-        <form
-          onSubmit={onChangePassword}
-          className="w-full max-w-md space-y-4 rounded-lg border border-stone-200 bg-white p-8 shadow-sm"
-        >
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Change password</h1>
-            <p className="mt-1 text-sm text-stone-600">
-              Seeded accounts must set a new password before continuing.
-            </p>
-          </div>
-          <label className="block text-sm">
-            <span className="text-stone-600">Current password</span>
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-              type="password"
-              value={currentPassword}
-              onChange={(e) => setCurrentPassword(e.target.value)}
-              required
-              autoComplete="current-password"
-            />
-          </label>
-          <label className="block text-sm">
-            <span className="text-stone-600">New password (min 12 characters)</span>
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-              type="password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              required
-              minLength={12}
-              autoComplete="new-password"
-            />
-          </label>
-          <label className="block text-sm">
-            <span className="text-stone-600">Confirm new password</span>
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-              type="password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              required
-              minLength={12}
-              autoComplete="new-password"
-            />
-          </label>
-          {error && <p className="text-sm text-red-700">{error}</p>}
-          <button
-            type="submit"
-            disabled={pending}
-            className="w-full rounded bg-stone-900 px-4 py-2 text-white hover:bg-stone-800 disabled:opacity-60"
-          >
-            {pending ? "Saving…" : "Update password"}
-          </button>
-          <button
-            type="button"
-            className="w-full text-sm text-stone-600 underline"
-            onClick={() => logout()}
-          >
-            Sign out
-          </button>
-        </form>
+      <div className="flex min-h-screen items-center justify-center bg-surface-page px-4">
+        <div className="flex w-full max-w-md flex-col items-center gap-3">
+          <Wordmark />
+          <p className="font-accent text-[14px] text-ink-muted">
+            Member-Owned · Farmer-Connected · Middlemen-Free
+          </p>
+          <Card className="w-full" title="Change password">
+            <form onSubmit={onChangePassword} className="space-y-4">
+              <p className="text-sm text-ink-muted">
+                Seeded accounts must set a new password before continuing.
+              </p>
+              <Field
+                label="Current password"
+                type="password"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+              />
+              <Field
+                label="New password"
+                hint="Minimum 12 characters"
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+                minLength={12}
+                autoComplete="new-password"
+              />
+              <Field
+                label="Confirm new password"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+                minLength={12}
+                autoComplete="new-password"
+              />
+              {error && (
+                <p className="text-sm text-state-danger" role="alert">
+                  {error}
+                </p>
+              )}
+              <Button type="submit" className="w-full" loading={pending}>
+                Update password
+              </Button>
+              <Button type="button" variant="quiet" className="w-full" onClick={() => logout()}>
+                Sign out
+              </Button>
+            </form>
+          </Card>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-stone-100 px-4">
-      <form
-        onSubmit={onLogin}
-        className="w-full max-w-md space-y-4 rounded-lg border border-stone-200 bg-white p-8 shadow-sm"
-      >
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Harvestlink</h1>
-          <p className="mt-1 text-sm text-stone-600">Sign in to the co-op retail platform</p>
-        </div>
-        <label className="block text-sm">
-          <span className="text-stone-600">Email</span>
-          <input
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-            autoComplete="username"
-          />
-        </label>
-        <label className="block text-sm">
-          <span className="text-stone-600">Password</span>
-          <input
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-            autoComplete="current-password"
-          />
-        </label>
-        {error && <p className="text-sm text-red-700">{error}</p>}
-        <button
-          type="submit"
-          disabled={pending}
-          className="w-full rounded bg-stone-900 px-4 py-2 text-white hover:bg-stone-800 disabled:opacity-60"
-        >
-          {pending ? "Signing in…" : "Sign in"}
-        </button>
-      </form>
+    <div className="flex min-h-screen items-center justify-center bg-surface-page px-4">
+      <div className="flex w-full max-w-md flex-col items-center gap-3">
+        <Wordmark />
+        <p className="font-accent text-[14px] text-ink-muted">
+          Member-Owned · Farmer-Connected · Middlemen-Free
+        </p>
+        <Card className="w-full">
+          <form onSubmit={onLogin} className="space-y-4">
+            <p className="text-sm text-ink-muted">Sign in to the co-op retail platform</p>
+            <Field
+              label="Email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              autoComplete="username"
+            />
+            <Field
+              label="Password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+              autoComplete="current-password"
+              error={error ?? undefined}
+            />
+            <Button type="submit" className="w-full" loading={pending}>
+              Sign in
+            </Button>
+          </form>
+        </Card>
+      </div>
     </div>
   );
 }

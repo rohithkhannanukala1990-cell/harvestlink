@@ -10,9 +10,20 @@
  */
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { Payout, SettlementSummary } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  Money,
+  PageHeader,
+  StatCard,
+  formatMoney,
+  type DataTableColumn,
+} from "../components/ui";
 
 export function SettlementPage() {
   const { activeStoreId } = useAuth();
@@ -62,84 +73,96 @@ export function SettlementPage() {
   }
 
   if (!activeStoreId) {
-    return <p className="text-stone-600">Select a store to view settlement.</p>;
+    return <p className="text-ink-muted">Select a store to view settlement.</p>;
   }
 
   const summary = summaryQuery.data;
+  const payouts = payoutsQuery.data?.payouts ?? [];
+
+  const payoutColumns: DataTableColumn<Payout>[] = [
+    {
+      id: "when",
+      header: "When",
+      cell: (p) => (
+        <span>
+          {new Date(p.createdAt).toLocaleString()}
+          {p.note ? ` · ${p.note}` : ""}
+        </span>
+      ),
+    },
+    {
+      id: "amount",
+      header: "Amount",
+      numeric: true,
+      cell: (p) => <Money value={p.amount} />,
+    },
+  ];
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Settlement</h1>
-      <p className="text-sm text-stone-600">
-        Internal ledger of what the co-op owes the store operator (not a Stripe payout).
-      </p>
+      <PageHeader
+        title="Settlement"
+        description="Internal ledger of what the co-op owes the store operator (not a Stripe payout). Trading shares in ink; amounts owed in alert."
+      />
 
-      <div className="grid gap-4 sm:grid-cols-4">
-        {(
-          [
-            ["Gross sales", summary?.grossSales],
-            ["Operator accrued", summary?.operatorAccrued],
-            ["Paid out", summary?.totalPaidOut],
-            ["Currently owed", summary?.currentlyOwed],
-          ] as const
-        ).map(([label, value]) => (
-          <div key={label} className="rounded-lg border border-stone-200 bg-white p-4">
-            <p className="text-sm text-stone-500">{label}</p>
-            <p className="mt-2 text-xl font-semibold">{money(value ?? 0)}</p>
-          </div>
-        ))}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          label="Gross sales"
+          value={formatMoney(summary?.grossSales ?? 0)}
+        />
+        <StatCard
+          label="Operator share accrued"
+          value={formatMoney(summary?.operatorAccrued ?? 0)}
+        />
+        <StatCard
+          label="Paid out"
+          value={formatMoney(summary?.totalPaidOut ?? 0)}
+        />
+        <StatCard
+          label="Currently owed"
+          value={formatMoney(summary?.currentlyOwed ?? 0)}
+          tone="alert"
+        />
       </div>
 
-      <form
-        onSubmit={onSubmit}
-        className="grid max-w-xl gap-3 rounded-lg border border-stone-200 bg-white p-4 sm:grid-cols-2"
-      >
-        <h2 className="sm:col-span-2 font-medium">Record payout</h2>
-        <label className="text-sm">
-          Amount
-          <input
+      <Card title="Record payout">
+        <form onSubmit={onSubmit} className="grid max-w-xl gap-3 sm:grid-cols-2">
+          <Field
+            label="Amount"
             type="number"
             min="0.01"
             step="0.01"
-            className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
             value={amount}
             onChange={(e) => setAmount(e.target.value)}
             required
           />
-        </label>
-        <label className="text-sm">
-          Note
-          <input
-            className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
+          <Field
+            label="Note"
             value={note}
             onChange={(e) => setNote(e.target.value)}
             placeholder="Weekly transfer"
           />
-        </label>
-        <div className="sm:col-span-2">
-          <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
-            Save payout
-          </button>
-          {error && <p className="mt-2 text-sm text-red-700">{error}</p>}
-        </div>
-      </form>
+          <div className="sm:col-span-2">
+            <Button type="submit" loading={payoutMutation.isPending}>
+              Save payout
+            </Button>
+            {error && (
+              <p className="mt-2 text-sm text-state-danger" role="alert">
+                {error}
+              </p>
+            )}
+          </div>
+        </form>
+      </Card>
 
-      <section>
-        <h2 className="mb-2 font-medium">Payout history</h2>
-        <ul className="divide-y divide-stone-200 rounded-lg border border-stone-200 bg-white">
-          {(payoutsQuery.data?.payouts ?? []).map((p) => (
-            <li key={p.id} className="flex justify-between px-4 py-3 text-sm">
-              <span>
-                {new Date(p.createdAt).toLocaleString()}
-                {p.note ? ` · ${p.note}` : ""}
-              </span>
-              <span className="font-medium">{money(p.amount)}</span>
-            </li>
-          ))}
-          {payoutsQuery.data?.payouts.length === 0 && (
-            <li className="px-4 py-3 text-sm text-stone-500">No payouts yet.</li>
-          )}
-        </ul>
+      <section className="space-y-2">
+        <h2 className="font-semibold text-ink">Payout history</h2>
+        <DataTable
+          columns={payoutColumns}
+          rows={payouts}
+          rowKey={(p) => p.id}
+          emptyMessage="No payouts yet."
+        />
       </section>
     </div>
   );

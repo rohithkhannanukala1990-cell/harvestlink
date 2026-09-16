@@ -3,10 +3,11 @@
  */
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { CashDrawer } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import { Button, Card, Field, Money, PageHeader, formatMoney } from "../components/ui";
 
 export function DrawerPage() {
   const { activeStoreId, isRole } = useAuth();
@@ -49,7 +50,7 @@ export function DrawerPage() {
         },
       }),
     onSuccess: (data) => {
-      setMessage(`Drawer closed — variance ${money(data.drawer.variance ?? 0)}`);
+      setMessage(`Drawer closed — variance ${formatMoney(data.drawer.variance ?? 0)}`);
       setCounted("");
       void qc.invalidateQueries({ queryKey: ["drawer"] });
     },
@@ -57,77 +58,78 @@ export function DrawerPage() {
   });
 
   if (!activeStoreId) {
-    return <p className="text-stone-600">Select a store.</p>;
+    return <p className="text-ink-muted">Select a store.</p>;
   }
 
   const drawer = drawerQuery.data?.drawer;
 
   return (
     <div className="mx-auto max-w-lg space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Cash drawer</h1>
-      {message && <p className="text-sm text-stone-600">{message}</p>}
+      <PageHeader title="Cash drawer" />
+      {message && <p className="text-sm text-ink-muted">{message}</p>}
 
       {drawer ? (
-        <div className="space-y-3 rounded-lg border border-stone-200 bg-white p-4">
-          <p className="text-sm text-stone-600">Open since {new Date(drawer.openedAt).toLocaleString()}</p>
-          <p>
-            Opening float: <strong>{money(drawer.openingFloat)}</strong>
-          </p>
-          {isRole("STORE_ADMIN", "COOP_ADMIN") && (
-            <form
-              className="space-y-3 border-t pt-3"
-              onSubmit={(e: FormEvent) => {
-                e.preventDefault();
-                closeMutation.mutate();
-              }}
-            >
-              <label className="block text-sm">
-                Counted cash
-                <input
+        <Card title="Open drawer">
+          <div className="space-y-3">
+            <p className="text-sm text-ink-muted">
+              Open since {new Date(drawer.openedAt).toLocaleString()}
+            </p>
+            <p className="text-ink">
+              Opening float:{" "}
+              <strong>
+                <Money value={drawer.openingFloat} />
+              </strong>
+            </p>
+            {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+              <form
+                className="space-y-3 border-t border-border-hairline pt-3"
+                onSubmit={(e: FormEvent) => {
+                  e.preventDefault();
+                  closeMutation.mutate();
+                }}
+              >
+                <Field
+                  label="Counted cash"
                   type="number"
                   step="0.01"
                   min="0"
-                  className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
                   value={counted}
                   onChange={(e) => setCounted(e.target.value)}
                   required
                 />
-              </label>
-              <button
-                type="submit"
-                className="rounded bg-stone-900 px-4 py-2 text-white"
-                disabled={closeMutation.isPending}
-              >
-                Close drawer
-              </button>
-            </form>
-          )}
-        </div>
+                <Button type="submit" loading={closeMutation.isPending}>
+                  Close drawer
+                </Button>
+              </form>
+            )}
+          </div>
+        </Card>
       ) : (
-        <form
-          className="space-y-3 rounded-lg border border-stone-200 bg-white p-4"
-          onSubmit={(e: FormEvent) => {
-            e.preventDefault();
-            openMutation.mutate();
-          }}
-        >
-          <p className="text-sm text-stone-600">No drawer is open. Open one before taking cash.</p>
-          <label className="block text-sm">
-            Opening float
-            <input
+        <Card title="Open drawer">
+          <form
+            className="space-y-3"
+            onSubmit={(e: FormEvent) => {
+              e.preventDefault();
+              openMutation.mutate();
+            }}
+          >
+            <p className="text-sm text-ink-muted">
+              No drawer is open. Open one before taking cash.
+            </p>
+            <Field
+              label="Opening float"
               type="number"
               step="0.01"
               min="0"
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
               value={floatAmt}
               onChange={(e) => setFloatAmt(e.target.value)}
               required
             />
-          </label>
-          <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
-            Open drawer
-          </button>
-        </form>
+            <Button type="submit" loading={openMutation.isPending}>
+              Open drawer
+            </Button>
+          </form>
+        </Card>
       )}
     </div>
   );

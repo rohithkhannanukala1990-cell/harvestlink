@@ -81,6 +81,8 @@ export type Sale = {
   memberId: string | null;
   subtotal: string | number;
   discountAmount?: string | number;
+  /** Member benefit discount total (equity perk savings — not manual line discounts). */
+  memberDiscountAmount?: string | number;
   taxAmount?: string | number;
   total: string | number;
   operatorPercent: string | number;
@@ -171,6 +173,10 @@ export type Store = {
   operatorPercent: string | number;
   taxRate?: string | number;
   refundPolicy?: string;
+  /** Who funds member discounts at this store (from API — presentation only). */
+  memberDiscountBearer?: "COOP" | "OPERATOR" | "SHARED";
+  memberDiscountSharedPercent?: string | number;
+  honorsNetworkBenefits?: boolean;
   createdAt: string;
   isActive: boolean;
   todaysSales?: string;

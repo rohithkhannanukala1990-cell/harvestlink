@@ -1,8 +1,80 @@
-/**
- * Global stylesheet for the Harvestlink frontend.
- * Imports Tailwind and sets a simple full-viewport base layout.
- */
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:ital@1&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap");
 @import "tailwindcss";
+
+@theme {
+  --color-surface-page: #f4f1e6;
+  --color-surface-raised: #ffffff;
+  --color-surface-sunken: #eae6d8;
+  --color-surface-canopy: #17301c;
+  --color-border-hairline: #d8d3c2;
+  --color-border-strong: #8c8672;
+  --color-ink: #1b2b1f;
+  --color-ink-muted: #4e5c52;
+  --color-ink-inverse: #f7f5ec;
+  --color-brand-green: #1e4524;
+  --color-brand-sage: #5c7a33;
+  --color-brand-terracotta: #c2571e;
+  --color-brand-terracotta-ink: #94400f;
+  --color-brand-gold: #8a6b18;
+  --color-state-success: #2c6631;
+  --color-state-warning: #8a5f0b;
+  --color-state-danger: #9c2f25;
+  --color-focus-ring: #c2571e;
+
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-accent: Fraunces, Georgia, serif;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+
+  --shadow-card: 0 1px 2px rgba(27, 43, 31, 0.06);
+  --shadow-raised: 0 6px 20px rgba(27, 43, 31, 0.14);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-surface-page: #131e17;
+    --color-surface-raised: #1b291f;
+    --color-surface-sunken: #0e1712;
+    --color-surface-canopy: #0f2014;
+    --color-border-hairline: #2e4034;
+    --color-border-strong: #5a6e60;
+    --color-ink: #efebde;
+    --color-ink-muted: #a9b7ac;
+    --color-ink-inverse: #f1eee3;
+    --color-brand-green: #7db884;
+    --color-brand-sage: #9cc169;
+    --color-brand-terracotta: #e4854d;
+    --color-brand-terracotta-ink: #f0a277;
+    --color-brand-gold: #dcc073;
+    --color-state-success: #79bc7f;
+    --color-state-warning: #e0b44f;
+    --color-state-danger: #ec7f6e;
+    --color-focus-ring: #e4854d;
+  }
+}
+
+[data-theme="dark"] {
+  --color-surface-page: #131e17;
+  --color-surface-raised: #1b291f;
+  --color-surface-sunken: #0e1712;
+  --color-surface-canopy: #0f2014;
+  --color-border-hairline: #2e4034;
+  --color-border-strong: #5a6e60;
+  --color-ink: #efebde;
+  --color-ink-muted: #a9b7ac;
+  --color-ink-inverse: #f1eee3;
+  --color-brand-green: #7db884;
+  --color-brand-sage: #9cc169;
+  --color-brand-terracotta: #e4854d;
+  --color-brand-terracotta-ink: #f0a277;
+  --color-brand-gold: #dcc073;
+  --color-state-success: #79bc7f;
+  --color-state-warning: #e0b44f;
+  --color-state-danger: #ec7f6e;
+  --color-focus-ring: #e4854d;
+}
 
 html,
 body,
@@ -12,4 +84,23 @@ body,
 
 body {
   margin: 0;
+  font-family: var(--font-sans);
+  background-color: var(--color-surface-page);
+  color: var(--color-ink);
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
 }

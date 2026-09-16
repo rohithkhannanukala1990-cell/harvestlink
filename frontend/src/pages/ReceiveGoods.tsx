@@ -5,8 +5,17 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { PurchaseOrder, PurchaseOrderLine } from "../api/types";
+import {
+  Button,
+  Card,
+  Field,
+  Keypad,
+  Money,
+  PageHeader,
+  StatusBadge,
+} from "../components/ui";
 
 type LineDraft = {
   poLineId: string;
@@ -152,49 +161,56 @@ export function ReceiveGoodsPage() {
   });
 
   if (!po) {
-    return <p className="text-stone-600">Loading PO…</p>;
+    return <p className="text-ink-muted">Loading PO…</p>;
   }
 
   return (
     <div className="mx-auto max-w-lg space-y-4 pb-8">
-      <div className="flex items-center gap-3">
-        <Link to={`/purchase-orders/${id}`} className="text-sm underline">
-          ← {po.poNumber}
-        </Link>
-        <h1 className="text-2xl font-semibold tracking-tight">Receive</h1>
-      </div>
-      <p className="text-sm text-stone-600">
-        {po.supplier?.name} · {po.status}
-      </p>
+      <PageHeader
+        title="Receive"
+        description={
+          <>
+            <Link
+              to={`/purchase-orders/${id}`}
+              className="font-semibold text-brand-terracotta-ink underline"
+            >
+              ← {po.poNumber}
+            </Link>
+            <span className="text-ink-muted">
+              {" "}
+              · {po.supplier?.name} · {po.status}
+            </span>
+          </>
+        }
+      />
       {message && (
-        <p className="rounded bg-amber-100 px-3 py-2 text-sm text-amber-950">{message}</p>
+        <p className="rounded-lg bg-state-warning/15 px-3 py-2 text-sm text-state-warning">
+          {message}
+        </p>
       )}
 
-      <label className="block text-sm font-medium">
-        Scan or type SKU
-        <div className="mt-1 flex gap-2">
-          <input
-            autoFocus
-            className="min-h-14 flex-1 rounded-xl border-2 border-stone-400 px-4 text-xl"
-            value={skuInput}
-            onChange={(e) => setSkuInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                findBySku();
-              }
-            }}
-            placeholder="SKU"
-          />
-          <button
-            type="button"
-            className="min-h-14 rounded-xl bg-stone-900 px-5 text-lg text-white"
-            onClick={findBySku}
-          >
+      <div className="flex gap-2">
+        <Field
+          label="Scan or type SKU"
+          className="flex-1"
+          size="lg"
+          autoFocus
+          value={skuInput}
+          onChange={(e) => setSkuInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              findBySku();
+            }
+          }}
+          placeholder="SKU"
+        />
+        <div className="flex items-end">
+          <Button type="button" size="lg" onClick={findBySku}>
             Find
-          </button>
+          </Button>
         </div>
-      </label>
+      </div>
 
       <div className="space-y-2">
         {openLines.map((line) => {
@@ -205,20 +221,26 @@ export function ReceiveGoodsPage() {
               key={line.id}
               type="button"
               onClick={() => setActiveLineId(line.id)}
-              className={`w-full rounded-xl border-2 p-4 text-left ${
-                selected ? "border-stone-900 bg-stone-100" : "border-stone-200 bg-white"
+              className={`w-full rounded-lg border-2 p-4 text-left ${
+                selected
+                  ? "border-brand-green bg-surface-sunken"
+                  : "border-border-hairline bg-surface-raised"
               }`}
             >
-              <div className="text-lg font-semibold">{line.product?.name ?? line.productId}</div>
-              <div className="text-sm text-stone-600">
-                {line.product?.sku} · need {remaining(line)} of {line.orderedQty} · PO{" "}
-                {money(line.unitCost)}
+              <div className="text-lg font-semibold text-ink">
+                {line.product?.name ?? line.productId}
+              </div>
+              <div className="text-sm text-ink-muted">
+                {line.product?.sku} · need{" "}
+                <span className="tabular">{remaining(line)}</span> of{" "}
+                <span className="tabular">{line.orderedQty}</span> · PO{" "}
+                <Money value={line.unitCost} />
               </div>
               {draft?.quantityReceived && (
-                <div className="mt-1 text-base font-medium">
-                  Receiving {draft.quantityReceived}
+                <div className="mt-1 text-base font-medium text-ink">
+                  Receiving <span className="tabular">{draft.quantityReceived}</span>
                   {draft.lotNumber ? (
-                    <span className="ml-2 font-mono text-sm text-stone-600">
+                    <span className="ml-2 font-mono text-sm text-ink-muted">
                       lot {draft.lotNumber}
                     </span>
                   ) : null}
@@ -228,41 +250,30 @@ export function ReceiveGoodsPage() {
           );
         })}
         {!openLines.length && (
-          <p className="text-sm text-stone-600">Nothing left to receive on this PO.</p>
+          <p className="text-sm text-ink-muted">Nothing left to receive on this PO.</p>
         )}
       </div>
 
       {activeLine && activeDraft && (
-        <section className="space-y-3 rounded-xl border-2 border-stone-300 bg-white p-4">
-          <div className="text-center">
-            <div className="text-sm text-stone-500">Quantity accepted</div>
-            <div className="font-mono text-5xl font-semibold tracking-tight">
-              {activeDraft.quantityReceived || "0"}
+        <Card title="Quantity accepted">
+          <div className="space-y-3">
+            <div className="text-center">
+              <div className="tabular text-5xl font-bold tracking-tight text-ink">
+                {activeDraft.quantityReceived || "0"}
+              </div>
+              <div className="text-sm text-ink-muted">
+                Outstanding on PO:{" "}
+                <span className="tabular">{remaining(activeLine)}</span>
+              </div>
             </div>
-            <div className="text-sm text-stone-500">
-              Outstanding on PO: {remaining(activeLine)}
-            </div>
-          </div>
 
-          <div className="grid grid-cols-3 gap-2">
-            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "C", "0", "⌫"].map((key) => (
-              <button
-                key={key}
-                type="button"
-                className="min-h-16 rounded-xl bg-stone-800 text-2xl font-medium text-white active:bg-stone-600"
-                onClick={() => keypad(key)}
-              >
-                {key}
-              </button>
-            ))}
-          </div>
+            <Keypad onKey={keypad} />
 
-          <div className="space-y-3 border-t border-stone-200 pt-3">
-            <p className="text-sm font-medium text-stone-700">Lot on the box</p>
-            <label className="block text-sm">
-              Lot / batch number
-              <input
-                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl font-mono"
+            <div className="space-y-3 border-t border-border-hairline pt-3">
+              <p className="text-sm font-semibold text-ink">Lot on the box</p>
+              <Field
+                label="Lot / batch number"
+                size="lg"
                 value={activeDraft.lotNumber}
                 onChange={(e) =>
                   setDrafts((prev) => ({
@@ -275,13 +286,12 @@ export function ReceiveGoodsPage() {
                 }
                 placeholder="Scan or type lot #"
                 autoComplete="off"
+                className="font-mono"
               />
-            </label>
-            <label className="block text-sm">
-              Expiry / use-by date
-              <input
+              <Field
+                label="Expiry / use-by date"
                 type="date"
-                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl"
+                size="lg"
                 value={activeDraft.expiryDate}
                 onChange={(e) =>
                   setDrafts((prev) => ({
@@ -293,11 +303,9 @@ export function ReceiveGoodsPage() {
                   }))
                 }
               />
-            </label>
-            <label className="block text-sm">
-              Country of origin
-              <input
-                className="mt-1 min-h-14 w-full rounded-xl border-2 border-stone-400 px-4 text-xl uppercase"
+              <Field
+                label="Country of origin"
+                size="lg"
                 value={activeDraft.countryOfOrigin}
                 onChange={(e) =>
                   setDrafts((prev) => ({
@@ -311,13 +319,11 @@ export function ReceiveGoodsPage() {
                 placeholder="e.g. US"
                 maxLength={3}
               />
-            </label>
-          </div>
+            </div>
 
-          <label className="block text-sm">
-            Actual unit cost (invoice)
-            <input
-              className="mt-1 min-h-12 w-full rounded-xl border border-stone-300 px-3 text-lg"
+            <Field
+              label="Actual unit cost (invoice)"
+              size="lg"
               value={activeDraft.unitCostActual}
               onChange={(e) =>
                 setDrafts((prev) => ({
@@ -329,12 +335,10 @@ export function ReceiveGoodsPage() {
                 }))
               }
             />
-          </label>
 
-          <label className="block text-sm">
-            Rejected qty
-            <input
-              className="mt-1 min-h-12 w-full rounded-xl border border-stone-300 px-3 text-lg"
+            <Field
+              label="Rejected qty"
+              size="lg"
               value={activeDraft.quantityRejected}
               onChange={(e) =>
                 setDrafts((prev) => ({
@@ -346,114 +350,118 @@ export function ReceiveGoodsPage() {
                 }))
               }
             />
-          </label>
-          {Number(activeDraft.quantityRejected) > 0 && (
-            <input
-              className="min-h-12 w-full rounded-xl border border-stone-300 px-3"
-              placeholder="Rejection reason (required)"
-              value={activeDraft.rejectionReason}
-              onChange={(e) =>
-                setDrafts((prev) => ({
-                  ...prev,
-                  [activeLine.id]: {
-                    ...prev[activeLine.id]!,
-                    rejectionReason: e.target.value,
-                  },
-                }))
-              }
-            />
-          )}
-
-          {Number(activeDraft.quantityReceived) > remaining(activeLine) && (
-            <label className="flex items-start gap-3 rounded-xl bg-amber-100 p-3 text-sm">
-              <input
-                type="checkbox"
-                className="mt-1 h-5 w-5"
-                checked={activeDraft.acknowledgeOverReceipt}
+            {Number(activeDraft.quantityRejected) > 0 && (
+              <Field
+                label="Rejection reason"
+                size="lg"
+                value={activeDraft.rejectionReason}
                 onChange={(e) =>
                   setDrafts((prev) => ({
                     ...prev,
                     [activeLine.id]: {
                       ...prev[activeLine.id]!,
-                      acknowledgeOverReceipt: e.target.checked,
+                      rejectionReason: e.target.value,
                     },
                   }))
                 }
+                placeholder="Required when rejecting"
               />
-              <span>
-                Over-receipt: accepting more than ordered. I acknowledge this mismatch.
-              </span>
-            </label>
-          )}
+            )}
 
-          <label className="flex items-start gap-3 rounded-xl border border-stone-200 p-3 text-sm">
-            <input
-              type="checkbox"
-              className="mt-1 h-5 w-5"
-              checked={activeDraft.closeShort}
-              onChange={(e) =>
-                setDrafts((prev) => ({
-                  ...prev,
-                  [activeLine.id]: {
-                    ...prev[activeLine.id]!,
-                    closeShort: e.target.checked,
-                    acknowledgeShortReceipt: e.target.checked
-                      ? prev[activeLine.id]!.acknowledgeShortReceipt
-                      : false,
-                  },
-                }))
-              }
-            />
-            <span>Close this line short (supplier will not ship the rest)</span>
-          </label>
-          {activeDraft.closeShort && (
-            <label className="flex items-start gap-3 rounded-xl bg-amber-100 p-3 text-sm">
+            {Number(activeDraft.quantityReceived) > remaining(activeLine) && (
+              <label className="flex items-start gap-3 rounded-lg bg-state-warning/15 p-3 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-5 w-5"
+                  checked={activeDraft.acknowledgeOverReceipt}
+                  onChange={(e) =>
+                    setDrafts((prev) => ({
+                      ...prev,
+                      [activeLine.id]: {
+                        ...prev[activeLine.id]!,
+                        acknowledgeOverReceipt: e.target.checked,
+                      },
+                    }))
+                  }
+                />
+                <span>
+                  Over-receipt: accepting more than ordered. I acknowledge this mismatch.
+                </span>
+              </label>
+            )}
+
+            <label className="flex items-start gap-3 rounded-lg border border-border-hairline p-3 text-sm text-ink">
               <input
                 type="checkbox"
                 className="mt-1 h-5 w-5"
-                checked={activeDraft.acknowledgeShortReceipt}
+                checked={activeDraft.closeShort}
                 onChange={(e) =>
                   setDrafts((prev) => ({
                     ...prev,
                     [activeLine.id]: {
                       ...prev[activeLine.id]!,
-                      acknowledgeShortReceipt: e.target.checked,
+                      closeShort: e.target.checked,
+                      acknowledgeShortReceipt: e.target.checked
+                        ? prev[activeLine.id]!.acknowledgeShortReceipt
+                        : false,
                     },
                   }))
                 }
               />
-              <span>Short-receipt acknowledged — line will not stay open for more units.</span>
+              <span>Close this line short (supplier will not ship the rest)</span>
             </label>
-          )}
-        </section>
+            {activeDraft.closeShort && (
+              <label className="flex items-start gap-3 rounded-lg bg-state-warning/15 p-3 text-sm text-ink">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-5 w-5"
+                  checked={activeDraft.acknowledgeShortReceipt}
+                  onChange={(e) =>
+                    setDrafts((prev) => ({
+                      ...prev,
+                      [activeLine.id]: {
+                        ...prev[activeLine.id]!,
+                        acknowledgeShortReceipt: e.target.checked,
+                      },
+                    }))
+                  }
+                />
+                <span>
+                  Short-receipt acknowledged — line will not stay open for more units.
+                </span>
+              </label>
+            )}
+          </div>
+        </Card>
       )}
 
-      <label className="block text-sm">
-        Invoice #
-        <input
-          className="mt-1 min-h-12 w-full rounded-xl border border-stone-300 px-3 text-lg"
-          value={invoiceNumber}
-          onChange={(e) => setInvoiceNumber(e.target.value)}
-        />
-      </label>
-      <label className="block text-sm">
-        Notes
+      <Field
+        label="Invoice #"
+        size="lg"
+        value={invoiceNumber}
+        onChange={(e) => setInvoiceNumber(e.target.value)}
+      />
+      <label className="flex flex-col gap-1.5">
+        <span className="text-sm font-semibold text-ink">Notes</span>
         <textarea
-          className="mt-1 w-full rounded-xl border border-stone-300 px-3 py-2"
+          className="w-full rounded-lg border-2 border-border-strong bg-surface-raised px-4 py-3 text-lg text-ink"
           rows={2}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
       </label>
 
-      <button
+      <Button
         type="button"
-        disabled={receiveMutation.isPending || !openLines.length}
+        size="lg"
+        className="w-full"
+        disabled={!openLines.length}
+        loading={receiveMutation.isPending}
         onClick={() => receiveMutation.mutate()}
-        className="min-h-16 w-full rounded-xl bg-emerald-800 text-xl font-semibold text-white disabled:opacity-40"
       >
-        {receiveMutation.isPending ? "Saving…" : "Confirm receipt"}
-      </button>
+        Confirm receipt
+      </Button>
+      {!openLines.length && <StatusBadge label="Closed" tone="neutral" />}
     </div>
   );
 }

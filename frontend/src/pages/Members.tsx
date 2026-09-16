@@ -5,9 +5,23 @@
  */
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, apiRequest, money } from "../api/client";
+import { ApiError, apiRequest } from "../api/client";
 import type { Member, Sale } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  MemberVotingBadge,
+  Money,
+  PageHeader,
+  StatCard,
+  formatMoney,
+  type DataTableColumn,
+} from "../components/ui";
+
+type HistorySale = Sale & { store: { id: string; name: string } };
 
 export function MembersPage() {
   const { isRole } = useAuth();
@@ -40,7 +54,7 @@ export function MembersPage() {
     queryFn: () =>
       apiRequest<{
         member: Member;
-        sales: Array<Sale & { store: { id: string; name: string } }>;
+        sales: HistorySale[];
         total: number;
       }>(`/members/${selectedId}/purchase-history?page=1&pageSize=20`),
   });
@@ -83,152 +97,212 @@ export function MembersPage() {
     onError: (err) => setError(err instanceof ApiError ? err.message : "Investment failed"),
   });
 
+  const members = membersQuery.data?.members ?? [];
+  const detail = historyQuery.data?.member;
+
+  const saleColumns: DataTableColumn<HistorySale>[] = [
+    {
+      id: "when",
+      header: "Purchase",
+      cell: (s) => (
+        <span>
+          {s.store.name} · {new Date(s.createdAt).toLocaleString()} · {s.paymentStatus}
+        </span>
+      ),
+    },
+    {
+      id: "total",
+      header: "Sale total",
+      numeric: true,
+      cell: (s) => <Money value={s.total} />,
+    },
+  ];
+
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Members (owners)</h1>
-      <p className="text-sm text-stone-600">
-        Lifetime capital investment — memberships never expire. Capital is equity, not sales
-        revenue. A $100 joining fee confers membership but no votes; $1,000+ invested confers
-        voting rights (one member, one vote).
-      </p>
+      <PageHeader
+        title="Members (owners)"
+        description="Lifetime capital investment — memberships never expire. Capital is equity, not sales revenue. A joining fee confers membership but no votes; capital at the voting threshold confers one vote — investing more never buys more votes."
+      />
       {(message || error) && (
-        <p className={`text-sm ${error ? "text-red-700" : "text-stone-600"}`}>
+        <p
+          className={`text-sm ${error ? "text-state-danger" : "text-ink-muted"}`}
+          role={error ? "alert" : undefined}
+        >
           {error ?? message}
         </p>
       )}
 
-      <div className="flex gap-2">
-        <input
-          className="w-full max-w-md rounded border border-stone-300 px-3 py-2"
-          placeholder="Search name or member number"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
-      </div>
+      <Field
+        label="Search"
+        className="max-w-md"
+        placeholder="Search name or member number"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+      />
 
       {canManage && (
-        <form
-          onSubmit={(e: FormEvent) => {
-            e.preventDefault();
-            createMutation.mutate();
-          }}
-          className="grid gap-3 rounded-lg border border-stone-200 bg-white p-4 sm:grid-cols-4"
-        >
-          <h2 className="sm:col-span-4 font-medium">Add member</h2>
-          <label className="text-sm">
-            Name
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
+        <Card title="Add member">
+          <form
+            onSubmit={(e: FormEvent) => {
+              e.preventDefault();
+              createMutation.mutate();
+            }}
+            className="grid gap-3 sm:grid-cols-4"
+          >
+            <Field
+              label="Name"
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
               required
             />
-          </label>
-          <label className="text-sm">
-            Email
-            <input
+            <Field
+              label="Email"
               type="email"
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
               value={form.email}
               onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
               required
             />
-          </label>
-          <label className="text-sm">
-            Phone
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1"
+            <Field
+              label="Phone"
               value={form.phone}
               onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
             />
-          </label>
-          <div className="flex items-end">
-            <button type="submit" className="rounded bg-stone-900 px-4 py-2 text-white">
-              Create
-            </button>
-          </div>
-        </form>
+            <div className="flex items-end">
+              <Button type="submit" loading={createMutation.isPending}>
+                Create
+              </Button>
+            </div>
+          </form>
+        </Card>
       )}
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <ul className="divide-y divide-stone-200 rounded-lg border border-stone-200 bg-white">
-          {(membersQuery.data?.members ?? []).map((m) => (
-            <li key={m.id}>
-              <button
-                type="button"
-                className="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-stone-50"
-                onClick={() => setSelectedId(m.id)}
-              >
-                <span>
-                  <span className="font-medium">{m.name}</span>
-                  <span className="ml-2 font-mono text-xs text-stone-500">{m.memberNumber}</span>
-                </span>
-                <span className="text-right text-sm text-stone-500">
-                  <span className="block">{m.status}</span>
-                  <span className="block text-xs">
-                    {m.hasVotingRights ? "Voting" : "No vote"}
-                    {" · "}
-                    {money(m.totalInvested ?? 0)} invested
+        <Card title="Owners">
+          <ul className="divide-y divide-border-hairline">
+            {members.map((m) => (
+              <li key={m.id}>
+                <button
+                  type="button"
+                  className={`flex w-full items-center justify-between gap-3 px-1 py-3 text-left hover:bg-surface-sunken ${
+                    selectedId === m.id ? "bg-surface-sunken" : ""
+                  }`}
+                  onClick={() => setSelectedId(m.id)}
+                >
+                  <span>
+                    <span className="font-semibold text-ink">{m.name}</span>
+                    <span className="ml-2 font-mono text-xs text-ink-muted">
+                      {m.memberNumber}
+                    </span>
+                    <span className="mt-1 flex flex-wrap items-center gap-2">
+                      <MemberVotingBadge hasVotingRights={m.hasVotingRights} />
+                      <span className="text-xs text-ink-muted">{m.status}</span>
+                    </span>
                   </span>
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
+                  <span className="text-right text-sm">
+                    <span className="block text-xs font-semibold uppercase tracking-wide text-brand-gold">
+                      Capital invested
+                    </span>
+                    <Money value={m.totalInvested ?? 0} tone="capital" />
+                  </span>
+                </button>
+              </li>
+            ))}
+            {members.length === 0 && (
+              <li className="py-3 text-sm text-ink-muted">No members match.</li>
+            )}
+          </ul>
+        </Card>
 
         {canManage && (
-          <section className="space-y-4 rounded-lg border border-stone-200 bg-white p-4">
-            <h2 className="font-medium">Detail</h2>
-            {!selectedId && (
-              <p className="text-sm text-stone-500">Select a member.</p>
-            )}
-            {historyQuery.data && (
-              <>
-                <p className="text-sm">
-                  Status: {historyQuery.data.member.status}
-                  {" · "}
-                  Invested: {money(historyQuery.data.member.totalInvested ?? 0)}
-                  {" · "}
-                  Voting rights: {historyQuery.data.member.hasVotingRights ? "yes" : "no"}
-                  {" · "}
-                  Soft vote eligible:{" "}
-                  {historyQuery.data.member.isEligibleToVote ? "yes" : "no"}
-                </p>
-                {isCoop && (
-                  <div className="flex gap-2">
-                    <input
-                      className="rounded border border-stone-300 px-2 py-1"
-                      placeholder="Capital $"
-                      value={contribAmount}
-                      onChange={(e) => setContribAmount(e.target.value)}
+          <Card title="Detail">
+            {!selectedId && <p className="text-sm text-ink-muted">Select a member.</p>}
+            {detail && (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <MemberVotingBadge hasVotingRights={detail.hasVotingRights} />
+                  <span className="text-sm text-ink-muted">
+                    {detail.status}
+                    {detail.isEligibleToVote === false ? " · soft vote ineligible" : ""}
+                  </span>
+                </div>
+
+                {/* Capital is gold and labelled as investment — never as a sale or payment. */}
+                <StatCard
+                  label="Capital invested (equity)"
+                  value={formatMoney(detail.totalInvested ?? 0)}
+                  tone="capital"
+                  subLine="Not store revenue — one member, one vote above threshold"
+                />
+
+                {detail.equityAccount && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <StatCard
+                      label="Equity contributions"
+                      value={formatMoney(detail.equityAccount.totalContributed)}
+                      tone="capital"
                     />
-                    <button
-                      type="button"
-                      className="rounded bg-emerald-800 px-3 py-1 text-sm text-white"
-                      onClick={() => contributeMutation.mutate()}
-                    >
-                      Record capital (equity)
-                    </button>
+                    <StatCard
+                      label="Equity balance"
+                      value={formatMoney(detail.equityAccount.currentBalance)}
+                      tone="capital"
+                      subLine={
+                        <>
+                          Distributed{" "}
+                          <Money
+                            value={detail.equityAccount.distributedToDate}
+                            tone="capital"
+                          />
+                        </>
+                      }
+                    />
                   </div>
                 )}
-                <h3 className="text-sm font-medium">Purchase history (all stores)</h3>
-                <ul className="space-y-2 text-sm">
-                  {historyQuery.data.sales.length === 0 && (
-                    <li className="text-stone-500">No purchases yet.</li>
-                  )}
-                  {historyQuery.data.sales.map((s) => (
-                    <li key={s.id} className="flex justify-between border-b border-stone-100 py-2">
-                      <span>
-                        {s.store.name} · {new Date(s.createdAt).toLocaleString()} ·{" "}
-                        {s.paymentStatus}
-                      </span>
-                      <span>{money(s.total)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </>
+
+                {isCoop && (
+                  <div className="space-y-2 rounded-md border border-brand-gold/30 bg-brand-gold/10 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-brand-gold">
+                      Record capital investment — equity, not a sale
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Field
+                        label="Investment amount"
+                        className="min-w-[8rem] flex-1"
+                        value={contribAmount}
+                        onChange={(e) => setContribAmount(e.target.value)}
+                        placeholder="Capital $"
+                      />
+                      <div className="flex items-end">
+                        <Button
+                          type="button"
+                          variant="quiet"
+                          loading={contributeMutation.isPending}
+                          onClick={() => contributeMutation.mutate()}
+                        >
+                          Record investment
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <h3 className="mb-2 text-sm font-semibold text-ink">
+                    Purchase history (all stores)
+                  </h3>
+                  <p className="mb-2 text-xs text-ink-muted">
+                    Store sales only — capital investments never appear here.
+                  </p>
+                  <DataTable
+                    columns={saleColumns}
+                    rows={historyQuery.data?.sales ?? []}
+                    rowKey={(s) => s.id}
+                    emptyMessage="No purchases yet."
+                  />
+                </div>
+              </div>
             )}
-          </section>
+          </Card>
         )}
       </div>
     </div>

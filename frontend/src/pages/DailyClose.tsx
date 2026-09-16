@@ -3,13 +3,24 @@
  */
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { apiRequest, money } from "../api/client";
+import { apiRequest } from "../api/client";
 import type { DailyCloseReport } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import {
+  DataTable,
+  Field,
+  Money,
+  PageHeader,
+  StatCard,
+  formatMoney,
+  type DataTableColumn,
+} from "../components/ui";
 
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10);
 }
+
+type CashierRow = DailyCloseReport["cashierBreakdown"][number];
 
 export function DailyClosePage() {
   const { activeStoreId } = useAuth();
@@ -28,81 +39,80 @@ export function DailyClosePage() {
   });
 
   if (!activeStoreId) {
-    return <p className="text-stone-600">Select a store.</p>;
+    return <p className="text-ink-muted">Select a store.</p>;
   }
 
   const report = reportQuery.data;
 
+  const cashierColumns: DataTableColumn<CashierRow>[] = [
+    { id: "email", header: "Cashier", cell: (row) => row.email },
+    {
+      id: "sales",
+      header: "Sales",
+      numeric: true,
+      cell: (row) => <span className="tabular">{row.saleCount}</span>,
+    },
+    {
+      id: "gross",
+      header: "Gross",
+      numeric: true,
+      cell: (row) => <Money value={row.grossSales} />,
+    },
+    {
+      id: "share",
+      header: "Operator share",
+      numeric: true,
+      cell: (row) => <Money value={row.operatorShare} />,
+    },
+  ];
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Daily close</h1>
-          <p className="text-sm text-stone-600">Z-report for operator night sign-off</p>
-        </div>
-        <label className="text-sm">
-          Date (UTC)
-          <input
+      <PageHeader
+        title="Daily close"
+        description="Z-report for operator night sign-off"
+        actions={
+          <Field
+            label="Date (UTC)"
             type="date"
-            className="ml-2 rounded border border-stone-300 px-2 py-1"
             value={date}
             onChange={(e) => setDate(e.target.value)}
           />
-        </label>
-      </div>
+        }
+      />
 
-      {reportQuery.isLoading && <p>Loading…</p>}
+      {reportQuery.isLoading && <p className="text-ink-muted">Loading…</p>}
       {report && (
         <div className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {Object.entries(report.salesByPaymentMethod).map(([method, amt]) => (
-              <div key={method} className="rounded-lg border border-stone-200 bg-white p-4">
-                <p className="text-sm text-stone-500">{method}</p>
-                <p className="mt-1 text-xl font-semibold">{money(amt)}</p>
-              </div>
+              <StatCard key={method} label={method} value={formatMoney(amt)} />
             ))}
-            <div className="rounded-lg border border-stone-200 bg-white p-4">
-              <p className="text-sm text-stone-500">Tax collected</p>
-              <p className="mt-1 text-xl font-semibold">{money(report.taxCollected)}</p>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-white p-4">
-              <p className="text-sm text-stone-500">Refunds</p>
-              <p className="mt-1 text-xl font-semibold">{money(report.refundsTotal)}</p>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-white p-4">
-              <p className="text-sm text-stone-500">Operator share accrued</p>
-              <p className="mt-1 text-xl font-semibold">{money(report.operatorShareAccrued)}</p>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-white p-4">
-              <p className="text-sm text-stone-500">Cash variance</p>
-              <p className="mt-1 text-xl font-semibold">
-                {report.cashVariance == null ? "—" : money(report.cashVariance)}
-              </p>
-            </div>
+            <StatCard label="Tax collected" value={formatMoney(report.taxCollected)} />
+            <StatCard label="Refunds" value={formatMoney(report.refundsTotal)} />
+            <StatCard
+              label="Operator share accrued"
+              value={formatMoney(report.operatorShareAccrued)}
+            />
+            <StatCard
+              label="Cash variance"
+              value={
+                report.cashVariance == null ? "—" : formatMoney(report.cashVariance)
+              }
+              tone={
+                report.cashVariance != null && Number(report.cashVariance) !== 0
+                  ? "alert"
+                  : "default"
+              }
+            />
           </div>
 
-          <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-            <table className="min-w-full text-left text-sm">
-              <thead className="border-b bg-stone-50 text-stone-600">
-                <tr>
-                  <th className="px-3 py-2">Cashier</th>
-                  <th className="px-3 py-2">Sales</th>
-                  <th className="px-3 py-2">Gross</th>
-                  <th className="px-3 py-2">Operator share</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {report.cashierBreakdown.map((row) => (
-                  <tr key={row.cashierId}>
-                    <td className="px-3 py-2">{row.email}</td>
-                    <td className="px-3 py-2">{row.saleCount}</td>
-                    <td className="px-3 py-2">{money(row.grossSales)}</td>
-                    <td className="px-3 py-2">{money(row.operatorShare)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <DataTable
+            columns={cashierColumns}
+            rows={report.cashierBreakdown}
+            rowKey={(row) => row.cashierId}
+            emptyMessage="No cashier activity"
+          />
         </div>
       )}
     </div>

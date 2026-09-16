@@ -64,15 +64,23 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   const { body, auth = true, headers, ...rest } = options;
   const token = getToken();
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...rest,
-    headers: {
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-      ...(auth && token ? { Authorization: `Bearer ${token}` } : {}),
-      ...headers,
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...rest,
+      headers: {
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(auth && token ? { Authorization: `Bearer ${token}` } : {}),
+        ...headers,
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new ApiError(
+      0,
+      `Cannot reach the API at ${API_BASE}. Is the backend running, and is this page’s origin allowed by CORS?`,
+    );
+  }
 
   if (res.status === 401) {
     clearSession();

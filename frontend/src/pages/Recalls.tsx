@@ -4,6 +4,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { apiRequest } from "../api/client.ts";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  Money,
+  PageHeader,
+  SelectField,
+  StatusBadge,
+  type DataTableColumn,
+  type StatusTone,
+} from "../components/ui";
 
 type RecallRow = {
   id: string;
@@ -17,12 +29,37 @@ type RecallRow = {
 };
 
 type Impact = {
-  affectedMembers: Array<{ memberId: string; name: string; email: string; quantityPurchased: number }>;
+  affectedMembers: Array<{
+    memberId: string;
+    name: string;
+    email: string;
+    quantityPurchased: number;
+  }>;
   unitsSold: number;
   unitsOnShelves: number;
   storesInvolved: Array<{ storeName: string }>;
   estimatedFinancialExposure: string;
 };
+
+function recallStatusBadge(status: string) {
+  const tone: StatusTone =
+    status === "ACTIVE"
+      ? "danger"
+      : status === "DRAFT"
+        ? "warning"
+        : status === "CLOSED"
+          ? "neutral"
+          : "neutral";
+  const label =
+    status === "ACTIVE"
+      ? "Recalled"
+      : status === "DRAFT"
+        ? "Pending"
+        : status === "CLOSED"
+          ? "Closed"
+          : status;
+  return <StatusBadge label={label} tone={tone} />;
+}
 
 export function RecallsPage() {
   const qc = useQueryClient();
@@ -99,167 +136,184 @@ export function RecallsPage() {
   });
 
   const recalls = listQuery.data?.recalls ?? [];
+  const activeRecalls = recalls.filter((r) => r.status === "ACTIVE");
+
+  const columns: DataTableColumn<RecallRow>[] = [
+    {
+      id: "number",
+      header: "Number",
+      cell: (r) => <span className="font-semibold">{r.recallNumber}</span>,
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (r) => recallStatusBadge(r.status),
+    },
+    { id: "severity", header: "Severity", cell: (r) => r.severity },
+    {
+      id: "lots",
+      header: "Lots",
+      cell: (r) => r.lots.map((l) => l.lot.lotNumber).join(", "),
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (r) => (
+        <span className="inline-flex flex-wrap gap-2">
+          <Button type="button" variant="quiet" onClick={() => setSelectedId(r.id)}>
+            Impact
+          </Button>
+          {r.status === "DRAFT" && (
+            <Button
+              type="button"
+              variant="destructive"
+              loading={activate.isPending}
+              onClick={() => activate.mutate(r.id)}
+            >
+              Activate
+            </Button>
+          )}
+          {r.status === "ACTIVE" && (
+            <>
+              <Button
+                type="button"
+                variant="quiet"
+                loading={dispatch.isPending}
+                onClick={() => dispatch.mutate(r.id)}
+              >
+                Dispatch notices
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                loading={refunds.isPending}
+                onClick={() => refunds.mutate(r.id)}
+              >
+                Refund
+              </Button>
+              <Button
+                type="button"
+                variant="quiet"
+                loading={close.isPending}
+                onClick={() => close.mutate(r.id)}
+              >
+                Close
+              </Button>
+            </>
+          )}
+        </span>
+      ),
+    },
+  ];
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Recalls</h1>
-        <p className="mt-1 text-sm text-stone-600">
-          Quarantine first, investigate second. Recalled goods never return to sellable stock.
-          Records are retained for regulators — never deleted.
-        </p>
-      </div>
+      <PageHeader
+        title="Recalls"
+        description="Quarantine first, investigate second. Recalled goods never return to sellable stock. Records are retained for regulators — never deleted."
+      />
+
+      {activeRecalls.length > 0 && (
+        <div
+          className="rounded-lg border border-state-danger bg-state-danger px-4 py-3 text-ink-inverse"
+          role="alert"
+        >
+          <p className="font-semibold tracking-wide">ACTIVE PRODUCT RECALL</p>
+          <ul className="mt-1 space-y-1 text-sm">
+            {activeRecalls.map((r) => (
+              <li key={r.id}>
+                <span className="font-medium">{r.recallNumber}</span>
+                {" · "}
+                {r.severity} — {r.reason}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1 text-sm opacity-90">
+            Affected stores also see this banner on Inventory, Lots, POS, and receiving.
+          </p>
+        </div>
+      )}
 
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800">
+        <div
+          className="rounded-md border border-state-danger bg-state-danger/10 px-3 py-2 text-sm text-state-danger"
+          role="alert"
+        >
           {error}
         </div>
       )}
 
-      <section className="rounded-lg border border-stone-200 bg-white p-4">
-        <h2 className="text-lg font-medium">Initiate recall</h2>
-        <p className="mt-1 text-sm text-stone-500">
+      <Card title="Initiate recall">
+        <p className="mb-4 text-sm text-ink-muted">
           Lots are quarantined immediately so POS cannot sell another unit during setup.
         </p>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          <label className="block text-sm sm:col-span-2">
-            <span className="font-medium">Lot IDs</span>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="flex flex-col gap-1.5 text-sm sm:col-span-2">
+            <span className="font-semibold text-ink">Lot IDs</span>
             <textarea
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+              className="w-full rounded-md border border-border-strong bg-surface-raised px-3 py-2 text-sm text-ink"
               rows={2}
               value={lotIdsText}
               onChange={(e) => setLotIdsText(e.target.value)}
               placeholder="cuid lot ids, comma or space separated"
             />
           </label>
-          <label className="block text-sm sm:col-span-2">
-            <span className="font-medium">Reason</span>
-            <input
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-            />
-          </label>
-          <label className="block text-sm">
-            <span className="font-medium">Severity</span>
-            <select
-              className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
-              value={severity}
-              onChange={(e) => setSeverity(e.target.value as typeof severity)}
-            >
-              <option value="ADVISORY">ADVISORY</option>
-              <option value="VOLUNTARY">VOLUNTARY</option>
-              <option value="MANDATORY">MANDATORY</option>
-            </select>
-          </label>
+          <Field
+            label="Reason"
+            className="sm:col-span-2"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+          <SelectField
+            label="Severity"
+            value={severity}
+            onChange={(e) => setSeverity(e.target.value as typeof severity)}
+          >
+            <option value="ADVISORY">ADVISORY</option>
+            <option value="VOLUNTARY">VOLUNTARY</option>
+            <option value="MANDATORY">MANDATORY</option>
+          </SelectField>
         </div>
-        <button
-          type="button"
-          className="mt-4 rounded bg-red-800 px-4 py-2 text-sm font-medium text-white hover:bg-red-900 disabled:opacity-50"
-          disabled={initiate.isPending || !lotIdsText.trim() || !reason.trim()}
-          onClick={() => initiate.mutate()}
-        >
-          Quarantine &amp; create DRAFT
-        </button>
-      </section>
+        <div className="mt-4">
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={!lotIdsText.trim() || !reason.trim()}
+            loading={initiate.isPending}
+            onClick={() => initiate.mutate()}
+          >
+            Quarantine & create DRAFT
+          </Button>
+        </div>
+      </Card>
 
-      <section className="rounded-lg border border-stone-200 bg-white p-4">
-        <h2 className="text-lg font-medium">Open recalls</h2>
-        <div className="mt-3 overflow-x-auto">
-          <table className="min-w-full text-left text-sm">
-            <thead className="border-b border-stone-200 text-stone-500">
-              <tr>
-                <th className="py-2 pr-4">Number</th>
-                <th className="py-2 pr-4">Status</th>
-                <th className="py-2 pr-4">Severity</th>
-                <th className="py-2 pr-4">Lots</th>
-                <th className="py-2 pr-4">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recalls.map((r) => (
-                <tr key={r.id} className="border-b border-stone-100">
-                  <td className="py-2 pr-4 font-medium">{r.recallNumber}</td>
-                  <td className="py-2 pr-4">{r.status}</td>
-                  <td className="py-2 pr-4">{r.severity}</td>
-                  <td className="py-2 pr-4">
-                    {r.lots.map((l) => l.lot.lotNumber).join(", ")}
-                  </td>
-                  <td className="py-2 pr-4">
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        className="rounded border border-stone-300 px-2 py-1 text-xs hover:bg-stone-50"
-                        onClick={() => setSelectedId(r.id)}
-                      >
-                        Impact
-                      </button>
-                      {r.status === "DRAFT" && (
-                        <button
-                          type="button"
-                          className="rounded border border-red-300 px-2 py-1 text-xs text-red-800 hover:bg-red-50"
-                          onClick={() => activate.mutate(r.id)}
-                        >
-                          Activate
-                        </button>
-                      )}
-                      {r.status === "ACTIVE" && (
-                        <>
-                          <button
-                            type="button"
-                            className="rounded border border-stone-300 px-2 py-1 text-xs hover:bg-stone-50"
-                            onClick={() => dispatch.mutate(r.id)}
-                          >
-                            Dispatch notices
-                          </button>
-                          <button
-                            type="button"
-                            className="rounded border border-stone-300 px-2 py-1 text-xs hover:bg-stone-50"
-                            onClick={() => refunds.mutate(r.id)}
-                          >
-                            Refund (no restock)
-                          </button>
-                          <button
-                            type="button"
-                            className="rounded border border-stone-300 px-2 py-1 text-xs hover:bg-stone-50"
-                            onClick={() => close.mutate(r.id)}
-                          >
-                            Close
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {recalls.length === 0 && (
-                <tr>
-                  <td colSpan={5} className="py-4 text-stone-500">
-                    No recalls yet.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+      <section className="space-y-2">
+        <h2 className="text-lg font-semibold text-ink">Open recalls</h2>
+        <DataTable
+          columns={columns}
+          rows={recalls}
+          rowKey={(r) => r.id}
+          emptyMessage="No recalls yet."
+        />
       </section>
 
       {selectedId && impactQuery.data && (
-        <section className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-          <h2 className="text-lg font-medium">Impact preview</h2>
-          <p className="mt-1 text-sm text-stone-700">
-            Sold {impactQuery.data.unitsSold} · On shelves {impactQuery.data.unitsOnShelves} ·
-            Exposure ${impactQuery.data.estimatedFinancialExposure} · Stores{" "}
+        <Card title="Impact preview">
+          <p className="text-sm text-ink">
+            Sold <span className="tabular">{impactQuery.data.unitsSold}</span> · On shelves{" "}
+            <span className="tabular">{impactQuery.data.unitsOnShelves}</span> · Exposure{" "}
+            <Money value={impactQuery.data.estimatedFinancialExposure} tone="alert" /> · Stores{" "}
             {impactQuery.data.storesInvolved.map((s) => s.storeName).join(", ") || "—"}
           </p>
-          <ul className="mt-3 list-inside list-disc text-sm">
+          <ul className="mt-3 list-inside list-disc text-sm text-ink">
             {impactQuery.data.affectedMembers.map((m) => (
               <li key={m.memberId}>
-                {m.name} ({m.email}) — {m.quantityPurchased} unit(s)
+                {m.name} ({m.email}) —{" "}
+                <span className="tabular">{m.quantityPurchased}</span> unit(s)
               </li>
             ))}
           </ul>
-        </section>
+        </Card>
       )}
     </div>
   );

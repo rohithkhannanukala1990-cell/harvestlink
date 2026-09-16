@@ -3,12 +3,32 @@
  */
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ApiError, apiRequest, getToken, money } from "../api/client";
+import { ApiError, apiRequest, getToken } from "../api/client";
 import type { Sale } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import {
+  Button,
+  Card,
+  DataTable,
+  LotStatusBadge,
+  Money,
+  PageHeader,
+  StatusBadge,
+  type DataTableColumn,
+} from "../components/ui";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
+
+function paymentStatusBadge(status: Sale["paymentStatus"]) {
+  if (status === "PAID") return <StatusBadge label="Paid" tone="success" />;
+  if (status === "PENDING" || status === "REFUNDING") {
+    return <StatusBadge label="Pending" tone="warning" />;
+  }
+  if (status === "FAILED") return <StatusBadge label="Failed" tone="danger" />;
+  if (status === "REFUNDED") return <StatusBadge label="Closed" tone="neutral" />;
+  return <StatusBadge label="Expired" tone="neutral" />;
+}
 
 export function SalesHistoryPage() {
   const { activeStoreId } = useAuth();
@@ -65,102 +85,130 @@ export function SalesHistoryPage() {
   }
 
   if (!activeStoreId) {
-    return <p className="text-stone-600">Select a store to view sales.</p>;
+    return <p className="text-ink-muted">Select a store to view sales.</p>;
   }
 
   const detail = detailQuery.data?.sale;
+  const sales = salesQuery.data?.sales ?? [];
+
+  const columns: DataTableColumn<Sale>[] = [
+    {
+      id: "when",
+      header: "When",
+      cell: (sale) => (
+        <span className="whitespace-nowrap">
+          {new Date(sale.paidAt ?? sale.createdAt).toLocaleString()}
+        </span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (sale) => paymentStatusBadge(sale.paymentStatus),
+    },
+    {
+      id: "pay",
+      header: "Pay",
+      cell: (sale) => sale.paymentMethod ?? "—",
+    },
+    {
+      id: "total",
+      header: "Total",
+      numeric: true,
+      cell: (sale) => <Money value={sale.total} />,
+    },
+    {
+      id: "tax",
+      header: "Tax",
+      numeric: true,
+      cell: (sale) => <Money value={sale.taxAmount ?? 0} />,
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (sale) => (
+        <span className="inline-flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="quiet"
+            onClick={() => setDetailId(detailId === sale.id ? null : sale.id)}
+          >
+            {detailId === sale.id ? "Hide" : "Detail"}
+          </Button>
+          {(sale.paymentStatus === "PAID" || sale.paymentStatus === "REFUNDED") && (
+            <>
+              <Button type="button" variant="quiet" onClick={() => openReceipt(sale.id)}>
+                Reprint
+              </Button>
+              <Button
+                type="button"
+                variant="quiet"
+                onClick={() => void emailReceipt(sale.id)}
+              >
+                Email
+              </Button>
+            </>
+          )}
+        </span>
+      ),
+    },
+  ];
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">Sales history</h1>
-      {message && <p className="text-sm text-stone-600">{message}</p>}
-      <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-        <table className="min-w-full text-left text-sm">
-          <thead className="border-b bg-stone-50 text-stone-600">
-            <tr>
-              <th className="px-3 py-2">When</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Pay</th>
-              <th className="px-3 py-2">Total</th>
-              <th className="px-3 py-2">Tax</th>
-              <th className="px-3 py-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {(salesQuery.data?.sales ?? []).map((sale) => (
-              <tr key={sale.id} className={detailId === sale.id ? "bg-stone-50" : ""}>
-                <td className="px-3 py-2 whitespace-nowrap">
-                  {new Date(sale.paidAt ?? sale.createdAt).toLocaleString()}
-                </td>
-                <td className="px-3 py-2">{sale.paymentStatus}</td>
-                <td className="px-3 py-2">{sale.paymentMethod ?? "—"}</td>
-                <td className="px-3 py-2">{money(sale.total)}</td>
-                <td className="px-3 py-2">{money(sale.taxAmount ?? 0)}</td>
-                <td className="px-3 py-2 space-x-2">
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => setDetailId(detailId === sale.id ? null : sale.id)}
-                  >
-                    {detailId === sale.id ? "Hide" : "Detail"}
-                  </button>
-                  {(sale.paymentStatus === "PAID" || sale.paymentStatus === "REFUNDED") && (
-                    <>
-                      <button
-                        type="button"
-                        className="underline"
-                        onClick={() => openReceipt(sale.id)}
-                      >
-                        Reprint
-                      </button>
-                      <button
-                        type="button"
-                        className="underline"
-                        onClick={() => void emailReceipt(sale.id)}
-                      >
-                        Email
-                      </button>
-                    </>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <PageHeader title="Sales history" />
+      {message && <p className="text-sm text-ink-muted">{message}</p>}
+      <DataTable
+        columns={columns}
+        rows={sales}
+        rowKey={(sale) => sale.id}
+        emptyMessage="No sales yet"
+      />
 
       {detailId && (
-        <section className="rounded-lg border border-stone-200 bg-white p-4">
-          <h2 className="text-lg font-medium">Sale detail</h2>
-          {detailQuery.isLoading && <p className="mt-2 text-sm text-stone-500">Loading…</p>}
+        <Card title="Sale detail">
+          {detailQuery.isLoading && <p className="text-sm text-ink-muted">Loading…</p>}
           {detail && (
-            <ul className="mt-3 space-y-3 text-sm">
+            <ul className="space-y-3 text-sm">
               {detail.items.map((item) => (
-                <li key={item.id} className="border-b border-stone-100 pb-2">
-                  <div className="font-medium">
+                <li key={item.id} className="border-b border-border-hairline pb-2">
+                  <div className="font-semibold text-ink">
                     {item.nameSnapshot}{" "}
-                    <span className="font-normal text-stone-500">
-                      ×{item.quantity} @ {money(item.priceSnapshot)}
+                    <span className="font-normal text-ink-muted">
+                      ×<span className="tabular">{item.quantity}</span> @{" "}
+                      <Money value={item.priceSnapshot} />
                     </span>
                   </div>
-                  <div className="mt-1 text-stone-600">
+                  <div className="mt-1 text-ink-muted">
                     {item.lotAllocations && item.lotAllocations.length > 0 ? (
                       item.lotAllocations.map((a) => (
-                        <div key={a.id} className="font-mono text-xs">
-                          Lot {a.lot?.lotNumber ?? a.lotId}
-                          {a.quantity !== item.quantity ? ` ×${a.quantity}` : ""}
-                          {a.lot?.status ? ` · ${a.lot.status}` : ""}
+                        <div
+                          key={a.id}
+                          className="flex flex-wrap items-center gap-2 font-mono text-xs"
+                        >
+                          <span>
+                            Lot {a.lot?.lotNumber ?? a.lotId}
+                            {a.quantity !== item.quantity ? (
+                              <>
+                                {" "}
+                                ×<span className="tabular">{a.quantity}</span>
+                              </>
+                            ) : null}
+                          </span>
+                          {a.lot?.status ? (
+                            <LotStatusBadge status={a.lot.status} />
+                          ) : null}
                         </div>
                       ))
                     ) : (
-                      <span className="text-xs text-stone-400">No lot allocation recorded</span>
+                      <span className="text-xs text-ink-muted">No lot allocation recorded</span>
                     )}
                   </div>
                 </li>
               ))}
             </ul>
           )}
-        </section>
+        </Card>
       )}
     </div>
   );

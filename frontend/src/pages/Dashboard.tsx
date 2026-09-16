@@ -9,10 +9,19 @@
  * Cashiers see sales + low stock; settlement card is hidden for CASHIER.
  */
 import { useQuery } from "@tanstack/react-query";
-import { apiRequest, money, todayRangeIso } from "../api/client";
+import { apiRequest, todayRangeIso } from "../api/client";
 import type { Product, Sale, SettlementSummary } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import {
+  DataTable,
+  Money,
+  PageHeader,
+  StatCard,
+  StatusBadge,
+  formatMoney,
+  type DataTableColumn,
+} from "../components/ui";
 
 export function DashboardPage() {
   const { activeStoreId, isRole } = useAuth();
@@ -44,7 +53,7 @@ export function DashboardPage() {
 
   if (!activeStoreId) {
     return (
-      <p className="text-stone-600">
+      <p className="text-ink-muted">
         Select a store (COOP_ADMIN) or sign in with a store-scoped account.
       </p>
     );
@@ -54,51 +63,80 @@ export function DashboardPage() {
   const todaysTotal = todaysSales.reduce((sum, s) => sum + Number(s.total), 0);
   const lowStock = productsQuery.data?.products.filter((p) => p.lowStock) ?? [];
 
+  const lowStockColumns: DataTableColumn<Product>[] = [
+    {
+      id: "name",
+      header: "Product",
+      cell: (p) => (
+        <span>
+          {p.name}{" "}
+          <span className="font-mono text-ink-muted">({p.sku})</span>
+        </span>
+      ),
+    },
+    {
+      id: "stock",
+      header: "Stock",
+      numeric: true,
+      cell: (p) => <span className="tabular">{p.stock}</span>,
+    },
+    {
+      id: "reorder",
+      header: "Reorder at",
+      numeric: true,
+      cell: (p) => <span className="tabular">{p.reorderAt}</span>,
+    },
+  ];
+
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+      <PageHeader title="Dashboard" />
       <div className="grid gap-4 sm:grid-cols-3">
-        <div className="rounded-lg border border-stone-200 bg-white p-4">
-          <p className="text-sm text-stone-500">Today&apos;s paid sales</p>
-          <p className="mt-2 text-2xl font-semibold">{money(todaysTotal)}</p>
-          <p className="mt-1 text-sm text-stone-500">{todaysSales.length} transactions</p>
-        </div>
-        <div className="rounded-lg border border-stone-200 bg-white p-4">
-          <p className="text-sm text-stone-500">Low stock SKUs</p>
-          <p className="mt-2 text-2xl font-semibold">{lowStock.length}</p>
-          <p className="mt-1 text-sm text-stone-500">stock ≤ reorderAt</p>
-        </div>
+        <StatCard
+          label="Today's paid sales"
+          value={formatMoney(todaysTotal)}
+          subLine={
+            <>
+              <span className="tabular">{todaysSales.length}</span> transactions
+            </>
+          }
+        />
+        <StatCard
+          label="Low stock SKUs"
+          value={String(lowStock.length)}
+          subLine="stock ≤ reorderAt"
+          tone={lowStock.length > 0 ? "alert" : "default"}
+        />
         {isRole("STORE_ADMIN", "COOP_ADMIN") && (
-          <div className="rounded-lg border border-stone-200 bg-white p-4">
-            <p className="text-sm text-stone-500">Owed to operator</p>
-            <p className="mt-2 text-2xl font-semibold">
-              {settlementQuery.isLoading
+          <StatCard
+            label="Owed to operator"
+            value={
+              settlementQuery.isLoading
                 ? "…"
-                : money(settlementQuery.data?.currentlyOwed ?? 0)}
-            </p>
-            <p className="mt-1 text-sm text-stone-500">
-              Accrued {money(settlementQuery.data?.operatorAccrued ?? 0)} − paid{" "}
-              {money(settlementQuery.data?.totalPaidOut ?? 0)}
-            </p>
-          </div>
+                : formatMoney(settlementQuery.data?.currentlyOwed ?? 0)
+            }
+            subLine={
+              <>
+                Accrued <Money value={settlementQuery.data?.operatorAccrued ?? 0} /> − paid{" "}
+                <Money value={settlementQuery.data?.totalPaidOut ?? 0} />
+              </>
+            }
+          />
         )}
       </div>
 
       {lowStock.length > 0 && (
-        <section>
-          <h2 className="mb-2 text-lg font-medium">Low stock</h2>
-          <ul className="divide-y divide-stone-200 rounded-lg border border-stone-200 bg-white">
-            {lowStock.slice(0, 10).map((p) => (
-              <li key={p.id} className="flex justify-between px-4 py-2 text-sm">
-                <span>
-                  {p.name} <span className="text-stone-400">({p.sku})</span>
-                </span>
-                <span>
-                  {p.stock} / reorder {p.reorderAt}
-                </span>
-              </li>
-            ))}
-          </ul>
+        <section className="space-y-2">
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-semibold text-ink">Low stock</h2>
+            <StatusBadge label="Low stock" tone="warning" />
+          </div>
+          <DataTable
+            columns={lowStockColumns}
+            rows={lowStock.slice(0, 10)}
+            rowKey={(p) => p.id}
+            emptyMessage="No low-stock SKUs"
+          />
         </section>
       )}
     </div>

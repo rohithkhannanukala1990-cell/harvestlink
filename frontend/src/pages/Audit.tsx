@@ -8,6 +8,15 @@ import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "../api/client";
 import type { AuditLogEntry, Store } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import {
+  Button,
+  Card,
+  DataTable,
+  Field,
+  PageHeader,
+  SelectField,
+  type DataTableColumn,
+} from "../components/ui";
 
 type AuditResponse = {
   logs: AuditLogEntry[];
@@ -59,29 +68,85 @@ export function AuditPage() {
   });
 
   const actions = auditQuery.data?.actions ?? [];
+  const logs = auditQuery.data?.logs ?? [];
+
+  const columns: DataTableColumn<AuditLogEntry>[] = [
+    {
+      id: "when",
+      header: "When",
+      cell: (log) => (
+        <span className="whitespace-nowrap text-ink-muted">
+          {new Date(log.createdAt).toLocaleString()}
+        </span>
+      ),
+    },
+    {
+      id: "action",
+      header: "Action",
+      cell: (log) => <span className="font-semibold">{log.action}</span>,
+    },
+    {
+      id: "actor",
+      header: "Actor",
+      cell: (log) => (
+        <span className="font-mono text-xs">{log.userId ?? "—"}</span>
+      ),
+    },
+    {
+      id: "entity",
+      header: "Entity",
+      cell: (log) => (
+        <div>
+          <div>{log.entityType}</div>
+          <div className="font-mono text-xs text-ink-muted">{log.entityId ?? "—"}</div>
+        </div>
+      ),
+    },
+    {
+      id: "before",
+      header: "Before",
+      cell: (log) => (
+        <span className="block max-w-xs truncate font-mono text-xs text-ink-muted">
+          {formatJson(log.before)}
+        </span>
+      ),
+    },
+    {
+      id: "after",
+      header: "After",
+      cell: (log) => (
+        <span className="block max-w-xs truncate font-mono text-xs text-ink-muted">
+          {formatJson(log.after)}
+        </span>
+      ),
+    },
+    {
+      id: "ip",
+      header: "IP",
+      cell: (log) => (
+        <span className="font-mono text-xs">{log.ipAddress ?? "—"}</span>
+      ),
+    },
+  ];
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Audit log</h1>
-        <p className="mt-1 text-sm text-stone-600">
-          Append-only trail of sensitive changes (operator %, stock, payouts, refunds, auth).
-          Records cannot be edited or deleted.
-        </p>
-      </div>
+      <PageHeader
+        title="Audit log"
+        description="Append-only trail of sensitive changes (operator %, stock, payouts, refunds, auth). Records cannot be edited or deleted."
+      />
 
-      <form
-        className="grid gap-3 rounded-lg border border-stone-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-3"
-        onSubmit={(e) => {
-          e.preventDefault();
-          setPage(1);
-          void auditQuery.refetch();
-        }}
-      >
-        <label className="block text-sm">
-          <span className="text-stone-600">Store</span>
-          <select
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+      <Card title="Filters">
+        <form
+          className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            setPage(1);
+            void auditQuery.refetch();
+          }}
+        >
+          <SelectField
+            label="Store"
             value={storeId}
             onChange={(e) => {
               setStoreId(e.target.value);
@@ -94,21 +159,15 @@ export function AuditPage() {
                 {s.name}
               </option>
             ))}
-          </select>
-        </label>
-        <label className="block text-sm">
-          <span className="text-stone-600">User id</span>
-          <input
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          </SelectField>
+          <Field
+            label="User id"
             value={userId}
             onChange={(e) => setUserId(e.target.value)}
             placeholder="cuid…"
           />
-        </label>
-        <label className="block text-sm">
-          <span className="text-stone-600">Action</span>
-          <select
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
+          <SelectField
+            label="Action"
             value={action}
             onChange={(e) => {
               setAction(e.target.value);
@@ -121,122 +180,84 @@ export function AuditPage() {
                 {a}
               </option>
             ))}
-          </select>
-        </label>
-        <label className="block text-sm">
-          <span className="text-stone-600">From</span>
-          <input
+          </SelectField>
+          <Field
+            label="From"
             type="date"
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
             value={from}
             onChange={(e) => {
               setFrom(e.target.value);
               setPage(1);
             }}
           />
-        </label>
-        <label className="block text-sm">
-          <span className="text-stone-600">To</span>
-          <input
+          <Field
+            label="To"
             type="date"
-            className="mt-1 w-full rounded border border-stone-300 px-3 py-2"
             value={to}
             onChange={(e) => {
               setTo(e.target.value);
               setPage(1);
             }}
           />
-        </label>
-        <div className="flex items-end">
-          <button
-            type="submit"
-            className="w-full rounded bg-stone-900 px-4 py-2 text-white hover:bg-stone-800"
-          >
-            Apply filters
-          </button>
-        </div>
-      </form>
+          <div className="flex items-end">
+            <Button type="submit" className="w-full">
+              Apply filters
+            </Button>
+          </div>
+        </form>
+      </Card>
 
       {auditQuery.isError && (
-        <p className="text-sm text-red-700">Failed to load audit log.</p>
+        <p className="text-sm text-state-danger" role="alert">
+          Failed to load audit log.
+        </p>
       )}
 
-      <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white">
-        <table className="min-w-full text-left text-sm">
-          <thead className="border-b border-stone-200 bg-stone-50 text-stone-600">
-            <tr>
-              <th className="px-3 py-2 font-medium">When</th>
-              <th className="px-3 py-2 font-medium">Action</th>
-              <th className="px-3 py-2 font-medium">Actor</th>
-              <th className="px-3 py-2 font-medium">Entity</th>
-              <th className="px-3 py-2 font-medium">Before</th>
-              <th className="px-3 py-2 font-medium">After</th>
-              <th className="px-3 py-2 font-medium">IP</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-stone-100">
-            {(auditQuery.data?.logs ?? []).map((log) => (
-              <tr key={log.id} className="align-top">
-                <td className="whitespace-nowrap px-3 py-2 text-stone-600">
-                  {new Date(log.createdAt).toLocaleString()}
-                </td>
-                <td className="px-3 py-2 font-medium">{log.action}</td>
-                <td className="px-3 py-2 font-mono text-xs">{log.userId ?? "—"}</td>
-                <td className="px-3 py-2">
-                  <div>{log.entityType}</div>
-                  <div className="font-mono text-xs text-stone-500">{log.entityId ?? "—"}</div>
-                </td>
-                <td className="max-w-xs truncate px-3 py-2 font-mono text-xs text-stone-600">
-                  {formatJson(log.before)}
-                </td>
-                <td className="max-w-xs truncate px-3 py-2 font-mono text-xs text-stone-600">
-                  {formatJson(log.after)}
-                </td>
-                <td className="px-3 py-2 font-mono text-xs">{log.ipAddress ?? "—"}</td>
-              </tr>
-            ))}
-            {!auditQuery.isLoading && (auditQuery.data?.logs.length ?? 0) === 0 && (
-              <tr>
-                <td colSpan={7} className="px-3 py-8 text-center text-stone-500">
-                  No audit events match these filters.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        rows={logs}
+        rowKey={(log) => log.id}
+        emptyMessage={
+          auditQuery.isLoading ? "Loading…" : "No audit events match these filters."
+        }
+      />
 
       <div className="flex items-center justify-between text-sm">
-        <p className="text-stone-600">
+        <p className="text-ink-muted">
           {auditQuery.data
             ? `${auditQuery.data.total} event${auditQuery.data.total === 1 ? "" : "s"}`
             : "…"}
         </p>
         <div className="flex gap-2">
-          <button
+          <Button
             type="button"
+            variant="quiet"
             disabled={page <= 1}
-            className="rounded border border-stone-300 px-3 py-1 disabled:opacity-40"
             onClick={() => setPage((p) => Math.max(1, p - 1))}
           >
             Previous
-          </button>
-          <span className="px-2 py-1 text-stone-600">
-            Page {page}
-            {auditQuery.data?.totalPages ? ` / ${auditQuery.data.totalPages}` : ""}
+          </Button>
+          <span className="px-2 py-2 text-ink-muted">
+            Page <span className="tabular">{page}</span>
+            {auditQuery.data?.totalPages ? (
+              <>
+                {" "}
+                / <span className="tabular">{auditQuery.data.totalPages}</span>
+              </>
+            ) : null}
           </span>
-          <button
+          <Button
             type="button"
+            variant="quiet"
             disabled={
               !auditQuery.data ||
               auditQuery.data.totalPages === 0 ||
               page >= auditQuery.data.totalPages
             }
-            className="rounded border border-stone-300 px-3 py-1 disabled:opacity-40"
             onClick={() => setPage((p) => p + 1)}
           >
             Next
-          </button>
+          </Button>
         </div>
       </div>
     </div>
