@@ -160,6 +160,13 @@ export type SettlementSummary = {
   operatorAccrued: string;
   totalPaidOut: string;
   currentlyOwed: string;
+  grossSalesCard: string;
+  grossSalesCash: string;
+  /** Co-op share of card sales — settles to the co-op account through the processor. */
+  coopAmountCard: string;
+  /** Co-op share of cash sales — held in the store until an operator banks it. */
+  coopAmountCash: string;
+  cashCollectedButNotDeposited: string;
 };
 
 export type Payout = {

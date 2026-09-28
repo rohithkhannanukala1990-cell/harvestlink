@@ -15,6 +15,19 @@
  *   totalPaidOut     = Σ Payout.amount
  *   currentlyOwed    = operatorAccrued - totalPaidOut
  *
+ * Payment-method split (same rows, same netting — filtered by channel):
+ *   grossSalesCash   = grossSales over cash sales;  grossSalesCard = grossSales - grossSalesCash
+ *   coopAmountX      = grossSalesX - operatorAccruedX   (co-op keeps everything the operator
+ *                      did not accrue, including sales tax it must remit)
+ *   cashCollectedButNotDeposited = coopAmountCash - confirmed cash deposits
+ *
+ * Card takings settle to the cooperative through the processor. Cash takings sit in the store
+ * until an operator banks them. These are the same number in the ledger and completely
+ * different in reality, and the settlement view must show that.
+ * A sale counts as card only when it is TERMINAL/CHECKOUT or carries a Stripe reference; legacy
+ * rows with no recorded method and no Stripe id are treated as cash so money we cannot prove
+ * was banked is never reported as banked.
+ *
  * ACCOUNTING (why netting matters):
  * - Full card capture still lands in the co-op Stripe account; operatorAmount is an
  *   INTERNAL accrual only. When we refund the customer, we must claw back the same
@@ -51,6 +64,16 @@ export type StoreSettlementSummary = {
   operatorAccrued: string;
   totalPaidOut: string;
   currentlyOwed: string;
+} & PaymentMethodSplit;
+
+export type PaymentMethodSplit = {
+  grossSalesCard: string;
+  grossSalesCash: string;
+  /** Co-op share of card sales — reaches the co-op account through the processor. */
+  coopAmountCard: string;
+  /** Co-op share of cash sales — physically held in the store until banked. */
+  coopAmountCash: string;
+  cashCollectedButNotDeposited: string;
 };
 
 export type NetworkSettlementSummary = {
@@ -60,7 +83,15 @@ export type NetworkSettlementSummary = {
   totalPaidOut: string;
   currentlyOwed: string;
   stores: StoreSettlementSummary[];
-};
+} & PaymentMethodSplit;
+
+// COALESCE keeps the predicate strictly true/false: a NULL paymentMethod would otherwise make
+// NOT (...) NULL and drop the row from the cash filter, silently counting it as card.
+const IS_CARD_SALE = Prisma.sql`(
+  COALESCE("paymentMethod"::text IN ('TERMINAL', 'CHECKOUT'), false)
+  OR "stripePaymentIntentId" IS NOT NULL
+  OR "stripeCheckoutSessionId" IS NOT NULL
+)`;
 
 export type CreatePayoutInput = {
   amount: number;
@@ -104,10 +135,19 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
 
   // Net in SQL so partial refunds (PAID + refundedOperatorAmount > 0) reduce currentlyOwed.
   const [salesAgg, payoutsAgg] = await Promise.all([
-    prisma.$queryRaw<Array<{ gross: Prisma.Decimal; accrued: Prisma.Decimal }>>`
+    prisma.$queryRaw<
+      Array<{
+        gross: Prisma.Decimal;
+        accrued: Prisma.Decimal;
+        grossCash: Prisma.Decimal;
+        accruedCash: Prisma.Decimal;
+      }>
+    >`
       SELECT
         COALESCE(SUM(total - "refundedAmount"), 0) AS gross,
-        COALESCE(SUM("operatorAmount" - "refundedOperatorAmount"), 0) AS accrued
+        COALESCE(SUM("operatorAmount" - "refundedOperatorAmount"), 0) AS accrued,
+        COALESCE(SUM(total - "refundedAmount") FILTER (WHERE NOT ${IS_CARD_SALE}), 0) AS "grossCash",
+        COALESCE(SUM("operatorAmount" - "refundedOperatorAmount") FILTER (WHERE NOT ${IS_CARD_SALE}), 0) AS "accruedCash"
       FROM "Sale"
       WHERE "storeId" = ${storeId}
         AND "paymentStatus"::text IN ('PAID', 'REFUNDING', 'REFUNDED')
@@ -126,6 +166,15 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
   // currentlyOwed can theoretically go negative if an admin over-paid; surface that honestly.
   const currentlyOwed = operatorAccrued.sub(totalPaidOut);
 
+  const grossSalesCash = new Prisma.Decimal(salesAgg[0]?.grossCash ?? 0);
+  const operatorAccruedCash = new Prisma.Decimal(salesAgg[0]?.accruedCash ?? 0);
+  const grossSalesCard = grossSales.sub(grossSalesCash);
+  const operatorAccruedCard = operatorAccrued.sub(operatorAccruedCash);
+  const coopAmountCash = grossSalesCash.sub(operatorAccruedCash);
+  const coopAmountCard = grossSalesCard.sub(operatorAccruedCard);
+  // No cash deposit ledger exists yet, so no co-op cash is confirmed banked.
+  const confirmedCashDeposits = new Prisma.Decimal(0);
+
   return {
     storeId: store.id,
     storeName: store.name,
@@ -133,6 +182,13 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
     operatorAccrued: decimalToMoneyString(operatorAccrued),
     totalPaidOut: decimalToMoneyString(totalPaidOut),
     currentlyOwed: decimalToMoneyString(currentlyOwed),
+    grossSalesCard: decimalToMoneyString(grossSalesCard),
+    grossSalesCash: decimalToMoneyString(grossSalesCash),
+    coopAmountCard: decimalToMoneyString(coopAmountCard),
+    coopAmountCash: decimalToMoneyString(coopAmountCash),
+    cashCollectedButNotDeposited: decimalToMoneyString(
+      coopAmountCash.sub(confirmedCashDeposits),
+    ),
   };
 }
 
@@ -289,12 +345,24 @@ export async function getNetworkSettlementSummary(): Promise<NetworkSettlementSu
   let operatorAccrued = new Prisma.Decimal(0);
   let totalPaidOut = new Prisma.Decimal(0);
   let currentlyOwed = new Prisma.Decimal(0);
+  let grossSalesCard = new Prisma.Decimal(0);
+  let grossSalesCash = new Prisma.Decimal(0);
+  let coopAmountCard = new Prisma.Decimal(0);
+  let coopAmountCash = new Prisma.Decimal(0);
+  let cashCollectedButNotDeposited = new Prisma.Decimal(0);
 
   for (const summary of storeSummaries) {
     grossSales = grossSales.add(summary.grossSales);
     operatorAccrued = operatorAccrued.add(summary.operatorAccrued);
     totalPaidOut = totalPaidOut.add(summary.totalPaidOut);
     currentlyOwed = currentlyOwed.add(summary.currentlyOwed);
+    grossSalesCard = grossSalesCard.add(summary.grossSalesCard);
+    grossSalesCash = grossSalesCash.add(summary.grossSalesCash);
+    coopAmountCard = coopAmountCard.add(summary.coopAmountCard);
+    coopAmountCash = coopAmountCash.add(summary.coopAmountCash);
+    cashCollectedButNotDeposited = cashCollectedButNotDeposited.add(
+      summary.cashCollectedButNotDeposited,
+    );
   }
 
   return {
@@ -303,6 +371,11 @@ export async function getNetworkSettlementSummary(): Promise<NetworkSettlementSu
     operatorAccrued: decimalToMoneyString(operatorAccrued),
     totalPaidOut: decimalToMoneyString(totalPaidOut),
     currentlyOwed: decimalToMoneyString(currentlyOwed),
+    grossSalesCard: decimalToMoneyString(grossSalesCard),
+    grossSalesCash: decimalToMoneyString(grossSalesCash),
+    coopAmountCard: decimalToMoneyString(coopAmountCard),
+    coopAmountCash: decimalToMoneyString(coopAmountCash),
+    cashCollectedButNotDeposited: decimalToMoneyString(cashCollectedButNotDeposited),
     stores: storeSummaries,
   };
 }

@@ -84,4 +84,78 @@ describe("settlement", () => {
     expect(summary.totalPaidOut).toBe("7.50");
     expect(summary.currentlyOwed).toBe("12.50");
   });
+
+  it("splits co-op share by payment method and nets refunds per method", async () => {
+    const { store, cashier, storeAdmin } = await seedCashierStore();
+    await prisma.store.update({
+      where: { id: store.id },
+      data: { operatorPercent: new Prisma.Decimal(10) },
+    });
+    await prisma.cashDrawer.create({
+      data: {
+        storeId: store.id,
+        openedByUserId: storeAdmin.id,
+        openingFloat: new Prisma.Decimal(100),
+      },
+    });
+    const pA = await createProduct(store.id, { sku: "A", price: 10, stock: 20 });
+    const pB = await createProduct(store.id, { sku: "B", price: 20, stock: 20 });
+
+    const card = await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [{ productId: pB.id, quantity: 1 }],
+      paymentMethod: PaymentMethod.TERMINAL,
+    });
+    await salesService.finalizePaidSale(card.sale.id);
+
+    const { sale: cash } = await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [
+        { productId: pA.id, quantity: 2 },
+        { productId: pB.id, quantity: 1 },
+      ],
+      paymentMethod: PaymentMethod.CASH,
+    });
+    const cashLineA = cash.items.find((i) => i.productId === pA.id)!;
+    await salesService.refundSale(cash.id, store.id, {
+      items: [{ saleItemId: cashLineA.id, quantity: 1 }],
+      createdByUserId: storeAdmin.id,
+    });
+
+    const summary = await settlementService.getStoreSettlementSummary(store.id);
+    // Card 20 (op 2); cash 40 − 10 refunded = 30 (op 4 − 1 = 3).
+    expect(summary.grossSales).toBe("50.00");
+    expect(summary.operatorAccrued).toBe("5.00");
+    expect(summary.grossSalesCard).toBe("20.00");
+    expect(summary.grossSalesCash).toBe("30.00");
+    expect(summary.coopAmountCard).toBe("18.00");
+    expect(summary.coopAmountCash).toBe("27.00");
+    expect(summary.cashCollectedButNotDeposited).toBe("27.00");
+
+    const network = await settlementService.getNetworkSettlementSummary();
+    expect(network.coopAmountCash).toBe("27.00");
+    expect(network.cashCollectedButNotDeposited).toBe("27.00");
+  });
+
+  it("treats a legacy sale with no payment method or Stripe reference as cash", async () => {
+    const { store, cashier } = await seedCashierStore();
+    await prisma.store.update({
+      where: { id: store.id },
+      data: { operatorPercent: new Prisma.Decimal(10) },
+    });
+    const product = await createProduct(store.id, { price: 100, stock: 5 });
+
+    const { sale } = await salesService.createSale(store.id, asAuthUser(cashier), {
+      items: [{ productId: product.id, quantity: 1 }],
+      paymentMethod: PaymentMethod.TERMINAL,
+    });
+    await salesService.finalizePaidSale(sale.id);
+    await prisma.sale.update({
+      where: { id: sale.id },
+      data: { paymentMethod: null, stripePaymentIntentId: null, stripeCheckoutSessionId: null },
+    });
+
+    const summary = await settlementService.getStoreSettlementSummary(store.id);
+    expect(summary.grossSalesCard).toBe("0.00");
+    expect(summary.grossSalesCash).toBe("100.00");
+    expect(summary.coopAmountCash).toBe("90.00");
+  });
 });

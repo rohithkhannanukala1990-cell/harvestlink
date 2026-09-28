@@ -125,6 +125,28 @@ export function SettlementPage() {
         />
       </div>
 
+      <section className="space-y-2">
+        <h2 className="font-semibold text-ink">Co-op share by payment method</h2>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <StatCard
+            label="Card — banked via processor"
+            value={formatMoney(summary?.coopAmountCard ?? 0)}
+            subLine={`From ${formatMoney(summary?.grossSalesCard ?? 0)} net card sales`}
+          />
+          <StatCard
+            label="Cash — held in store"
+            value={formatMoney(summary?.coopAmountCash ?? 0)}
+            subLine={`From ${formatMoney(summary?.grossSalesCash ?? 0)} net cash sales`}
+          />
+          <StatCard
+            label="Cash collected, not deposited"
+            value={formatMoney(summary?.cashCollectedButNotDeposited ?? 0)}
+            subLine="Co-op cash still in the till until an operator banks it"
+            tone="alert"
+          />
+        </div>
+      </section>
+
       <Card title="Record payout">
         <form onSubmit={onSubmit} className="grid max-w-xl gap-3 sm:grid-cols-2">
           <Field
