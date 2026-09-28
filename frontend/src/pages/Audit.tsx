@@ -1,13 +1,15 @@
 /**
  * Audit log viewer — COOP_ADMIN only.
  * GET /audit with filters for store, user, action, and date range.
+ * GET /reports/drawer-variance for the same store / date filters (last 30 days when blank).
  * Read-only: the backend has no update/delete audit endpoints.
  */
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "../api/client";
-import type { AuditLogEntry, Store } from "../api/types";
+import type { AuditLogEntry, DrawerVarianceReport, Store } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import { SignedMoney, VariancePatterns } from "../components/DrawerVariance";
 import {
   Button,
   Card,
@@ -15,8 +17,122 @@ import {
   Field,
   PageHeader,
   SelectField,
+  StatCard,
+  formatMoney,
   type DataTableColumn,
 } from "../components/ui";
+
+type VarianceUserRow = DrawerVarianceReport["byUser"][number];
+type VarianceStoreRow = DrawerVarianceReport["byStore"][number];
+
+const varianceUserColumns: DataTableColumn<VarianceUserRow>[] = [
+  { id: "user", header: "Opened by", cell: (r) => r.userEmail },
+  { id: "shifts", header: "Shifts", numeric: true, cell: (r) => r.shiftCount },
+  { id: "short", header: "Short", numeric: true, cell: (r) => <SignedMoney value={r.shortTotal} /> },
+  { id: "over", header: "Over", numeric: true, cell: (r) => <SignedMoney value={r.overTotal} /> },
+  { id: "avg", header: "Average", numeric: true, cell: (r) => <SignedMoney value={r.averageVariance} /> },
+  { id: "flagged", header: "Over threshold", numeric: true, cell: (r) => r.overThresholdCount },
+];
+
+const varianceStoreColumns: DataTableColumn<VarianceStoreRow>[] = [
+  { id: "store", header: "Store", cell: (r) => r.storeName },
+  { id: "shifts", header: "Shifts", numeric: true, cell: (r) => r.shiftCount },
+  { id: "net", header: "Net", numeric: true, cell: (r) => <SignedMoney value={r.totalVariance} /> },
+  { id: "short", header: "Short", numeric: true, cell: (r) => <SignedMoney value={r.shortTotal} /> },
+  { id: "over", header: "Over", numeric: true, cell: (r) => <SignedMoney value={r.overTotal} /> },
+  { id: "flagged", header: "Over threshold", numeric: true, cell: (r) => r.overThresholdCount },
+];
+
+function DrawerVarianceSection({
+  storeId,
+  from,
+  to,
+}: {
+  storeId: string;
+  from: string;
+  to: string;
+}) {
+  const [threshold, setThreshold] = useState("5");
+
+  const queryString = useMemo(() => {
+    const params = new URLSearchParams();
+    if (storeId) params.set("storeId", storeId);
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    if (threshold !== "" && Number(threshold) >= 0) params.set("threshold", threshold);
+    return params.toString();
+  }, [storeId, from, to, threshold]);
+
+  const varianceQuery = useQuery({
+    queryKey: ["drawer-variance", queryString],
+    queryFn: () => apiRequest<DrawerVarianceReport>(`/reports/drawer-variance?${queryString}`),
+  });
+  const report = varianceQuery.data;
+
+  return (
+    <section className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-ink">Drawer variance</h2>
+          <p className="text-sm text-ink-muted">
+            {report
+              ? `${report.from} to ${report.to} · ${storeId ? "selected store" : "all stores"}`
+              : "Loading…"}
+          </p>
+        </div>
+        <Field
+          label="Threshold ($)"
+          type="number"
+          min="0"
+          step="0.01"
+          value={threshold}
+          onChange={(e) => setThreshold(e.target.value)}
+        />
+      </div>
+
+      {varianceQuery.isError && (
+        <p className="text-sm text-state-danger" role="alert">
+          Failed to load drawer variance.
+        </p>
+      )}
+
+      {report && (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard label="Shifts" value={String(report.totals.shiftCount)} />
+            <StatCard label="Short (total)" value={formatMoney(report.totals.shortTotal)} />
+            <StatCard label="Over (total)" value={`+${formatMoney(report.totals.overTotal)}`} />
+            <StatCard
+              label={`Shifts over ${formatMoney(report.threshold)}`}
+              value={String(report.totals.overThresholdCount)}
+              tone={report.totals.overThresholdCount > 0 ? "warning" : "default"}
+            />
+          </div>
+
+          <VariancePatterns
+            patterns={report.patterns}
+            windowLabel={`${report.from} to ${report.to}`}
+          />
+
+          <DataTable
+            columns={varianceUserColumns}
+            rows={report.byUser}
+            rowKey={(r) => r.userId}
+            emptyMessage="No closed drawers in this range."
+          />
+
+          {!storeId && report.byStore.length > 0 && (
+            <DataTable
+              columns={varianceStoreColumns}
+              rows={report.byStore}
+              rowKey={(r) => r.storeId}
+            />
+          )}
+        </>
+      )}
+    </section>
+  );
+}
 
 type AuditResponse = {
   logs: AuditLogEntry[];
@@ -206,6 +322,10 @@ export function AuditPage() {
           </div>
         </form>
       </Card>
+
+      <DrawerVarianceSection storeId={storeId} from={from} to={to} />
+
+      <h2 className="text-lg font-semibold text-ink">Audit events</h2>
 
       {auditQuery.isError && (
         <p className="text-sm text-state-danger" role="alert">

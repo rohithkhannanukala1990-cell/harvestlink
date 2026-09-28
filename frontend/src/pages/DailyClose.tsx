@@ -4,8 +4,9 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "../api/client";
-import type { DailyCloseReport } from "../api/types";
+import type { DailyCloseReport, VarianceShift } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+import { SignedMoney, VariancePatterns } from "../components/DrawerVariance";
 import {
   DataTable,
   Field,
@@ -21,6 +22,28 @@ function todayUtc(): string {
 }
 
 type CashierRow = DailyCloseReport["cashierBreakdown"][number];
+
+const shiftColumns: DataTableColumn<VarianceShift>[] = [
+  { id: "user", header: "Opened by", cell: (s) => s.userEmail },
+  { id: "closer", header: "Closed by", cell: (s) => s.closedByEmail ?? "—" },
+  {
+    id: "closed",
+    header: "Closed",
+    cell: (s) => (
+      <span className="whitespace-nowrap text-ink-muted">
+        {new Date(s.closedAt).toLocaleTimeString()}
+      </span>
+    ),
+  },
+  { id: "expected", header: "Expected", numeric: true, cell: (s) => <Money value={s.expectedCash} /> },
+  { id: "counted", header: "Counted", numeric: true, cell: (s) => <Money value={s.countedCash} /> },
+  {
+    id: "variance",
+    header: "Variance",
+    numeric: true,
+    cell: (s) => <SignedMoney value={s.variance} emphasize={s.overThreshold} />,
+  },
+];
 
 export function DailyClosePage() {
   const { activeStoreId } = useAuth();
@@ -112,6 +135,24 @@ export function DailyClosePage() {
             rows={report.cashierBreakdown}
             rowKey={(row) => row.cashierId}
             emptyMessage="No cashier activity"
+          />
+
+          <section className="space-y-2">
+            <h2 className="font-semibold text-ink">Drawer shifts</h2>
+            <p className="text-sm text-ink-muted">
+              Variances above {formatMoney(report.drawerVariance.threshold)} are highlighted.
+            </p>
+            <DataTable
+              columns={shiftColumns}
+              rows={report.drawerVariance.shifts}
+              rowKey={(s) => s.drawerId}
+              emptyMessage="No drawers closed on this date"
+            />
+          </section>
+
+          <VariancePatterns
+            patterns={report.drawerVariance.patterns}
+            windowLabel={`${report.drawerVariance.windowFrom} to ${report.drawerVariance.windowTo}`}
           />
         </div>
       )}

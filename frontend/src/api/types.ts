@@ -246,6 +246,69 @@ export type DailyCloseReport = {
     grossSales: string;
     operatorShare: string;
   }>;
+  drawerVariance: {
+    windowFrom: string;
+    windowTo: string;
+    threshold: string;
+    shifts: VarianceShift[];
+    patterns: VariancePattern[];
+  };
+};
+
+export type VarianceDirection = "SHORT" | "OVER" | "BALANCED";
+
+export type VarianceShift = {
+  drawerId: string;
+  storeId: string;
+  storeName: string;
+  /** Who opened the drawer — the person running the till. */
+  userId: string;
+  userEmail: string;
+  closedByEmail: string | null;
+  openedAt: string;
+  closedAt: string;
+  expectedCash: string;
+  countedCash: string;
+  variance: string;
+  direction: VarianceDirection;
+  overThreshold: boolean;
+};
+
+export type VarianceAggregate = {
+  shiftCount: number;
+  totalVariance: string;
+  averageVariance: string;
+  shortTotal: string;
+  overTotal: string;
+  shortCount: number;
+  overCount: number;
+  overThresholdCount: number;
+};
+
+export type VariancePattern = {
+  userId: string;
+  userEmail: string;
+  direction: "SHORT" | "OVER";
+  shiftCount: number;
+  totalVariance: string;
+  firstClosedAt: string;
+  lastClosedAt: string;
+  ongoing: boolean;
+  drawerIds: string[];
+};
+
+export type DrawerVarianceReport = {
+  storeId: string | null;
+  from: string;
+  to: string;
+  threshold: string;
+  tolerance: string;
+  minStreak: number;
+  totals: VarianceAggregate;
+  byShift: VarianceShift[];
+  byUser: Array<VarianceAggregate & { userId: string; userEmail: string }>;
+  byStore: Array<VarianceAggregate & { storeId: string; storeName: string }>;
+  patterns: VariancePattern[];
 };
 
 export type AuditLogEntry = {

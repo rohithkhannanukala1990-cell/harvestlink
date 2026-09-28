@@ -1,5 +1,5 @@
 /**
- * Reporting routes — daily close (Z-report) for store operators.
+ * Reporting routes — daily close (Z-report) and drawer variance for store operators.
  */
 import { Role } from "@prisma/client";
 import { Router } from "express";
@@ -14,6 +14,15 @@ import { resolveStoreScope } from "../lib/storeScope.js";
 const dailyCloseQuery = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   storeId: z.string().min(1).optional(),
+});
+
+const drawerVarianceQuery = z.object({
+  storeId: z.string().min(1).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  threshold: z.coerce.number().nonnegative().optional(),
+  tolerance: z.coerce.number().nonnegative().optional(),
+  minStreak: z.coerce.number().int().min(2).optional(),
 });
 
 function handleError(res: import("express").Response, error: unknown): void {
@@ -46,6 +55,26 @@ reportsRouter.get(
         parsed.data.date,
         req.user!,
       );
+      res.status(200).json(report);
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+reportsRouter.get(
+  "/drawer-variance",
+  requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const parsed = drawerVarianceQuery.safeParse(req.query);
+      if (!parsed.success) {
+        res
+          .status(400)
+          .json({ error: "Invalid drawer-variance query", details: parsed.error.flatten() });
+        return;
+      }
+      const report = await reportsService.getDrawerVarianceReport(req.user!, parsed.data);
       res.status(200).json(report);
     } catch (error) {
       handleError(res, error);
