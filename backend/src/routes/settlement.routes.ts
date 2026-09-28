@@ -4,8 +4,8 @@
  * Restricted to STORE_ADMIN (own store) and COOP_ADMIN (any store). Cashiers cannot
  * record payouts — settlement moves co-op cash and must stay with store/co-op admins.
  *
- * GET /settlement/network-summary is registered before /:storeId/* so Express does not
- * treat "network-summary" as a storeId.
+ * GET /settlement/network-summary and /network-cash-position are registered before /:storeId/*
+ * so Express does not treat them as a storeId.
  *
  * Network rollup was deferred until single-store settlement was correct — otherwise a
  * scoping bug would silently mix two stores' accruals and be hard to notice.
@@ -18,6 +18,7 @@ import { clientIp } from "../lib/audit.js";
 import { authMiddleware } from "../middleware/auth.middleware.js";
 import { requirePasswordChanged } from "../middleware/requirePasswordChanged.middleware.js";
 import { requireRole } from "../middleware/requireRole.middleware.js";
+import * as cashService from "../services/cash.service.js";
 import * as settlementService from "../services/settlement.service.js";
 
 const createPayoutSchema = z.object({
@@ -51,6 +52,31 @@ settlementRouter.get(
     try {
       const summary = await settlementService.getNetworkSettlementSummary();
       res.status(200).json(summary);
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+settlementRouter.get(
+  "/network-cash-position",
+  requireRole(Role.COOP_ADMIN),
+  async (_req, res) => {
+    try {
+      res.status(200).json(await cashService.getNetworkCashPositions());
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+settlementRouter.get(
+  "/:storeId/cash-position",
+  requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      settlementService.assertSettlementAccess(req.user!, req.params.storeId);
+      res.status(200).json(await cashService.getStoreCashPosition(req.params.storeId));
     } catch (error) {
       handleError(res, error);
     }

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type StatTone = "default" | "capital" | "alert";
+export type StatTone = "default" | "capital" | "warning" | "alert";
 
 export type StatCardProps = {
   label: string;
@@ -9,7 +9,7 @@ export type StatCardProps = {
   subLine?: ReactNode;
   /**
    * default = ink; capital = brand-gold for member equity (never confuse with revenue);
-   * alert = state-danger.
+   * warning = state-warning (needs attention soon); alert = state-danger.
    */
   tone?: StatTone;
   className?: string;
@@ -18,6 +18,7 @@ export type StatCardProps = {
 const valueToneClass: Record<StatTone, string> = {
   default: "text-ink",
   capital: "text-brand-gold",
+  warning: "text-state-warning",
   alert: "text-state-danger",
 };
 

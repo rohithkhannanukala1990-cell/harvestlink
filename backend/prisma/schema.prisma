@@ -351,6 +351,10 @@ model CooperativeSettings {
   legalEntityName       String   @default("Harvestlink Cooperative")
   /// US state (or jurisdiction) of incorporation.
   stateOfIncorporation  String   @default("")
+  /// Days a closed shift's cash may sit undeposited before the store is prompted to bank it.
+  /// Twice this is the escalation point. Age matters more than amount: cash outside the bank
+  /// is at risk from robbery, fire or miscount, and every one of those gets worse with time.
+  cashDepositGraceDays  Int      @default(3)
   /// When this settings row was created.
   createdAt             DateTime @default(now())
   /// When settings were last updated.

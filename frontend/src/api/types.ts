@@ -53,8 +53,31 @@ export type CooperativeSettings = {
   fiscalYearEnd: string;
   legalEntityName: string;
   stateOfIncorporation: string;
+  /** Days closed-shift cash may sit undeposited before the store is prompted to bank it. */
+  cashDepositGraceDays: number;
   createdAt: string;
   updatedAt: string;
+};
+
+export type UndepositedDrawer = {
+  drawerId: string;
+  closedAt: string;
+  bankableCash: string;
+  coveredByConfirmedDeposits: string;
+  undeposited: string;
+  ageDays: number;
+};
+
+export type StoreCashPosition = {
+  storeId: string;
+  storeName: string;
+  graceDays: number;
+  cashOnHandByDrawer: UndepositedDrawer[];
+  undepositedTotal: string;
+  oldestUndepositedAt: string | null;
+  daysOutstanding: number;
+  pastGrace: boolean;
+  pastDoubleGrace: boolean;
 };
 
 export type Member = {

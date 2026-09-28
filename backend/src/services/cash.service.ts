@@ -20,11 +20,13 @@ import {
   Role,
   type CashDeposit,
   type CashDrawer,
+  type Store,
   type User,
 } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
+import { getCooperativeSettings } from "./membership.service.js";
 
 type DbClient = Prisma.TransactionClient | typeof prisma;
 
@@ -51,6 +53,20 @@ export type UndepositedDrawer = {
   coveredByConfirmedDeposits: string;
   undeposited: string;
   ageDays: number;
+};
+
+export type StoreCashPosition = {
+  storeId: string;
+  storeName: string;
+  graceDays: number;
+  /** Closed shifts still holding cash not covered by a confirmed deposit, oldest first. */
+  cashOnHandByDrawer: UndepositedDrawer[];
+  undepositedTotal: string;
+  oldestUndepositedAt: Date | null;
+  /** Whole days since the oldest undeposited shift closed; 0 when everything is banked. */
+  daysOutstanding: number;
+  pastGrace: boolean;
+  pastDoubleGrace: boolean;
 };
 
 export type UndepositedCashSummary = {
@@ -442,13 +458,16 @@ export async function disputeDeposit(
  * Closed shifts whose cash is not yet covered by a CONFIRMED deposit, oldest first.
  * RECORDED deposits do not reduce this figure — only bank-confirmed money counts.
  */
-export async function getUndepositedCash(storeId: string): Promise<UndepositedCashSummary> {
+export async function getUndepositedCash(
+  storeId: string,
+  asOf: Date = new Date(),
+): Promise<UndepositedCashSummary> {
   const store = await prisma.store.findUnique({ where: { id: storeId } });
   if (!store) {
     throw new AppError(404, "Store not found");
   }
 
-  const now = Date.now();
+  const now = asOf.getTime();
   const coverage = await loadDrawerCoverage(prisma, storeId);
   const drawers = coverage
     .filter((d) => d.uncovered.gt(0))
@@ -471,5 +490,68 @@ export async function getUndepositedCash(storeId: string): Promise<UndepositedCa
     totalUndeposited: moneyString(total),
     oldestAgeDays: drawers.length > 0 ? drawers[0]!.ageDays : null,
     drawers,
+  };
+}
+
+/**
+ * How long this store's co-op cash has sat outside the bank, measured against the co-op's
+ * grace period. Past grace = more than cashDepositGraceDays; past double grace = more than twice.
+ */
+export async function getStoreCashPosition(
+  storeId: string,
+  asOf: Date = new Date(),
+): Promise<StoreCashPosition> {
+  const store = await prisma.store.findUnique({ where: { id: storeId } });
+  if (!store) {
+    throw new AppError(404, "Store not found");
+  }
+  const settings = await getCooperativeSettings();
+  return buildCashPosition(store, settings.cashDepositGraceDays, asOf);
+}
+
+/** Every store's cash position, worst first: oldest undeposited cash, then largest amount. */
+export async function getNetworkCashPositions(
+  asOf: Date = new Date(),
+): Promise<{ graceDays: number; stores: StoreCashPosition[] }> {
+  const [stores, settings] = await Promise.all([
+    prisma.store.findMany({ orderBy: { name: "asc" } }),
+    getCooperativeSettings(),
+  ]);
+
+  const positions: StoreCashPosition[] = [];
+  for (const store of stores) {
+    positions.push(await buildCashPosition(store, settings.cashDepositGraceDays, asOf));
+  }
+
+  positions.sort(
+    (a, b) =>
+      b.daysOutstanding - a.daysOutstanding ||
+      new Prisma.Decimal(b.undepositedTotal).cmp(a.undepositedTotal) ||
+      a.storeName.localeCompare(b.storeName),
+  );
+
+  return { graceDays: settings.cashDepositGraceDays, stores: positions };
+}
+
+async function buildCashPosition(
+  store: Pick<Store, "id" | "name">,
+  graceDays: number,
+  asOf: Date,
+): Promise<StoreCashPosition> {
+  const undeposited = await getUndepositedCash(store.id, asOf);
+  const oldest = undeposited.drawers[0];
+  const daysOutstanding = oldest?.ageDays ?? 0;
+  const hasCash = new Prisma.Decimal(undeposited.totalUndeposited).gt(0);
+
+  return {
+    storeId: store.id,
+    storeName: store.name,
+    graceDays,
+    cashOnHandByDrawer: undeposited.drawers,
+    undepositedTotal: undeposited.totalUndeposited,
+    oldestUndepositedAt: oldest?.closedAt ?? null,
+    daysOutstanding,
+    pastGrace: hasCash && daysOutstanding > graceDays,
+    pastDoubleGrace: hasCash && daysOutstanding > graceDays * 2,
   };
 }

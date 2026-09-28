@@ -114,9 +114,16 @@ export async function updateCooperativeSettings(
     fiscalYearEnd: string;
     legalEntityName: string;
     stateOfIncorporation: string;
+    cashDepositGraceDays: number;
   }>,
 ): Promise<CooperativeSettings> {
   assertCoopAdmin(actor);
+  if (
+    input.cashDepositGraceDays !== undefined &&
+    (!Number.isInteger(input.cashDepositGraceDays) || input.cashDepositGraceDays < 1)
+  ) {
+    throw new AppError(400, "cashDepositGraceDays must be a whole number of at least 1");
+  }
   const settings = await getCooperativeSettings();
   const updated = await prisma.cooperativeSettings.update({
     where: { id: settings.id },
@@ -132,6 +139,9 @@ export async function updateCooperativeSettings(
         : {}),
       ...(input.stateOfIncorporation !== undefined
         ? { stateOfIncorporation: input.stateOfIncorporation.trim() }
+        : {}),
+      ...(input.cashDepositGraceDays !== undefined
+        ? { cashDepositGraceDays: input.cashDepositGraceDays }
         : {}),
     },
   });

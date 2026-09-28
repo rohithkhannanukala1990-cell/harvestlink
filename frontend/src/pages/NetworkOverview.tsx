@@ -4,11 +4,14 @@
  * APIs:
  * - GET /stores — every store with todaysSales, stockAlertCount, currentlyOwed
  * - GET /settlement/network-summary — co-op-wide rollup totals (Phase 6)
+ * - GET /settlement/network-cash-position — undeposited cash per store, worst first
+ *
+ * Rows follow the cash-position order so the store whose cash has waited longest is on top.
  */
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 import { apiRequest } from "../api/client.ts";
-import type { SettlementSummary, Store } from "../api/types.ts";
+import type { SettlementSummary, Store, StoreCashPosition } from "../api/types.ts";
 import { useAuth } from "../auth/AuthContext.tsx";
 import {
   Button,
@@ -17,6 +20,8 @@ import {
   PageHeader,
   StatCard,
   StatusBadge,
+  cashPositionTone,
+  formatDaysOutstanding,
   formatMoney,
   type DataTableColumn,
 } from "../components/ui";
@@ -50,12 +55,27 @@ export function NetworkOverviewPage() {
     queryFn: () => apiRequest<NetworkSummary>("/settlement/network-summary"),
   });
 
+  const cashQuery = useQuery({
+    queryKey: ["cash-position", "network"],
+    queryFn: () =>
+      apiRequest<{ graceDays: number; stores: StoreCashPosition[] }>(
+        "/settlement/network-cash-position",
+      ),
+  });
+
   function openStoreDashboard(storeId: string) {
     setStoreId(storeId);
     navigate("/");
   }
 
-  const stores = storesQuery.data?.stores ?? [];
+  const cashPositions = cashQuery.data?.stores ?? [];
+  const cashByStore = new Map(cashPositions.map((p) => [p.storeId, p]));
+  const worstFirst = new Map(cashPositions.map((p, index) => [p.storeId, index]));
+  const stores = [...(storesQuery.data?.stores ?? [])].sort(
+    (a, b) =>
+      (worstFirst.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+      (worstFirst.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+  );
   const network = networkQuery.data;
 
   const columns: DataTableColumn<StoreRow>[] = [
@@ -99,6 +119,26 @@ export function NetworkOverviewPage() {
       header: "Currently owed",
       numeric: true,
       cell: (store) => <Money value={store.currentlyOwed} tone="alert" />,
+    },
+    {
+      id: "cash",
+      header: "Cash to deposit",
+      numeric: true,
+      cell: (store) => {
+        const cash = cashByStore.get(store.id);
+        if (!cash) return <span className="text-ink-muted">…</span>;
+        if (Number(cash.undepositedTotal) <= 0) {
+          return <Money value={0} className="text-ink-muted" />;
+        }
+        return (
+          <span className="inline-flex flex-col items-end">
+            <Money value={cash.undepositedTotal} tone={cashPositionTone(cash)} />
+            <span className="text-xs text-ink-muted">
+              {formatDaysOutstanding(cash.daysOutstanding)}
+            </span>
+          </span>
+        );
+      },
     },
     {
       id: "actions",

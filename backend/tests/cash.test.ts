@@ -5,30 +5,12 @@ import { CashDepositStatus, Prisma, Role } from "@prisma/client";
 import { describe, expect, it } from "vitest";
 import * as cashService from "../src/services/cash.service.js";
 import { prisma } from "./helpers/db.js";
-import { createStore, createUser, seedCashierStore } from "./helpers/factories.js";
-
-const DAY = 24 * 60 * 60 * 1000;
-
-async function closedDrawer(
-  storeId: string,
-  openedByUserId: string,
-  input: { openingFloat: number; countedCash: number; closedDaysAgo?: number },
-) {
-  const closedAt = new Date(Date.now() - (input.closedDaysAgo ?? 0) * DAY);
-  return prisma.cashDrawer.create({
-    data: {
-      storeId,
-      openedByUserId,
-      closedByUserId: openedByUserId,
-      openingFloat: new Prisma.Decimal(input.openingFloat),
-      expectedCash: new Prisma.Decimal(input.countedCash),
-      countedCash: new Prisma.Decimal(input.countedCash),
-      variance: new Prisma.Decimal(0),
-      openedAt: new Date(closedAt.getTime() - 8 * 60 * 60 * 1000),
-      closedAt,
-    },
-  });
-}
+import {
+  createClosedDrawer as closedDrawer,
+  createStore,
+  createUser,
+  seedCashierStore,
+} from "./helpers/factories.js";
 
 describe("cash deposits", () => {
   it("counts only bank-confirmed money, at the bank's figure, and flags the discrepancy", async () => {

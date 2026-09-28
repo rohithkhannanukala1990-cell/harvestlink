@@ -5,12 +5,13 @@
  * - GET /sales?from&to — today's sales (CASHIER, STORE_ADMIN, COOP_ADMIN)
  * - GET /products — low-stock flags (same roles; COOP_ADMIN needs storeId)
  * - GET /settlement/:storeId/summary — amount owed (STORE_ADMIN, COOP_ADMIN only)
+ * - GET /settlement/:storeId/cash-position — cash to deposit and its age (same roles)
  *
- * Cashiers see sales + low stock; settlement card is hidden for CASHIER.
+ * Cashiers see sales + low stock; settlement and cash cards are hidden for CASHIER.
  */
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, todayRangeIso } from "../api/client";
-import type { Product, Sale, SettlementSummary } from "../api/types";
+import type { Product, Sale, SettlementSummary, StoreCashPosition } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
 import {
@@ -19,6 +20,9 @@ import {
   PageHeader,
   StatCard,
   StatusBadge,
+  cashPositionPrompt,
+  cashPositionTone,
+  formatDaysOutstanding,
   formatMoney,
   type DataTableColumn,
 } from "../components/ui";
@@ -51,6 +55,13 @@ export function DashboardPage() {
       apiRequest<SettlementSummary>(`/settlement/${activeStoreId}/summary`),
   });
 
+  const cashQuery = useQuery({
+    queryKey: ["cash-position", activeStoreId],
+    enabled: !!activeStoreId && isRole("STORE_ADMIN", "COOP_ADMIN"),
+    queryFn: () =>
+      apiRequest<StoreCashPosition>(`/settlement/${activeStoreId}/cash-position`),
+  });
+
   if (!activeStoreId) {
     return (
       <p className="text-ink-muted">
@@ -62,6 +73,7 @@ export function DashboardPage() {
   const todaysSales = salesQuery.data?.sales.filter((s) => s.paymentStatus === "PAID") ?? [];
   const todaysTotal = todaysSales.reduce((sum, s) => sum + Number(s.total), 0);
   const lowStock = productsQuery.data?.products.filter((p) => p.lowStock) ?? [];
+  const cash = cashQuery.data;
 
   const lowStockColumns: DataTableColumn<Product>[] = [
     {
@@ -91,7 +103,7 @@ export function DashboardPage() {
   return (
     <div className="space-y-6">
       <PageHeader title="Dashboard" />
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Today's paid sales"
           value={formatMoney(todaysTotal)}
@@ -121,6 +133,20 @@ export function DashboardPage() {
                 <Money value={settlementQuery.data?.totalPaidOut ?? 0} />
               </>
             }
+          />
+        )}
+        {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+          <StatCard
+            label="Cash to deposit"
+            value={
+              !cash
+                ? "…"
+                : Number(cash.undepositedTotal) > 0
+                  ? `${formatMoney(cash.undepositedTotal)} · ${formatDaysOutstanding(cash.daysOutstanding)}`
+                  : formatMoney(0)
+            }
+            subLine={cash ? cashPositionPrompt(cash) : undefined}
+            tone={cash ? cashPositionTone(cash) : "default"}
           />
         )}
       </div>

@@ -1,7 +1,17 @@
 /**
  * Factories for money-path tests — store, users, products, members.
  */
-import { MemberStatus, LotStatus, Prisma, Role, type Member, type Product, type Store, type User } from "@prisma/client";
+import {
+  MemberStatus,
+  LotStatus,
+  Prisma,
+  Role,
+  type CashDrawer,
+  type Member,
+  type Product,
+  type Store,
+  type User,
+} from "@prisma/client";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { prisma } from "./db.js";
@@ -115,6 +125,28 @@ export async function createMember(input?: {
     data: { memberId: member.id },
   });
   return member;
+}
+
+/** A counted, closed drawer shift; bankable cash = countedCash − openingFloat. */
+export async function createClosedDrawer(
+  storeId: string,
+  openedByUserId: string,
+  input: { openingFloat: number; countedCash: number; closedDaysAgo?: number },
+): Promise<CashDrawer> {
+  const closedAt = new Date(Date.now() - (input.closedDaysAgo ?? 0) * 24 * 60 * 60 * 1000);
+  return prisma.cashDrawer.create({
+    data: {
+      storeId,
+      openedByUserId,
+      closedByUserId: openedByUserId,
+      openingFloat: new Prisma.Decimal(input.openingFloat),
+      expectedCash: new Prisma.Decimal(input.countedCash),
+      countedCash: new Prisma.Decimal(input.countedCash),
+      variance: new Prisma.Decimal(0),
+      openedAt: new Date(closedAt.getTime() - 8 * 60 * 60 * 1000),
+      closedAt,
+    },
+  });
 }
 
 export function asAuthUser(user: User): AuthUser {

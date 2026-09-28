@@ -3,7 +3,7 @@ import type { StatTone } from "./StatCard.tsx";
 export type MoneyProps = {
   /** Decimal amount as a string or number — always rendered with two places ($8.00). */
   value: string | number;
-  /** Matches StatCard tones: default ink, capital gold (equity), alert danger. */
+  /** Matches StatCard tones: default ink, capital gold (equity), warning, alert danger. */
   tone?: StatTone;
   className?: string;
 };
@@ -11,6 +11,7 @@ export type MoneyProps = {
 const toneClass: Record<StatTone, string> = {
   default: "text-ink",
   capital: "text-brand-gold",
+  warning: "text-state-warning",
   alert: "text-state-danger",
 };
 
