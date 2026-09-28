@@ -127,22 +127,26 @@ export async function createMember(input?: {
   return member;
 }
 
-/** A counted, closed drawer shift; bankable cash = countedCash − openingFloat. */
+/**
+ * A counted, closed drawer shift; bankable cash = countedCash − openingFloat.
+ * variance (counted − expected) defaults to 0.
+ */
 export async function createClosedDrawer(
   storeId: string,
   openedByUserId: string,
-  input: { openingFloat: number; countedCash: number; closedDaysAgo?: number },
+  input: { openingFloat: number; countedCash: number; closedDaysAgo?: number; variance?: number },
 ): Promise<CashDrawer> {
   const closedAt = new Date(Date.now() - (input.closedDaysAgo ?? 0) * 24 * 60 * 60 * 1000);
+  const variance = new Prisma.Decimal(input.variance ?? 0);
   return prisma.cashDrawer.create({
     data: {
       storeId,
       openedByUserId,
       closedByUserId: openedByUserId,
       openingFloat: new Prisma.Decimal(input.openingFloat),
-      expectedCash: new Prisma.Decimal(input.countedCash),
+      expectedCash: new Prisma.Decimal(input.countedCash).sub(variance),
       countedCash: new Prisma.Decimal(input.countedCash),
-      variance: new Prisma.Decimal(0),
+      variance,
       openedAt: new Date(closedAt.getTime() - 8 * 60 * 60 * 1000),
       closedAt,
     },

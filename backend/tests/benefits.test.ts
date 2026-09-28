@@ -93,6 +93,9 @@ async function seedMemberWithPercentBenefit(input: {
       maxUsesPerPeriod: input.maxUsesPerPeriod ?? null,
       periodType: input.periodType ?? BenefitPeriod.PER_TRANSACTION,
       createdByUserId: coopAdmin.id,
+      // The DB default (now()) uses the Postgres clock, which can run a few ms ahead of Node's;
+      // resolveBenefits compares against Node's clock, so a just-created benefit could look future-dated.
+      startsAt: new Date(Date.now() - 60_000),
     },
   });
   invalidateBenefitCache();
@@ -181,6 +184,7 @@ describe("member benefit settlement", () => {
         priority: 10,
         description: "10% off product A only",
         createdByUserId: coopAdmin.id,
+        startsAt: new Date(Date.now() - 60_000),
       },
     });
     invalidateBenefitCache();
