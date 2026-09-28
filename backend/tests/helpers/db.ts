@@ -37,6 +37,8 @@ export async function truncateAll(): Promise<void> {
       "Sale",
       "StockAdjustment",
       "Payout",
+      "CashDepositDrawer",
+      "CashDeposit",
       "CashDrawer",
       "Lot",
       "Product",

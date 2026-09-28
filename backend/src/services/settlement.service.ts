@@ -172,7 +172,8 @@ export async function getStoreSettlementSummary(storeId: string): Promise<StoreS
   const operatorAccruedCard = operatorAccrued.sub(operatorAccruedCash);
   const coopAmountCash = grossSalesCash.sub(operatorAccruedCash);
   const coopAmountCard = grossSalesCard.sub(operatorAccruedCard);
-  // No cash deposit ledger exists yet, so no co-op cash is confirmed banked.
+  // Confirmed CashDeposits bank whole-till cash (operator share and tax included), not just the
+  // co-op share, so they cannot be subtracted from coopAmountCash directly.
   const confirmedCashDeposits = new Prisma.Decimal(0);
 
   return {
