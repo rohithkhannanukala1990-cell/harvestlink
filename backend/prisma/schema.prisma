@@ -188,6 +188,8 @@ model Store {
   stockReconciliations StockReconciliation[]
   /// Purchase orders targeted at this store (null on PO = co-op central buy).
   purchaseOrders PurchaseOrder[]
+  /// Physical stock counts taken at this store.
+  stockCounts StockCount[]
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -243,6 +245,12 @@ model User {
   cashDepositsConfirmed CashDeposit[] @relation("CashDepositConfirmedBy")
   /// Cash deposits this user disputed.
   cashDepositsDisputed  CashDeposit[] @relation("CashDepositDisputedBy")
+  /// Stock counts this user created / scheduled.
+  stockCountsCreated  StockCount[] @relation("StockCountCreatedBy")
+  /// Stock counts this user physically counted.
+  stockCountsCounted  StockCount[] @relation("StockCountCountedBy")
+  /// Stock counts this user approved.
+  stockCountsApproved StockCount[] @relation("StockCountApprovedBy")
 
   @@index([storeId])
 }
@@ -296,6 +304,8 @@ model Product {
   goodsReceiptLines GoodsReceiptLine[]
   /// Inventory lots for this product (lot tracking — additive; stock fields unchanged).
   lots Lot[]
+  /// Physical count lines for this product.
+  stockCountLines StockCountLine[]
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
@@ -1405,6 +1415,8 @@ model Lot {
   inventoryWriteOffs InventoryWriteOff[]
   /// Recall line items that quarantine / recall this lot.
   recallLots RecallLot[]
+  /// Physical count lines taken at lot level.
+  stockCountLines StockCountLine[]
 
   /// One lot number per product per store.
   @@unique([productId, lotNumber, storeId])
@@ -1420,6 +1432,106 @@ model Lot {
   @@index([supplierId])
   /// Backward trace: lot → goods receipt line → PO → supplier/FPO.
   @@index([goodsReceiptLineId])
+}
+
+/// What kind of physical count this is.
+enum StockCountType {
+  /// Scheduled partial count (a rotating subset of products).
+  CYCLE
+  /// Wall-to-wall count of everything in the store.
+  FULL
+  /// Ad-hoc check of a specific product or lot.
+  SPOT
+  /// Verifying a delivery against what was receipted.
+  RECEIVING_VERIFY
+}
+
+/// Lifecycle of a stock count. Counts are CANCELLED, never deleted.
+enum StockCountStatus {
+  DRAFT
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// Lifecycle of one line within a stock count.
+enum StockCountLineStatus {
+  PENDING
+  COUNTED
+  RECOUNT_REQUIRED
+  RESOLVED
+}
+
+/// Why counted stock differs from what the system expected.
+/// UNKNOWN is a legitimate answer and must stay available. Forcing a counter to pick a cause they
+/// don't know produces confident wrong data, which is worse than an honest blank.
+enum ShrinkageReason {
+  THEFT_SUSPECTED
+  DAMAGE
+  SPOILAGE
+  EXPIRY
+  RECEIVING_ERROR
+  COUNTING_ERROR
+  SYSTEM_ERROR
+  UNKNOWN
+}
+
+/// A physical count of stock at one store, built on the lot model.
+model StockCount {
+  id               String           @id @default(cuid())
+  storeId          String
+  type             StockCountType
+  status           StockCountStatus @default(DRAFT)
+  scheduledFor     DateTime?
+  /// When counting began — the moment every line's expectedQuantity was frozen.
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdByUserId  String
+  countedByUserId  String?
+  approvedByUserId String?
+  notes            String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  store      Store            @relation(fields: [storeId], references: [id])
+  createdBy  User             @relation("StockCountCreatedBy", fields: [createdByUserId], references: [id])
+  countedBy  User?            @relation("StockCountCountedBy", fields: [countedByUserId], references: [id])
+  approvedBy User?            @relation("StockCountApprovedBy", fields: [approvedByUserId], references: [id])
+  lines      StockCountLine[]
+
+  @@index([storeId, status])
+}
+
+/// One product (or one lot of a product) within a stock count.
+model StockCountLine {
+  id                String               @id @default(cuid())
+  countId           String
+  productId         String
+  /// Null for a product-level count; set when counting a specific lot.
+  lotId             String?
+  /// expectedQuantity is frozen when the count starts. Sales continuing during the count are
+  /// reconciled at approval, not by moving the target — otherwise the variance is meaningless.
+  expectedQuantity  Int
+  /// Null until counted.
+  countedQuantity   Int?
+  /// countedQuantity − expectedQuantity (negative = shrinkage). Null until counted.
+  variance          Int?
+  /// variance × lot unit cost. Null until counted.
+  varianceValue     Decimal?             @db.Decimal(12, 2)
+  reasonCode        ShrinkageReason?
+  recountedQuantity Int?
+  status            StockCountLineStatus @default(PENDING)
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  count   StockCount @relation(fields: [countId], references: [id])
+  product Product    @relation(fields: [productId], references: [id])
+  /// Restrict, not SET NULL: losing the lot would silently turn a lot-level line into a product-level one.
+  lot     Lot?       @relation(fields: [lotId], references: [id], onDelete: Restrict)
+
+  @@index([countId])
+  @@index([productId])
+  @@index([lotId])
 }
 
 /// How serious a recall is — drives regulator / public-notice obligations.
