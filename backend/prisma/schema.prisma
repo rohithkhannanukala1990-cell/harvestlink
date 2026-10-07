@@ -190,6 +190,8 @@ model Store {
   purchaseOrders PurchaseOrder[]
   /// Physical stock counts taken at this store.
   stockCounts StockCount[]
+  /// Scannable codes registered against this store's products.
+  productBarcodes ProductBarcode[]
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -310,11 +312,46 @@ model Product {
   lots Lot[]
   /// Physical count lines for this product.
   stockCountLines StockCountLine[]
+  /// Manufacturer UPC/EAN codes and store-printed labels that identify this product at a scanner.
+  barcodes ProductBarcode[]
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
   /// Two stores may each have "SKU-001"; uniqueness is (storeId, sku).
   @@unique([storeId, sku])
+}
+
+/// What kind of code a ProductBarcode is. A UPC/EAN is the manufacturer's (GS1-registered, carries a
+/// check digit); a SKU is ours. Store-printed labels usually encode the SKU or an internal code.
+enum BarcodeKind {
+  /// GS1 GTIN: UPC-A, UPC-E, EAN-8, EAN-13 or GTIN-14 printed by the manufacturer / packer.
+  GTIN
+  /// Store- or co-op-printed label (shelf tag, produce sticker, FPO crate label without a GTIN).
+  INTERNAL
+}
+
+/// One scannable code for a product. A product may have several (a can and its case, an old and a
+/// new packaging UPC, a store label); a code resolves to exactly one product within a store.
+model ProductBarcode {
+  id              String      @id @default(cuid())
+  /// Denormalised from Product so (storeId, code) can be unique: each store has its own Product row
+  /// for the same manufacturer item, so the same UPC legitimately exists once per store.
+  storeId         String
+  productId       String
+  /// Normalized code (see lib/barcode.ts): GTINs are zero-padded to 14 digits so a UPC-A and the
+  /// same item's EAN-13 collide here instead of silently registering twice.
+  code            String
+  kind            BarcodeKind
+  /// Free-text hint for staff, e.g. "case of 12" or "old packaging".
+  label           String?
+  createdByUserId String?
+  createdAt       DateTime    @default(now())
+
+  store   Store   @relation(fields: [storeId], references: [id])
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, code])
+  @@index([productId])
 }
 
 /// An audited manual change to on-hand stock (shrinkage, recount, receiving correction).
@@ -1419,6 +1456,9 @@ model Lot {
   /// Lot-level cost is the foundation for accurate margin. Two lots of the same product bought at
   /// different prices have different costs; a single product-level cost averages away the truth.
   unitCost           Decimal   @db.Decimal(12, 2)
+  /// Scannable lot label (supplier GS1-128 or a store-printed label), normalized like
+  /// ProductBarcode.code. Scanning it goes straight to this lot — needed for lot-level counts.
+  barcode            String?
   /// When this lot row was created.
   createdAt          DateTime  @default(now())
   /// When this lot was last updated.
@@ -1441,6 +1481,8 @@ model Lot {
 
   /// One lot number per product per store.
   @@unique([productId, lotNumber, storeId])
+  /// A lot barcode resolves to exactly one lot in a store. NULLs (most lots) do not collide.
+  @@unique([storeId, barcode])
   /// FEFO picking query: active lots for a product ordered by expiry.
   @@index([productId, status, expiryDate])
   /// Recall / quarantine sweeps by status.
@@ -1540,7 +1582,8 @@ model StockCountLine {
   countedQuantity   Int?
   countedByUserId   String?
   countedAt         DateTime?
-  /// expectedQuantity minus the lot's live quantity at the moment the latest (re)count was entered:
+  /// expectedQuantity minus the lot's quantity at the moment of the latest (re)count (for an entry
+  /// queued offline, the moment it was physically counted, not when it synced):
   /// net units that left (sales) or came back (restocked refunds) between startCount and counting.
   movementDuringCount Int?
   /// Final counted figure − (expectedQuantity − movementDuringCount): the true variance after
@@ -1552,6 +1595,11 @@ model StockCountLine {
   recountedQuantity Int?
   recountedByUserId String?
   recountedAt       DateTime?
+  /// Client-minted key for the first count submission. A queued offline count is replayed with the
+  /// same key, so a retry after a lost response returns the stored result instead of a 409.
+  countSubmissionKey   String?           @unique
+  /// Same, for the recount submission.
+  recountSubmissionKey String?           @unique
   status            StockCountLineStatus @default(PENDING)
   createdAt         DateTime             @default(now())
   updatedAt         DateTime             @updatedAt

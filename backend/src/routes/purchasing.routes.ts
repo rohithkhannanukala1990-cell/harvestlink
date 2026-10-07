@@ -69,6 +69,7 @@ const receiveSchema = z.object({
         rejectionReason: z.string().optional(),
         unitCostActual: z.number().nonnegative(),
         lotNumber: z.string().min(1).optional().nullable(),
+        lotBarcode: z.string().min(1).max(200).optional().nullable(),
         expiryDate: z.coerce.date().optional().nullable(),
         harvestDate: z.coerce.date().optional().nullable(),
         countryOfOrigin: z.string().optional().nullable(),

@@ -7,6 +7,7 @@ import express, { type Express } from "express";
 import helmet from "helmet";
 import { env } from "./config/env.js";
 import { authRouter } from "./routes/auth.routes.js";
+import { barcodeRouter } from "./routes/barcode.routes.js";
 import { auditRouter } from "./routes/audit.routes.js";
 import { drawerRouter } from "./routes/drawer.routes.js";
 import { inventoryRouter } from "./routes/inventory.routes.js";
@@ -84,6 +85,7 @@ export function createApp(): Express {
   app.use("/traceability", traceabilityRouter);
   app.use("/recalls", recallRouter);
   app.use("/stock-counts", stockCountRouter);
+  app.use("/barcodes", barcodeRouter);
 
   return app;
 }

@@ -160,6 +160,8 @@ export type LotStatus =
 export type Lot = {
   id: string;
   lotNumber: string;
+  /** Scannable lot label (normalized), when the lot carries its own barcode. */
+  barcode: string | null;
   productId: string;
   sku: string;
   productName: string;
@@ -174,6 +176,16 @@ export type Lot = {
   countryOfOrigin: string | null;
   supplier: { id: string; name: string } | null;
   daysUntilExpiry: number | null;
+};
+
+/** GET /barcodes/products/:productId — UPC/EAN (GTIN) from the manufacturer, or a store code. */
+export type ProductBarcode = {
+  id: string;
+  productId: string;
+  code: string;
+  kind: "GTIN" | "INTERNAL";
+  label: string | null;
+  createdAt: string;
 };
 
 export type SettlementSummary = {
@@ -253,6 +265,53 @@ export type DailyCloseReport = {
     shifts: VarianceShift[];
     patterns: VariancePattern[];
   };
+};
+
+export type CountLineStatus = "PENDING" | "COUNTED" | "RECOUNT_REQUIRED" | "RESOLVED";
+export type StockCountStatus = "DRAFT" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+
+/** GET /stock-counts — list rows carry no quantities. */
+export type StockCountSummary = {
+  id: string;
+  type: "FULL" | "CYCLE" | "SPOT";
+  status: StockCountStatus;
+  scheduledFor: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  approvedAt: string | null;
+  lineCount: number;
+  scheduledBySystem: boolean;
+  createdAt: string;
+};
+
+/** One lot to count. Blind by construction: no expected quantity, variance or anyone's figure. */
+export type StockCountSheetLine = {
+  id: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  lotId: string | null;
+  lotNumber: string | null;
+  expiryDate: string | null;
+  /** Normalized codes (see scanner/barcode.ts) for resolving scans offline. */
+  productBarcodes: string[];
+  lotBarcode: string | null;
+  status: CountLineStatus;
+  countedByYou: boolean;
+  recountByAnotherPerson: boolean;
+};
+
+/** GET /stock-counts/:id — the counter's view. */
+export type StockCountSheet = {
+  id: string;
+  storeId: string;
+  type: StockCountSummary["type"];
+  status: StockCountStatus;
+  scheduledFor: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  notes: string | null;
+  lines: StockCountSheetLine[];
 };
 
 export type ShrinkageSource =

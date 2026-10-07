@@ -29,6 +29,10 @@ const createCountSchema = z.object({
 
 const submitLineSchema = z.object({
   countedQuantity: z.number().int().nonnegative(),
+  /** Offline queue fields — see stockCountService.CountSubmission. */
+  idempotencyKey: z.string().min(8).max(128).optional(),
+  countedAt: z.coerce.date().optional(),
+  sentAt: z.coerce.date().optional(),
 });
 
 const approveSchema = z.object({
@@ -144,6 +148,11 @@ stockCountRouter.post("/:id/lines/:lineId/count", async (req, res) => {
       req.params.lineId,
       parsed.data.countedQuantity,
       clientIp(req),
+      {
+        idempotencyKey: parsed.data.idempotencyKey,
+        countedAt: parsed.data.countedAt,
+        sentAt: parsed.data.sentAt,
+      },
     );
     res.status(200).json(result);
   } catch (error) {

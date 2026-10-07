@@ -1,12 +1,21 @@
 /**
- * Back-door receiving UI — large touch targets, SKU scan/type, quantity keypad.
+ * Back-door receiving UI — large touch targets, barcode scan, quantity keypad.
  * Over/short receipts require explicit acknowledgement checkboxes before submit.
+ *
+ * Scanning (keyboard-wedge, see scanner/useScanner):
+ * - With focus on the lot number or lot label field, a scan fills that field.
+ * - Anywhere else, a scan selects the PO line for the product (manufacturer barcode, our SKU, or the
+ *   GTIN inside a GS1-128 case label). A GS1 label also fills lot number and expiry when they are
+ *   still empty on that line.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
 import type { PurchaseOrder, PurchaseOrderLine } from "../api/types";
+import { normalizeBarcode, parseGs1 } from "../scanner/barcode";
+import { lookupBarcode } from "../scanner/lookup";
+import { useScanner } from "../scanner/useScanner";
 import {
   Button,
   Card,
@@ -17,6 +26,15 @@ import {
   StatusBadge,
 } from "../components/ui";
 
+type ScanTarget = "lotNumber" | "lotBarcode";
+
+function focusedScanTarget(): ScanTarget | null {
+  const el = document.activeElement;
+  if (!(el instanceof HTMLElement)) return null;
+  const target = el.dataset.scanTarget;
+  return target === "lotNumber" || target === "lotBarcode" ? target : null;
+}
+
 type LineDraft = {
   poLineId: string;
   quantityReceived: string;
@@ -24,6 +42,7 @@ type LineDraft = {
   rejectionReason: string;
   unitCostActual: string;
   lotNumber: string;
+  lotBarcode: string;
   expiryDate: string;
   countryOfOrigin: string;
   acknowledgeOverReceipt: boolean;
@@ -59,6 +78,7 @@ export function ReceiveGoodsPage() {
           rejectionReason: "",
           unitCostActual: String(line.unitCost),
           lotNumber: "",
+          lotBarcode: "",
           expiryDate: "",
           countryOfOrigin: "",
           acknowledgeOverReceipt: false,
@@ -106,17 +126,76 @@ export function ReceiveGoodsPage() {
     setActiveQty(`${activeDraft.quantityReceived}${digit}`.replace(/^0+(?=\d)/, ""));
   }
 
+  const patchDraft = useCallback((lineId: string, patch: Partial<LineDraft>) => {
+    setDrafts((prev) => (prev[lineId] ? { ...prev, [lineId]: { ...prev[lineId], ...patch } } : prev));
+  }, []);
+
+  /** Select the open PO line for a scanned or typed product code; fill lot details from GS1. */
+  const selectByCode = useCallback(
+    async (raw: string) => {
+      if (!po || !raw.trim()) return;
+      const typed = raw.trim().toLowerCase();
+      const gs1 = parseGs1(raw);
+      let line = openLines.find((l) => l.product?.sku.toLowerCase() === typed);
+      if (!line) {
+        try {
+          const storeId = po.storeId ?? openLines[0]?.product?.storeId ?? null;
+          const result = await lookupBarcode(storeId, raw);
+          const lotLabel = result.matches.find((m) => m.matchedBy === "LOT_BARCODE");
+          if (lotLabel) {
+            setMessage(
+              `${result.code} is already the label of lot ${lotLabel.lot?.lotNumber} (${lotLabel.product.name}). Scan the product barcode instead.`,
+            );
+            return;
+          }
+          const productIds = new Set(result.matches.map((m) => m.product.id));
+          line = openLines.find((l) => productIds.has(l.productId));
+        } catch (err) {
+          setMessage(err instanceof ApiError ? err.message : "Barcode lookup failed — try the SKU");
+          return;
+        }
+      }
+      if (!line) {
+        setMessage(`Nothing on this PO matches ${normalizeBarcode(raw).code}`);
+        return;
+      }
+      setActiveLineId(line.id);
+      const current = drafts[line.id];
+      const fill: Partial<LineDraft> = {};
+      if (gs1?.lot && !current?.lotNumber) fill.lotNumber = gs1.lot;
+      const expiry = gs1?.expiry ?? gs1?.bestBefore;
+      if (expiry && !current?.expiryDate) fill.expiryDate = expiry;
+      patchDraft(line.id, fill);
+      const filled = [fill.lotNumber && `lot ${fill.lotNumber}`, fill.expiryDate && `expiry ${fill.expiryDate}`]
+        .filter(Boolean)
+        .join(", ");
+      setMessage(`Selected ${line.product?.name}${filled ? ` — ${filled} from the label` : ""}`);
+      setSkuInput("");
+    },
+    [po, openLines, drafts, patchDraft],
+  );
+
+  const handleScan = useCallback(
+    (raw: string) => {
+      const target = focusedScanTarget();
+      if (target && activeLine) {
+        if (target === "lotBarcode") {
+          patchDraft(activeLine.id, { lotBarcode: normalizeBarcode(raw).code });
+        } else {
+          const gs1 = parseGs1(raw);
+          patchDraft(activeLine.id, { lotNumber: gs1?.lot ?? raw.trim() });
+        }
+        return;
+      }
+      void selectByCode(raw);
+    },
+    [activeLine, patchDraft, selectByCode],
+  );
+
+  useScanner(handleScan, { enabled: openLines.length > 0 });
+
   function findBySku() {
-    const sku = skuInput.trim().toLowerCase();
-    if (!sku || !po) return;
-    const match = openLines.find((l) => l.product?.sku.toLowerCase() === sku);
-    if (!match) {
-      setMessage(`No open PO line for SKU ${skuInput}`);
-      return;
-    }
-    setActiveLineId(match.id);
-    setMessage(`Selected ${match.product?.name}`);
-    setSkuInput("");
+    void selectByCode(skuInput);
   }
 
   const remaining = (line: PurchaseOrderLine) =>
@@ -138,6 +217,7 @@ export function ReceiveGoodsPage() {
           rejectionReason: d.rejectionReason || undefined,
           unitCostActual: Number(d.unitCostActual),
           lotNumber: d.lotNumber.trim() || undefined,
+          lotBarcode: d.lotBarcode.trim() || undefined,
           expiryDate: d.expiryDate || undefined,
           countryOfOrigin: d.countryOfOrigin.trim() || undefined,
           acknowledgeOverReceipt: d.acknowledgeOverReceipt || undefined,
@@ -191,7 +271,7 @@ export function ReceiveGoodsPage() {
 
       <div className="flex gap-2">
         <Field
-          label="Scan or type SKU"
+          label="Scan a product or type its SKU"
           className="flex-1"
           size="lg"
           autoFocus
@@ -203,7 +283,8 @@ export function ReceiveGoodsPage() {
               findBySku();
             }
           }}
-          placeholder="SKU"
+          placeholder="Barcode or SKU"
+          autoComplete="off"
         />
         <div className="flex items-end">
           <Button type="button" size="lg" onClick={findBySku}>
@@ -287,6 +368,18 @@ export function ReceiveGoodsPage() {
                 placeholder="Scan or type lot #"
                 autoComplete="off"
                 className="font-mono"
+                data-scan-target="lotNumber"
+              />
+              <Field
+                label="Lot label barcode (optional)"
+                hint="If the case carries its own lot barcode, scan it here so counts and lookups find this lot directly."
+                size="lg"
+                value={activeDraft.lotBarcode}
+                onChange={(e) => patchDraft(activeLine.id, { lotBarcode: e.target.value })}
+                placeholder="Scan the lot label"
+                autoComplete="off"
+                className="font-mono"
+                data-scan-target="lotBarcode"
               />
               <Field
                 label="Expiry / use-by date"

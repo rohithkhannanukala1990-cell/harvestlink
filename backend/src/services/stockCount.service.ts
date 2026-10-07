@@ -62,6 +62,9 @@ export type CounterLineView = {
   lotId: string | null;
   lotNumber: string | null;
   expiryDate: Date | null;
+  /** Normalized product codes, so a device can resolve scans against the count while offline. */
+  productBarcodes: string[];
+  lotBarcode: string | null;
   status: StockCountLineStatus;
   countedByYou: boolean;
   /** True when a different person should take this recount (the viewer did the first count). */
@@ -743,10 +746,59 @@ async function otherCountersAvailable(
 }
 
 /**
+ * How a count was captured, for submissions replayed from a device's offline queue.
+ *
+ * countedAt and sentAt are both the DEVICE's clock. The server corrects countedAt by the device's
+ * skew (server receive time − sentAt), so a tablet whose clock is ten minutes slow does not
+ * misplace the count against sales. The result is clamped to [startedAt, now].
+ */
+export type CountSubmission = {
+  /** Minted once per entry on the device; a retry with the same key is a replay, not a recount. */
+  idempotencyKey?: string | null;
+  countedAt?: Date | null;
+  sentAt?: Date | null;
+};
+
+type SubmitResult = { lineId: string; status: StockCountLineStatus; replayed?: true };
+
+async function findSubmission(db: DbClient, key: string) {
+  return db.stockCountLine.findFirst({
+    where: { OR: [{ countSubmissionKey: key }, { recountSubmissionKey: key }] },
+    select: { id: true, countId: true, status: true },
+  });
+}
+
+function replayOf(
+  existing: { id: string; countId: string; status: StockCountLineStatus },
+  countId: string,
+  lineId: string,
+): SubmitResult {
+  if (existing.id !== lineId || existing.countId !== countId) {
+    throw new AppError(409, "idempotencyKey was already used for a different count line");
+  }
+  return { lineId, status: existing.status, replayed: true };
+}
+
+/** The physical moment of the count on the server's clock: see CountSubmission. */
+function resolveCountedAt(submission: CountSubmission | undefined, startedAt: Date | null, now: Date): Date {
+  if (!submission?.countedAt) return now;
+  let t = submission.countedAt.getTime();
+  if (submission.sentAt) t += now.getTime() - submission.sentAt.getTime();
+  t = Math.min(t, now.getTime());
+  if (startedAt) t = Math.max(t, startedAt.getTime());
+  return new Date(t);
+}
+
+/**
  * Records a physical count for one line.
  *
- * The lot's live quantityRemaining is read at this moment, so the variance already accounts for
- * every sale (and restocked refund) between startCount and now: see approveCount for why.
+ * The variance is measured against the lot as it stood at the moment of counting, so it already
+ * accounts for every sale between startCount and the count: see approveCount for why. Online,
+ * that is the live quantityRemaining. For an entry queued offline and synced later, units paid
+ * from the lot after countedAt are added back — they were still on the shelf when the counter
+ * looked. Restocked refunds in that gap are not reconstructed (refunds do not record which lot
+ * took the units back until finalize); they are rare in the minutes a stockroom is out of signal,
+ * and would show as a small shortfall that the review screen's movement column makes visible.
  *
  * First count over the recount threshold → RECOUNT_REQUIRED. The recount must be entered by a
  * different person unless nobody else on the store's staff can do it; the recount figure stands
@@ -758,10 +810,12 @@ export async function submitCountLine(
   lineId: string,
   countedQuantity: number,
   ipAddress?: string | null,
-): Promise<{ lineId: string; status: StockCountLineStatus }> {
+  submission?: CountSubmission,
+): Promise<SubmitResult> {
   if (!Number.isInteger(countedQuantity) || countedQuantity < 0) {
     throw new AppError(400, "countedQuantity must be a non-negative whole number");
   }
+  const key = submission?.idempotencyKey?.trim() || null;
 
   const settings = await getCooperativeSettings();
   const thresholds = {
@@ -771,6 +825,13 @@ export async function submitCountLine(
 
   return prisma.$transaction(async (tx) => {
     const count = await loadCount(tx, actor, countId);
+
+    // A replay must succeed even if the count has since moved on (e.g. was completed).
+    if (key) {
+      const existing = await findSubmission(tx, key);
+      if (existing) return replayOf(existing, countId, lineId);
+    }
+
     if (count.status !== StockCountStatus.IN_PROGRESS) {
       throw new AppError(409, "Lines can only be counted while the count is IN_PROGRESS", {
         status: count.status,
@@ -798,10 +859,20 @@ export async function submitCountLine(
       where: { id: line.lotId },
       select: { quantityRemaining: true, unitCost: true },
     });
-    const movementDuringCount = line.expectedQuantity - lot.quantityRemaining;
-    const variance = countedQuantity - lot.quantityRemaining;
-    const varianceValue = moneyDec(lot.unitCost.mul(variance));
     const now = new Date();
+    const countedAt = resolveCountedAt(submission, count.startedAt, now);
+    let paidSinceCount = 0;
+    if (countedAt < now) {
+      const sold = await tx.saleItemLot.aggregate({
+        where: { lotId: line.lotId, saleItem: { sale: { paidAt: { gt: countedAt, lte: now } } } },
+        _sum: { quantity: true },
+      });
+      paidSinceCount = sold._sum.quantity ?? 0;
+    }
+    const quantityAtCount = lot.quantityRemaining + paidSinceCount;
+    const movementDuringCount = line.expectedQuantity - quantityAtCount;
+    const variance = countedQuantity - quantityAtCount;
+    const varianceValue = moneyDec(lot.unitCost.mul(variance));
 
     let status: StockCountLineStatus;
     let data: Prisma.StockCountLineUncheckedUpdateManyInput;
@@ -810,20 +881,22 @@ export async function submitCountLine(
       data = {
         recountedQuantity: countedQuantity,
         recountedByUserId: actor.id,
-        recountedAt: now,
+        recountedAt: countedAt,
+        recountSubmissionKey: key,
         movementDuringCount,
         variance,
         varianceValue,
         status,
       };
     } else {
-      status = exceedsRecountThreshold(lot.quantityRemaining, variance, varianceValue, thresholds)
+      status = exceedsRecountThreshold(quantityAtCount, variance, varianceValue, thresholds)
         ? StockCountLineStatus.RECOUNT_REQUIRED
         : StockCountLineStatus.COUNTED;
       data = {
         countedQuantity,
         countedByUserId: actor.id,
-        countedAt: now,
+        countedAt,
+        countSubmissionKey: key,
         movementDuringCount,
         variance,
         varianceValue,
@@ -836,6 +909,11 @@ export async function submitCountLine(
       data,
     });
     if (claimed.count !== 1) {
+      // The same queued entry arriving twice at once: the other request won, so this is a replay.
+      if (key) {
+        const existing = await findSubmission(tx, key);
+        if (existing) return replayOf(existing, countId, lineId);
+      }
       throw new AppError(409, "This line was just counted by someone else");
     }
 
@@ -862,6 +940,7 @@ export async function submitCountLine(
           recount: isRecount,
           status,
           ...(sameCounterRecount ? { sameCounterRecount: true } : {}),
+          ...(submission?.countedAt ? { queuedOffline: true, countedAt: countedAt.toISOString() } : {}),
         },
         ipAddress: ipAddress ?? null,
       },
@@ -1020,8 +1099,8 @@ export async function getCountForCounter(
       lotId: true,
       status: true,
       countedByUserId: true,
-      product: { select: { sku: true, name: true } },
-      lot: { select: { lotNumber: true, expiryDate: true } },
+      product: { select: { sku: true, name: true, barcodes: { select: { code: true } } } },
+      lot: { select: { lotNumber: true, expiryDate: true, barcode: true } },
     },
     orderBy: [{ product: { name: "asc" } }, { lot: { lotNumber: "asc" } }],
   });
@@ -1043,6 +1122,8 @@ export async function getCountForCounter(
       lotId: line.lotId,
       lotNumber: line.lot?.lotNumber ?? null,
       expiryDate: line.lot?.expiryDate ?? null,
+      productBarcodes: line.product.barcodes.map((b) => b.code),
+      lotBarcode: line.lot?.barcode ?? null,
       status: line.status,
       countedByYou: line.countedByUserId === actor.id,
       recountByAnotherPerson:

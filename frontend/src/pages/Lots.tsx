@@ -1,13 +1,20 @@
 /**
  * Lots page — search by lot number, filter status/expiry, trace forward, quarantine.
+ *
+ * Scanning (keyboard-wedge, see scanner/useScanner): a scan looks the code up as a lot label, a GS1
+ * case label, a product barcode, a SKU or a lot number and narrows the list to what it found.
+ * While an admin is setting a lot's label, the next scan fills the label field instead.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
 import type { Lot, LotStatus } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { formatExpiry } from "../lib/lotDisplay";
+import { normalizeBarcode } from "../scanner/barcode";
+import { lookupBarcode } from "../scanner/lookup";
+import { useScanner } from "../scanner/useScanner";
 import {
   Button,
   Card,
@@ -53,6 +60,65 @@ export function LotsPage() {
   const [expiryWithinDays, setExpiryWithinDays] = useState<string>("");
   const [traceLotId, setTraceLotId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [labelLot, setLabelLot] = useState<Lot | null>(null);
+  const [labelInput, setLabelInput] = useState("");
+
+  const handleScan = useCallback(
+    async (raw: string) => {
+      if (labelLot) {
+        setLabelInput(normalizeBarcode(raw).code);
+        return;
+      }
+      try {
+        const result = await lookupBarcode(activeStoreId, raw);
+        const lotMatches = result.matches.filter((m) => m.lot);
+        if (lotMatches.length === 1) {
+          const m = lotMatches[0]!;
+          setSearch(m.lot!.lotNumber);
+          setMessage(`Lot ${m.lot!.lotNumber} · ${m.product.name}`);
+        } else if (result.matches.length > 0) {
+          const product = result.matches[0]!.product;
+          setSearch(product.sku);
+          setMessage(
+            result.gs1?.lot
+              ? `${product.name} — lot ${result.gs1.lot} from the label is not on file; showing all lots of the product`
+              : `${product.name} — showing its lots`,
+          );
+        } else {
+          setMessage(`Nothing in this store matches ${result.code}`);
+        }
+        setStatus("");
+        setExpiryWithinDays("");
+      } catch (err) {
+        setMessage(err instanceof ApiError ? err.message : "Barcode lookup failed");
+      }
+    },
+    [activeStoreId, labelLot],
+  );
+
+  useScanner(
+    useCallback((raw: string) => void handleScan(raw), [handleScan]),
+    { enabled: !!activeStoreId },
+  );
+
+  const saveLabel = useMutation({
+    mutationFn: (input: { lot: Lot; barcode: string | null }) =>
+      apiRequest<{ lot: Lot }>(`/barcodes/lots/${input.lot.id}`, {
+        method: "PUT",
+        body: { barcode: input.barcode, ...(activeStoreId ? { storeId: activeStoreId } : {}) },
+      }),
+    onSuccess: (_data, input) => {
+      setMessage(
+        input.barcode
+          ? `Lot ${input.lot.lotNumber} label set`
+          : `Lot ${input.lot.lotNumber} label removed`,
+      );
+      setLabelLot(null);
+      setLabelInput("");
+      void qc.invalidateQueries({ queryKey: ["lots"] });
+    },
+    onError: (err) => setMessage(err instanceof ApiError ? err.message : "Could not save the label"),
+  });
 
   const params = useMemo(() => {
     const p = new URLSearchParams();
@@ -103,7 +169,16 @@ export function LotsPage() {
     {
       id: "lot",
       header: "Lot #",
-      cell: (lot) => <span className="font-mono text-xs">{lot.lotNumber}</span>,
+      cell: (lot) => (
+        <div>
+          <div className="font-mono text-xs">{lot.lotNumber}</div>
+          {lot.barcode && (
+            <div className="font-mono text-xs text-ink-muted" title="Lot label barcode">
+              ▮ {lot.barcode}
+            </div>
+          )}
+        </div>
+      ),
     },
     {
       id: "product",
@@ -170,6 +245,18 @@ export function LotsPage() {
                 Quarantine
               </Button>
             )}
+            {canQuarantine && (
+              <Button
+                type="button"
+                variant="quiet"
+                onClick={() => {
+                  setLabelLot(lot);
+                  setLabelInput(lot.barcode ?? "");
+                }}
+              >
+                Label
+              </Button>
+            )}
             {isRole("COOP_ADMIN") && (
               <Link
                 className="text-sm font-semibold text-brand-terracotta-ink underline"
@@ -188,8 +275,59 @@ export function LotsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Lots"
-        description="Search by lot number or product. Trace opens the forward recall list. Quarantine pulls stock from sale immediately."
+        description="Scan a lot label or product barcode, or search by lot number or product. Trace opens the forward recall list. Quarantine pulls stock from sale immediately."
       />
+
+      {labelLot && (
+        <Card
+          title={`Lot label · ${labelLot.lotNumber}`}
+          actions={
+            <Button
+              type="button"
+              variant="quiet"
+              onClick={() => {
+                setLabelLot(null);
+                setLabelInput("");
+              }}
+            >
+              Cancel
+            </Button>
+          }
+        >
+          <form
+            className="flex flex-wrap items-end gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveLabel.mutate({ lot: labelLot, barcode: labelInput.trim() || null });
+            }}
+          >
+            <Field
+              label="Scan the label on the case, or type it"
+              className="min-w-[16rem] flex-1"
+              size="lg"
+              autoFocus
+              value={labelInput}
+              onChange={(e) => setLabelInput(e.target.value)}
+              autoComplete="off"
+              hint={`${labelLot.productName} · ${labelLot.sku}. A code can mean only one thing in this store.`}
+            />
+            <Button type="submit" size="lg" loading={saveLabel.isPending}>
+              Save
+            </Button>
+            {labelLot.barcode && (
+              <Button
+                type="button"
+                size="lg"
+                variant="destructive"
+                disabled={saveLabel.isPending}
+                onClick={() => saveLabel.mutate({ lot: labelLot, barcode: null })}
+              >
+                Remove
+              </Button>
+            )}
+          </form>
+        </Card>
+      )}
 
       {message && (
         <p className="rounded-md border border-border-hairline bg-surface-raised px-3 py-2 text-sm text-ink">

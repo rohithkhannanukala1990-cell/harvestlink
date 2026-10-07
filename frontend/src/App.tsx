@@ -7,6 +7,7 @@ import type { Role } from "./api/types.ts";
 import { useAuth } from "./auth/AuthContext.tsx";
 import { AppLayout } from "./components/AppLayout.tsx";
 import { AuditPage } from "./pages/Audit.tsx";
+import { CountScanPage } from "./pages/CountScan.tsx";
 import { DailyClosePage } from "./pages/DailyClose.tsx";
 import { DashboardPage } from "./pages/Dashboard.tsx";
 import { DrawerPage } from "./pages/Drawer.tsx";
@@ -23,6 +24,7 @@ import { RecallsPage } from "./pages/Recalls.tsx";
 import { SalesHistoryPage } from "./pages/SalesHistory.tsx";
 import { SettingsPage } from "./pages/Settings.tsx";
 import { SettlementPage } from "./pages/Settlement.tsx";
+import { StockCountsPage } from "./pages/StockCounts.tsx";
 import { ShrinkagePage } from "./pages/Shrinkage.tsx";
 import { SuppliersPage } from "./pages/Suppliers.tsx";
 
@@ -54,6 +56,8 @@ export default function App() {
           <Route path="drawer" element={<DrawerPage />} />
           <Route path="inventory" element={<InventoryPage />} />
           <Route path="lots" element={<LotsPage />} />
+          <Route path="counts" element={<StockCountsPage />} />
+          <Route path="counts/:id" element={<CountScanPage />} />
           <Route path="members" element={<MembersPage />} />
           <Route element={<RequireRoles roles={["COOP_ADMIN"]} />}>
             <Route path="network" element={<NetworkOverviewPage />} />

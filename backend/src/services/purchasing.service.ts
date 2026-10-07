@@ -24,6 +24,7 @@ import {
 } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
+import { claimLotBarcode } from "./barcode.service.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 
@@ -557,6 +558,8 @@ export type ReceiveLineInput = {
   unitCostActual: number;
   /** Dock / supplier lot number; when omitted, auto-generated as {SKU}-{YYYYMMDD}-{receiptId short}. */
   lotNumber?: string | null;
+  /** Scannable label on the case (supplier GS1-128 or a store label) — lets counts scan the lot. */
+  lotBarcode?: string | null;
   /** Sell-by / use-by for the received lot. */
   expiryDate?: Date | string | null;
   /** Harvest date for produce lots. */
@@ -757,9 +760,14 @@ export async function receiveGoods(
           lotNumber = `${lotNumber}-${receiptLine.id.slice(-4)}`;
         }
 
+        const lotBarcode = raw.lotBarcode?.trim()
+          ? await claimLotBarcode(tx, product.storeId, raw.lotBarcode)
+          : null;
+
         const lot = await tx.lot.create({
           data: {
             lotNumber,
+            barcode: lotBarcode,
             productId: product.id,
             storeId: product.storeId,
             supplierId: po.supplierId,

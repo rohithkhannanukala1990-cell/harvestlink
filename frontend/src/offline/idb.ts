@@ -1,15 +1,18 @@
 /**
- * Thin IndexedDB wrapper for Harvestlink POS offline storage.
+ * Thin IndexedDB wrapper for Harvestlink offline storage (POS sales, stock counts).
  *
  * Why IndexedDB (not localStorage): product catalogs and queued sales can exceed
  * localStorage quotas, and we need structured queries by storeId without parsing
  * giant JSON blobs on every render.
  */
 const DB_NAME = "harvestlink-pos";
-const DB_VERSION = 1;
+/** v2 added the stock count stores. Upgrades only ever add stores, so v1 data survives. */
+const DB_VERSION = 2;
 
 export const STORE_CATALOG = "productCatalog";
 export const STORE_QUEUE = "queuedSales";
+export const STORE_COUNT_QUEUE = "queuedCountEntries";
+export const STORE_COUNT_SHEETS = "countSheets";
 
 export type CatalogRecord = {
   /** Composite key: storeId */
@@ -46,6 +49,37 @@ export type QueuedSale = {
   lastError?: string;
 };
 
+/**
+ * One counted quantity captured on the counting screen, waiting to reach the server.
+ * Holds only what the counter typed — never an expected figure. The idempotencyKey is minted when
+ * the counter confirms the quantity and reused on every sync attempt (see countSync).
+ */
+export type QueuedCountEntry = {
+  idempotencyKey: string;
+  countId: string;
+  storeId: string;
+  lineId: string;
+  countedQuantity: number;
+  recount: boolean;
+  /** Device clock when the counter confirmed the quantity — the physical moment of the count. */
+  countedAt: string;
+  /** Snapshots for the pending list. */
+  productName: string;
+  sku: string;
+  lotNumber: string | null;
+  lastError?: string;
+  /** The server refused this entry (4xx). Kept for the counter to see; not retried automatically. */
+  rejected?: boolean;
+};
+
+export type CountSheetRecord = {
+  countId: string;
+  storeId: string;
+  /** The counter view (GET /stock-counts/:id) — no expected quantities by construction. */
+  sheet: unknown;
+  cachedAt: string;
+};
+
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -58,6 +92,13 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_QUEUE)) {
         const queue = db.createObjectStore(STORE_QUEUE, { keyPath: "idempotencyKey" });
         queue.createIndex("byStore", "storeId", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_COUNT_QUEUE)) {
+        const counts = db.createObjectStore(STORE_COUNT_QUEUE, { keyPath: "idempotencyKey" });
+        counts.createIndex("byCount", "countId", { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_COUNT_SHEETS)) {
+        db.createObjectStore(STORE_COUNT_SHEETS, { keyPath: "countId" });
       }
     };
     req.onsuccess = () => resolve(req.result);

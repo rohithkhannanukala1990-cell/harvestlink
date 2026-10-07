@@ -389,6 +389,7 @@ export type LotListItem = {
   receivedAt: Date;
   unitCost: string;
   countryOfOrigin: string | null;
+  barcode: string | null;
   supplier: { id: string; name: string } | null;
   daysUntilExpiry: number | null;
 };
@@ -407,6 +408,7 @@ function toLotListItem(
     receivedAt: Date;
     unitCost: Prisma.Decimal;
     countryOfOrigin: string | null;
+    barcode: string | null;
     product: { sku: string; name: string };
     supplier: { id: string; name: string } | null;
   },
@@ -428,6 +430,7 @@ function toLotListItem(
     receivedAt: lot.receivedAt,
     unitCost: lot.unitCost.toFixed(2),
     countryOfOrigin: lot.countryOfOrigin,
+    barcode: lot.barcode,
     supplier: lot.supplier,
     daysUntilExpiry: lot.expiryDate
       ? Math.ceil((lot.expiryDate.getTime() - now.getTime()) / msPerDay)
@@ -490,6 +493,7 @@ export async function listLots(filter: ListLotsFilter): Promise<LotListItem[]> {
         ? {
             OR: [
               { lotNumber: { contains: q, mode: "insensitive" } },
+              { barcode: { equals: q, mode: "insensitive" } },
               { product: { sku: { contains: q, mode: "insensitive" } } },
               { product: { name: { contains: q, mode: "insensitive" } } },
             ],

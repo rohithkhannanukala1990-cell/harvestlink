@@ -95,6 +95,9 @@ export function AppLayout() {
             <NavLink to="/lots" className={linkClass}>
               Lots
             </NavLink>
+            <NavLink to="/counts" className={linkClass}>
+              Counts
+            </NavLink>
             <NavLink to="/members" className={linkClass}>
               Members
             </NavLink>
