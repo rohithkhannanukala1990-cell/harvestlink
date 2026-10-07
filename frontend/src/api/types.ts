@@ -273,7 +273,7 @@ export type StockCountStatus = "DRAFT" | "IN_PROGRESS" | "COMPLETED" | "CANCELLE
 /** GET /stock-counts — list rows carry no quantities. */
 export type StockCountSummary = {
   id: string;
-  type: "FULL" | "CYCLE" | "SPOT";
+  type: "FULL" | "CYCLE" | "SPOT" | "RECEIVING_VERIFY";
   status: StockCountStatus;
   scheduledFor: string | null;
   startedAt: string | null;
