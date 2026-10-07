@@ -168,56 +168,373 @@ function countableLotWhere(storeId: string, productIds?: string[]): Prisma.LotWh
 }
 
 /**
- * CYCLE selection: products at the store with countable lots, least recently counted first
- * (never-counted before everything), ties broken by stock value at lot cost so the most money is
- * checked soonest. Products already on an open or finished count are "recently counted"; only
- * CANCELLED counts are ignored. Size comes from CooperativeSettings.cycleCountSize.
+ * Counts whose lines have not been applied to stock yet. A product on one of these must not be put
+ * on another count: if both were approved, one shortfall would be written off twice.
  */
-async function selectCycleProducts(storeId: string, size: number): Promise<string[]> {
+export function openCountWhere(storeId: string): Prisma.StockCountWhereInput {
+  return {
+    storeId,
+    OR: [
+      { status: { in: [StockCountStatus.DRAFT, StockCountStatus.IN_PROGRESS] } },
+      { status: StockCountStatus.COMPLETED, approvedAt: null },
+    ],
+  };
+}
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** An ACTIVE lot expiring within this many days pulls its product into the next cycle count. */
+const NEAR_EXPIRY_DAYS = 7;
+/** How many cycles apart each class is due: A every cycle, B every 2nd, C every 4th. */
+const CLASS_INTERVAL_CYCLES = { A: 1, B: 2, C: 4 } as const;
+/** Value on hand at or above this share of highValueThreshold is class B. */
+const CLASS_B_VALUE_SHARE = 0.25;
+/** Top 20% of sellers by units are class A on velocity; the next 30% are class B. */
+const CLASS_A_VELOCITY_SHARE = 0.2;
+const CLASS_B_VELOCITY_SHARE = 0.5;
+
+export type AbcClass = keyof typeof CLASS_INTERVAL_CYCLES;
+
+export type CycleCountReason =
+  | "VARIANCE_LAST_COUNT"
+  | "NEAR_EXPIRY"
+  | "HIGH_VALUE"
+  | "HIGH_VELOCITY"
+  | "NEVER_COUNTED"
+  | "DUE";
+
+export type CycleCountCandidate = {
+  productId: string;
+  sku: string;
+  productName: string;
+  abcClass: AbcClass;
+  reasons: CycleCountReason[];
+  /** Units on hand × lot unit cost across countable lots. */
+  valueOnHand: string;
+  /** Units sold over the last cycleCountFrequencyDays. */
+  unitsSold: number;
+  /** startedAt of the last approved count that included this product. */
+  lastCountedAt: Date | null;
+  score: number;
+};
+
+export type CycleCountSchedule = {
+  storeId: string;
+  generatedAt: Date;
+  frequencyDays: number;
+  size: number;
+  selected: CycleCountCandidate[];
+  /** Due or flagged, but beyond cycleCountSize; they rank higher next cycle as they age. */
+  dueButDeferred: number;
+  /** Skipped because they are already on an open count. */
+  alreadyOnOpenCount: number;
+};
+
+function betterClass(a: AbcClass, b: AbcClass): AbcClass {
+  return a < b ? a : b;
+}
+
+/**
+ * Picks the products for a store's next cycle count, by risk.
+ *
+ * /// ABC-style prioritisation: a few products hold most of the value and most of the risk. Count
+ * /// those often and everything else occasionally, rather than everything rarely.
+ *
+ * Class comes from value on hand at lot cost (A ≥ highValueThreshold, B ≥ a quarter of it) and
+ * from sales velocity over the last cycle (A = top fifth of sellers, B = top half); the better of
+ * the two wins. A product is due when its class interval would lapse before the next cycle, so A
+ * is counted every cycle, B every second and C every fourth. Never-counted products are due.
+ *
+ * Due or not, a product is always included when its last approved count found a variance, or when
+ * an ACTIVE lot expires within NEAR_EXPIRY_DAYS (FEFO failures show up there first).
+ *
+ * Order: those two flags first, then by score = value share + velocity share + staleness, each
+ * 0–1. Products already on an open count are skipped. At most cycleCountSize are selected.
+ */
+export async function generateCycleCountSchedule(
+  storeId: string,
+  now = new Date(),
+): Promise<CycleCountSchedule> {
+  const settings = await getCooperativeSettings();
+  const frequencyDays = settings.cycleCountFrequencyDays;
+  const size = settings.cycleCountSize;
+  const empty: CycleCountSchedule = {
+    storeId,
+    generatedAt: now,
+    frequencyDays,
+    size,
+    selected: [],
+    dueButDeferred: 0,
+    alreadyOnOpenCount: 0,
+  };
+
+  const nearExpiryBy = new Date(now.getTime() + NEAR_EXPIRY_DAYS * MS_PER_DAY);
   const lots = await prisma.lot.findMany({
     where: countableLotWhere(storeId),
-    select: { productId: true, quantityRemaining: true, unitCost: true },
-  });
-  const valueByProduct = new Map<string, Prisma.Decimal>();
-  for (const lot of lots) {
-    const prev = valueByProduct.get(lot.productId) ?? new Prisma.Decimal(0);
-    valueByProduct.set(
-      lot.productId,
-      prev.add(lot.unitCost.mul(Math.max(0, lot.quantityRemaining))),
-    );
-  }
-  const productIds = [...valueByProduct.keys()];
-  if (productIds.length === 0) return [];
-
-  const lastCounted = await prisma.stockCountLine.groupBy({
-    by: ["productId"],
-    where: {
-      productId: { in: productIds },
-      count: { storeId, status: { not: StockCountStatus.CANCELLED } },
+    select: {
+      productId: true,
+      status: true,
+      quantityRemaining: true,
+      unitCost: true,
+      expiryDate: true,
+      product: { select: { sku: true, name: true } },
     },
-    _max: { createdAt: true },
   });
-  const lastByProduct = new Map(
-    lastCounted.map((row) => [row.productId, row._max.createdAt?.getTime() ?? null]),
+  type ProductRisk = { sku: string; name: string; value: Prisma.Decimal; nearExpiry: boolean };
+  const byProduct = new Map<string, ProductRisk>();
+  for (const lot of lots) {
+    const entry = byProduct.get(lot.productId) ?? {
+      sku: lot.product.sku,
+      name: lot.product.name,
+      value: new Prisma.Decimal(0),
+      nearExpiry: false,
+    };
+    entry.value = entry.value.add(lot.unitCost.mul(Math.max(0, lot.quantityRemaining)));
+    if (
+      lot.status === LotStatus.ACTIVE &&
+      lot.quantityRemaining > 0 &&
+      lot.expiryDate &&
+      lot.expiryDate <= nearExpiryBy
+    ) {
+      entry.nearExpiry = true;
+    }
+    byProduct.set(lot.productId, entry);
+  }
+  const productIds = [...byProduct.keys()];
+  if (productIds.length === 0) return empty;
+
+  const since = new Date(now.getTime() - frequencyDays * MS_PER_DAY);
+  const [onOpenRows, soldRows, approvedLines] = await Promise.all([
+    prisma.stockCountLine.findMany({
+      where: { productId: { in: productIds }, count: openCountWhere(storeId) },
+      select: { productId: true },
+      distinct: ["productId"],
+    }),
+    prisma.saleItem.groupBy({
+      by: ["productId"],
+      where: { productId: { in: productIds }, sale: { storeId, paidAt: { gte: since, lte: now } } },
+      _sum: { quantity: true },
+    }),
+    prisma.stockCountLine.findMany({
+      where: { productId: { in: productIds }, count: { storeId, approvedAt: { not: null } } },
+      select: {
+        productId: true,
+        variance: true,
+        countId: true,
+        count: { select: { startedAt: true, approvedAt: true } },
+      },
+    }),
+  ]);
+  const onOpen = new Set(onOpenRows.map((r) => r.productId));
+  const sold = new Map(soldRows.map((r) => [r.productId, r._sum.quantity ?? 0]));
+
+  const lastCount = new Map<string, { countId: string; at: Date; hadVariance: boolean }>();
+  for (const line of approvedLines) {
+    const at = line.count.startedAt ?? line.count.approvedAt!;
+    const current = lastCount.get(line.productId);
+    if (!current || at > current.at) {
+      lastCount.set(line.productId, { countId: line.countId, at, hadVariance: false });
+    }
+  }
+  for (const line of approvedLines) {
+    const last = lastCount.get(line.productId)!;
+    if (line.countId === last.countId && (line.variance ?? 0) !== 0) last.hadVariance = true;
+  }
+
+  const sellers = productIds
+    .filter((id) => (sold.get(id) ?? 0) > 0)
+    .sort((a, b) => sold.get(b)! - sold.get(a)! || a.localeCompare(b));
+  const velocityRank = new Map(sellers.map((id, i) => [id, i]));
+  const topA = Math.ceil(sellers.length * CLASS_A_VELOCITY_SHARE);
+  const topB = Math.ceil(sellers.length * CLASS_B_VELOCITY_SHARE);
+
+  const highValue = settings.highValueThreshold;
+  const classBValue = highValue.mul(CLASS_B_VALUE_SHARE);
+  const maxValue = Math.max(...productIds.map((id) => byProduct.get(id)!.value.toNumber()), 0);
+  const maxSold = Math.max(...sellers.map((id) => sold.get(id)!), 0);
+  const nextCycle = new Date(now.getTime() + frequencyDays * MS_PER_DAY);
+
+  type Ranked = CycleCountCandidate & { flagged: boolean };
+  const ranked: Ranked[] = [];
+  let alreadyOnOpenCount = 0;
+
+  for (const productId of productIds) {
+    const risk = byProduct.get(productId)!;
+    const unitsSold = sold.get(productId) ?? 0;
+    const last = lastCount.get(productId) ?? null;
+
+    const valueClass: AbcClass = risk.value.gte(highValue)
+      ? "A"
+      : risk.value.gte(classBValue)
+        ? "B"
+        : "C";
+    const rank = velocityRank.get(productId);
+    const velocityClass: AbcClass =
+      rank === undefined ? "C" : rank < topA ? "A" : rank < topB ? "B" : "C";
+    const abcClass = betterClass(valueClass, velocityClass);
+
+    const intervalDays = CLASS_INTERVAL_CYCLES[abcClass] * frequencyDays;
+    const nextDueAt = last ? new Date(last.at.getTime() + intervalDays * MS_PER_DAY) : null;
+    const due = !nextDueAt || nextDueAt <= nextCycle;
+    const flagged = (last?.hadVariance ?? false) || risk.nearExpiry;
+    if (!due && !flagged) continue;
+    if (onOpen.has(productId)) {
+      alreadyOnOpenCount += 1;
+      continue;
+    }
+
+    const reasons: CycleCountReason[] = [];
+    if (last?.hadVariance) reasons.push("VARIANCE_LAST_COUNT");
+    if (risk.nearExpiry) reasons.push("NEAR_EXPIRY");
+    if (valueClass === "A") reasons.push("HIGH_VALUE");
+    if (velocityClass === "A") reasons.push("HIGH_VELOCITY");
+    if (!last) reasons.push("NEVER_COUNTED");
+    else if (due) reasons.push("DUE");
+
+    const staleness = last
+      ? Math.min(1, (now.getTime() - last.at.getTime()) / (intervalDays * MS_PER_DAY))
+      : 1;
+    const score =
+      (maxValue > 0 ? risk.value.toNumber() / maxValue : 0) +
+      (maxSold > 0 ? unitsSold / maxSold : 0) +
+      staleness;
+
+    ranked.push({
+      productId,
+      sku: risk.sku,
+      productName: risk.name,
+      abcClass,
+      reasons,
+      valueOnHand: moneyDec(risk.value).toFixed(2),
+      unitsSold,
+      lastCountedAt: last?.at ?? null,
+      score: Math.round(score * 1000) / 1000,
+      flagged,
+    });
+  }
+
+  ranked.sort(
+    (a, b) =>
+      Number(b.flagged) - Number(a.flagged) ||
+      b.score - a.score ||
+      a.productId.localeCompare(b.productId),
   );
 
-  return productIds
-    .sort((a, b) => {
-      const la = lastByProduct.get(a) ?? null;
-      const lb = lastByProduct.get(b) ?? null;
-      if (la === null && lb !== null) return -1;
-      if (la !== null && lb === null) return 1;
-      if (la !== null && lb !== null && la !== lb) return la - lb;
-      const byValue = valueByProduct.get(b)!.cmp(valueByProduct.get(a)!);
-      return byValue !== 0 ? byValue : a.localeCompare(b);
-    })
-    .slice(0, size);
+  return {
+    ...empty,
+    selected: ranked.slice(0, size).map(({ flagged: _flagged, ...candidate }) => candidate),
+    dueButDeferred: Math.max(0, ranked.length - size),
+    alreadyOnOpenCount,
+  };
+}
+
+type NewCountInput = {
+  storeId: string;
+  type: StockCountType;
+  lots: Array<{ id: string; productId: string }>;
+  /** Null when the scheduler creates the count. */
+  createdByUserId: string | null;
+  scheduledFor: Date | null;
+  notes: string | null;
+  ipAddress: string | null;
+  auditAfter: Record<string, Prisma.InputJsonValue>;
+};
+
+async function insertCount(input: NewCountInput): Promise<StockCount> {
+  return prisma.$transaction(async (tx) => {
+    // Serialise count creation per store so two requests cannot both pass the overlap check.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stock_count:${input.storeId}`}))`;
+
+    const productIds = [...new Set(input.lots.map((l) => l.productId))];
+    const clashes = await tx.stockCountLine.findMany({
+      where: { productId: { in: productIds }, count: openCountWhere(input.storeId) },
+      select: { productId: true, countId: true },
+      distinct: ["productId"],
+    });
+    if (clashes.length > 0) {
+      throw new AppError(
+        409,
+        "Some products are already on an open count; finish or cancel that count first",
+        { products: clashes },
+      );
+    }
+
+    const created = await tx.stockCount.create({
+      data: {
+        storeId: input.storeId,
+        type: input.type,
+        createdByUserId: input.createdByUserId,
+        scheduledFor: input.scheduledFor,
+        notes: input.notes,
+      },
+    });
+    await tx.stockCountLine.createMany({
+      data: input.lots.map((lot) => ({
+        countId: created.id,
+        productId: lot.productId,
+        lotId: lot.id,
+        expectedQuantity: 0,
+      })),
+    });
+    await writeAuditLog(
+      {
+        userId: input.createdByUserId,
+        storeId: input.storeId,
+        action: AuditAction.STOCK_COUNT_CREATE,
+        entityType: "StockCount",
+        entityId: created.id,
+        after: { type: input.type, lineCount: input.lots.length, ...input.auditAfter },
+        ipAddress: input.ipAddress,
+      },
+      { tx },
+    );
+    return created;
+  });
+}
+
+function scheduleAudit(schedule: CycleCountSchedule): Record<string, Prisma.InputJsonValue> {
+  return {
+    products: schedule.selected.map((c) => ({
+      productId: c.productId,
+      abcClass: c.abcClass,
+      reasons: c.reasons,
+    })),
+    dueButDeferred: schedule.dueButDeferred,
+  };
+}
+
+/**
+ * Creates the next DRAFT cycle count for a store from generateCycleCountSchedule, with no human
+ * creator. Returns null when nothing is due. Used by the scheduleCycleCounts job.
+ */
+export async function scheduleCycleCount(
+  storeId: string,
+  now = new Date(),
+): Promise<{ countId: string; schedule: CycleCountSchedule } | null> {
+  const schedule = await generateCycleCountSchedule(storeId, now);
+  if (schedule.selected.length === 0) return null;
+
+  const lots = await prisma.lot.findMany({
+    where: countableLotWhere(storeId, schedule.selected.map((c) => c.productId)),
+    select: { id: true, productId: true },
+  });
+  const count = await insertCount({
+    storeId,
+    type: StockCountType.CYCLE,
+    lots,
+    createdByUserId: null,
+    scheduledFor: now,
+    notes: "Scheduled cycle count",
+    ipAddress: null,
+    auditAfter: { scheduledBy: "SYSTEM", ...scheduleAudit(schedule) },
+  });
+  return { countId: count.id, schedule };
 }
 
 /**
  * Creates a DRAFT count with one line per lot. expectedQuantity stays 0 until startCount freezes it.
- * FULL counts every countable lot; CYCLE without ids selects products automatically; SPOT and
- * RECEIVING_VERIFY need explicit productIds and/or lotIds.
+ * FULL counts every countable lot; CYCLE without ids uses generateCycleCountSchedule; SPOT and
+ * RECEIVING_VERIFY need explicit productIds and/or lotIds. Rejected with 409 if any product is
+ * already on an open count.
  */
 export async function createCount(
   actor: AuthUser,
@@ -246,6 +563,7 @@ export async function createCount(
   }
 
   const lotsById = new Map<string, { id: string; productId: string }>();
+  let schedule: CycleCountSchedule | null = null;
 
   if (type === StockCountType.FULL) {
     for (const lot of await prisma.lot.findMany({
@@ -256,8 +574,13 @@ export async function createCount(
     }
   } else {
     if (type === StockCountType.CYCLE && !hasIds) {
-      const settings = await getCooperativeSettings();
-      productIds = await selectCycleProducts(storeId, settings.cycleCountSize);
+      schedule = await generateCycleCountSchedule(storeId);
+      productIds = schedule.selected.map((c) => c.productId);
+      if (productIds.length === 0) {
+        throw new AppError(400, "No products are due for a cycle count", {
+          alreadyOnOpenCount: schedule.alreadyOnOpenCount,
+        });
+      }
     }
 
     if (productIds.length > 0) {
@@ -310,37 +633,15 @@ export async function createCount(
     throw new AppError(400, "Nothing to count: no lots match this selection");
   }
 
-  const count = await prisma.$transaction(async (tx) => {
-    const created = await tx.stockCount.create({
-      data: {
-        storeId,
-        type,
-        createdByUserId: actor.id,
-        scheduledFor: options.scheduledFor ?? null,
-        notes: options.notes?.trim() || null,
-      },
-    });
-    await tx.stockCountLine.createMany({
-      data: [...lotsById.values()].map((lot) => ({
-        countId: created.id,
-        productId: lot.productId,
-        lotId: lot.id,
-        expectedQuantity: 0,
-      })),
-    });
-    await writeAuditLog(
-      {
-        userId: actor.id,
-        storeId,
-        action: AuditAction.STOCK_COUNT_CREATE,
-        entityType: "StockCount",
-        entityId: created.id,
-        after: { type, lineCount: lotsById.size, autoSelected: type === StockCountType.CYCLE && !hasIds },
-        ipAddress: options.ipAddress ?? null,
-      },
-      { tx },
-    );
-    return created;
+  const count = await insertCount({
+    storeId,
+    type,
+    lots: [...lotsById.values()],
+    createdByUserId: actor.id,
+    scheduledFor: options.scheduledFor ?? null,
+    notes: options.notes?.trim() || null,
+    ipAddress: options.ipAddress ?? null,
+    auditAfter: schedule ? { autoSelected: true, ...scheduleAudit(schedule) } : {},
   });
 
   return getCountForCounter(actor, count.id);
@@ -464,8 +765,8 @@ export async function submitCountLine(
 
   const settings = await getCooperativeSettings();
   const thresholds = {
-    percent: settings.stockCountRecountPercent,
-    value: settings.stockCountRecountValue,
+    percent: settings.varianceThresholdPercent,
+    value: settings.varianceThresholdValue,
   };
 
   return prisma.$transaction(async (tx) => {
@@ -680,6 +981,7 @@ export async function listCounts(
     completedAt: Date | null;
     approvedAt: Date | null;
     lineCount: number;
+    scheduledBySystem: boolean;
     createdAt: Date;
   }>
 > {
@@ -699,6 +1001,7 @@ export async function listCounts(
     completedAt: c.completedAt,
     approvedAt: c.approvedAt,
     lineCount: c._count.lines,
+    scheduledBySystem: c.createdByUserId === null,
     createdAt: c.createdAt,
   }));
 }

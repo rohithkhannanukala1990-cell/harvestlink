@@ -4,6 +4,8 @@
  * Blind counting: GET /:id and POST /:id/lines/:lineId/count never return expected quantities or
  * variances. Only GET /:id/review (STORE_ADMIN / COOP_ADMIN, COMPLETED counts) and the approval
  * response carry them.
+ *
+ * GET /schedule-preview is registered before /:id so Express does not treat it as a count id.
  */
 import { Role, ShrinkageReason, StockCountStatus, StockCountType } from "@prisma/client";
 import { Router } from "express";
@@ -69,6 +71,22 @@ stockCountRouter.get("/", async (req, res) => {
     handleError(res, error);
   }
 });
+
+stockCountRouter.get(
+  "/schedule-preview",
+  requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const storeId = resolveStoreScope(
+        req.user!,
+        typeof req.query.storeId === "string" ? req.query.storeId : undefined,
+      );
+      res.status(200).json(await stockCountService.generateCycleCountSchedule(storeId));
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
 
 stockCountRouter.post("/", requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN), async (req, res) => {
   try {

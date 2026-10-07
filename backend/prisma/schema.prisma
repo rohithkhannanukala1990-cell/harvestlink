@@ -371,10 +371,16 @@ model CooperativeSettings {
   cashDepositGraceDays  Int      @default(3)
   /// A counted line whose |variance| exceeds this percent of the expected quantity must be
   /// recounted before approval. Either threshold (percent or value) triggers a recount.
-  stockCountRecountPercent Decimal @default(10) @db.Decimal(5, 2)
+  varianceThresholdPercent Decimal @default(10) @db.Decimal(5, 2)
   /// A counted line whose |variance × lot unit cost| exceeds this USD value must be recounted.
-  stockCountRecountValue   Decimal @default(25) @db.Decimal(12, 2)
-  /// How many products a CYCLE count selects automatically.
+  varianceThresholdValue   Decimal @default(25) @db.Decimal(12, 2)
+  /// When true, the scheduler creates DRAFT cycle counts on the cadence below.
+  cycleCountEnabled        Boolean @default(true)
+  /// Days between scheduled cycle counts per store. Class A products are due every cycle.
+  cycleCountFrequencyDays  Int     @default(30)
+  /// Value on hand (USD at lot cost) at which a product is class A and counted every cycle.
+  highValueThreshold       Decimal @default(500) @db.Decimal(12, 2)
+  /// Maximum products in one cycle count.
   cycleCountSize           Int     @default(20)
   /// When this settings row was created.
   createdAt             DateTime @default(now())
@@ -1501,7 +1507,8 @@ model StockCount {
   /// When counting began — the moment every line's expectedQuantity was frozen.
   startedAt        DateTime?
   completedAt      DateTime?
-  createdByUserId  String
+  /// Null when the cycle-count scheduler created the count rather than a person.
+  createdByUserId  String?
   countedByUserId  String?
   approvedByUserId String?
   /// Set with approvedByUserId; a COMPLETED count with approvedAt set has been applied to stock.
@@ -1511,7 +1518,7 @@ model StockCount {
   updatedAt        DateTime         @updatedAt
 
   store      Store            @relation(fields: [storeId], references: [id])
-  createdBy  User             @relation("StockCountCreatedBy", fields: [createdByUserId], references: [id])
+  createdBy  User?            @relation("StockCountCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
   countedBy  User?            @relation("StockCountCountedBy", fields: [countedByUserId], references: [id])
   approvedBy User?            @relation("StockCountApprovedBy", fields: [approvedByUserId], references: [id])
   lines      StockCountLine[]
@@ -1556,6 +1563,8 @@ model StockCountLine {
   /// Restrict, not SET NULL: losing the lot would silently turn a lot-level line into a product-level one.
   lot     Lot?       @relation(fields: [lotId], references: [id], onDelete: Restrict)
 
+  /// A lot appears at most once per count.
+  @@unique([countId, lotId])
   @@index([countId])
   @@index([productId])
   @@index([lotId])

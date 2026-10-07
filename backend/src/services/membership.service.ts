@@ -115,8 +115,11 @@ export async function updateCooperativeSettings(
     legalEntityName: string;
     stateOfIncorporation: string;
     cashDepositGraceDays: number;
-    stockCountRecountPercent: number;
-    stockCountRecountValue: number;
+    varianceThresholdPercent: number;
+    varianceThresholdValue: number;
+    cycleCountEnabled: boolean;
+    cycleCountFrequencyDays: number;
+    highValueThreshold: number;
     cycleCountSize: number;
   }>,
 ): Promise<CooperativeSettings> {
@@ -128,19 +131,22 @@ export async function updateCooperativeSettings(
     throw new AppError(400, "cashDepositGraceDays must be a whole number of at least 1");
   }
   if (
-    input.stockCountRecountPercent !== undefined &&
-    !(input.stockCountRecountPercent >= 0 && input.stockCountRecountPercent <= 100)
+    input.varianceThresholdPercent !== undefined &&
+    !(input.varianceThresholdPercent >= 0 && input.varianceThresholdPercent <= 100)
   ) {
-    throw new AppError(400, "stockCountRecountPercent must be between 0 and 100");
+    throw new AppError(400, "varianceThresholdPercent must be between 0 and 100");
   }
-  if (input.stockCountRecountValue !== undefined && !(input.stockCountRecountValue >= 0)) {
-    throw new AppError(400, "stockCountRecountValue must be zero or more");
+  if (input.varianceThresholdValue !== undefined && !(input.varianceThresholdValue >= 0)) {
+    throw new AppError(400, "varianceThresholdValue must be zero or more");
   }
-  if (
-    input.cycleCountSize !== undefined &&
-    (!Number.isInteger(input.cycleCountSize) || input.cycleCountSize < 1)
-  ) {
-    throw new AppError(400, "cycleCountSize must be a whole number of at least 1");
+  if (input.highValueThreshold !== undefined && !(input.highValueThreshold > 0)) {
+    throw new AppError(400, "highValueThreshold must be more than zero");
+  }
+  for (const key of ["cycleCountFrequencyDays", "cycleCountSize"] as const) {
+    const value = input[key];
+    if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+      throw new AppError(400, `${key} must be a whole number of at least 1`);
+    }
   }
   const settings = await getCooperativeSettings();
   const updated = await prisma.cooperativeSettings.update({
@@ -161,11 +167,18 @@ export async function updateCooperativeSettings(
       ...(input.cashDepositGraceDays !== undefined
         ? { cashDepositGraceDays: input.cashDepositGraceDays }
         : {}),
-      ...(input.stockCountRecountPercent !== undefined
-        ? { stockCountRecountPercent: money(input.stockCountRecountPercent) }
+      ...(input.varianceThresholdPercent !== undefined
+        ? { varianceThresholdPercent: money(input.varianceThresholdPercent) }
         : {}),
-      ...(input.stockCountRecountValue !== undefined
-        ? { stockCountRecountValue: money(input.stockCountRecountValue) }
+      ...(input.varianceThresholdValue !== undefined
+        ? { varianceThresholdValue: money(input.varianceThresholdValue) }
+        : {}),
+      ...(input.cycleCountEnabled !== undefined ? { cycleCountEnabled: input.cycleCountEnabled } : {}),
+      ...(input.cycleCountFrequencyDays !== undefined
+        ? { cycleCountFrequencyDays: input.cycleCountFrequencyDays }
+        : {}),
+      ...(input.highValueThreshold !== undefined
+        ? { highValueThreshold: money(input.highValueThreshold) }
         : {}),
       ...(input.cycleCountSize !== undefined ? { cycleCountSize: input.cycleCountSize } : {}),
     },

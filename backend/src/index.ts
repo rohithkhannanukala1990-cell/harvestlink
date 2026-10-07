@@ -8,6 +8,7 @@ import { startExpireLotsJob } from "./jobs/expireLots.js";
 import { startExpirePendingSalesJob } from "./jobs/expirePendingSales.js";
 import { startFlagUndepositedCashJob } from "./jobs/flagUndepositedCash.js";
 import { startReconcileRefundingSalesJob } from "./jobs/reconcileRefundingSales.js";
+import { startScheduleCycleCountsJob } from "./jobs/scheduleCycleCounts.js";
 
 const app = createApp();
 
@@ -17,4 +18,5 @@ app.listen(env.PORT, () => {
   startReconcileRefundingSalesJob();
   startExpireLotsJob();
   startFlagUndepositedCashJob();
+  startScheduleCycleCountsJob();
 });

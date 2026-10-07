@@ -352,7 +352,7 @@ describe("stock counts", () => {
     expect(writeOff.quantity).toBe(2);
   });
 
-  it("CYCLE counts pick never-counted products first, highest stock value first", async () => {
+  it("CYCLE createCount uses the risk schedule and skips products on open counts", async () => {
     const { store, storeAdmin, coopAdmin } = await seedCashierStore();
     await membershipService.updateCooperativeSettings(asAuthUser(coopAdmin), { cycleCountSize: 2 });
     const cheap = await createProduct(store.id, { stock: 10, cost: 1 });
