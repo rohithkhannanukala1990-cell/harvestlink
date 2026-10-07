@@ -17,6 +17,7 @@ import { purchasingRouter } from "./routes/purchasing.routes.js";
 import { recallRouter } from "./routes/recall.routes.js";
 import { salesRouter } from "./routes/sales.routes.js";
 import { settlementRouter } from "./routes/settlement.routes.js";
+import { stockCountRouter } from "./routes/stockCount.routes.js";
 import { storesRouter } from "./routes/stores.routes.js";
 import { stripeWebhookHandler } from "./routes/stripe.webhook.js";
 import { traceabilityRouter } from "./routes/traceability.routes.js";
@@ -82,6 +83,7 @@ export function createApp(): Express {
   app.use("/purchasing", purchasingRouter);
   app.use("/traceability", traceabilityRouter);
   app.use("/recalls", recallRouter);
+  app.use("/stock-counts", stockCountRouter);
 
   return app;
 }

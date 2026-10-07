@@ -251,6 +251,10 @@ model User {
   stockCountsCounted  StockCount[] @relation("StockCountCountedBy")
   /// Stock counts this user approved.
   stockCountsApproved StockCount[] @relation("StockCountApprovedBy")
+  /// Count lines this user counted first.
+  stockCountLinesCounted   StockCountLine[] @relation("StockCountLineCountedBy")
+  /// Count lines this user recounted.
+  stockCountLinesRecounted StockCountLine[] @relation("StockCountLineRecountedBy")
 
   @@index([storeId])
 }
@@ -365,6 +369,13 @@ model CooperativeSettings {
   /// Twice this is the escalation point. Age matters more than amount: cash outside the bank
   /// is at risk from robbery, fire or miscount, and every one of those gets worse with time.
   cashDepositGraceDays  Int      @default(3)
+  /// A counted line whose |variance| exceeds this percent of the expected quantity must be
+  /// recounted before approval. Either threshold (percent or value) triggers a recount.
+  stockCountRecountPercent Decimal @default(10) @db.Decimal(5, 2)
+  /// A counted line whose |variance × lot unit cost| exceeds this USD value must be recounted.
+  stockCountRecountValue   Decimal @default(25) @db.Decimal(12, 2)
+  /// How many products a CYCLE count selects automatically.
+  cycleCountSize           Int     @default(20)
   /// When this settings row was created.
   createdAt             DateTime @default(now())
   /// When settings were last updated.
@@ -987,6 +998,10 @@ model InventoryWriteOff {
   saleRefundId String?
   quantity     Int
   reason       String
+  /// Lot unit cost at write-off time; null on rows written before valuation was recorded.
+  unitCost     Decimal? @db.Decimal(12, 2)
+  /// quantity × unitCost; null on rows written before valuation was recorded.
+  value        Decimal? @db.Decimal(12, 2)
   createdAt    DateTime @default(now())
 
   saleRefund SaleRefund? @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
@@ -1489,6 +1504,8 @@ model StockCount {
   createdByUserId  String
   countedByUserId  String?
   approvedByUserId String?
+  /// Set with approvedByUserId; a COMPLETED count with approvedAt set has been applied to stock.
+  approvedAt       DateTime?
   notes            String?
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
@@ -1514,18 +1531,28 @@ model StockCountLine {
   expectedQuantity  Int
   /// Null until counted.
   countedQuantity   Int?
-  /// countedQuantity − expectedQuantity (negative = shrinkage). Null until counted.
+  countedByUserId   String?
+  countedAt         DateTime?
+  /// expectedQuantity minus the lot's live quantity at the moment the latest (re)count was entered:
+  /// net units that left (sales) or came back (restocked refunds) between startCount and counting.
+  movementDuringCount Int?
+  /// Final counted figure − (expectedQuantity − movementDuringCount): the true variance after
+  /// mid-count sales. Negative = shrinkage. Null until counted.
   variance          Int?
   /// variance × lot unit cost. Null until counted.
   varianceValue     Decimal?             @db.Decimal(12, 2)
   reasonCode        ShrinkageReason?
   recountedQuantity Int?
+  recountedByUserId String?
+  recountedAt       DateTime?
   status            StockCountLineStatus @default(PENDING)
   createdAt         DateTime             @default(now())
   updatedAt         DateTime             @updatedAt
 
-  count   StockCount @relation(fields: [countId], references: [id])
-  product Product    @relation(fields: [productId], references: [id])
+  count       StockCount @relation(fields: [countId], references: [id])
+  product     Product    @relation(fields: [productId], references: [id])
+  countedBy   User?      @relation("StockCountLineCountedBy", fields: [countedByUserId], references: [id])
+  recountedBy User?      @relation("StockCountLineRecountedBy", fields: [recountedByUserId], references: [id])
   /// Restrict, not SET NULL: losing the lot would silently turn a lot-level line into a product-level one.
   lot     Lot?       @relation(fields: [lotId], references: [id], onDelete: Restrict)
 

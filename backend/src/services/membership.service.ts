@@ -115,6 +115,9 @@ export async function updateCooperativeSettings(
     legalEntityName: string;
     stateOfIncorporation: string;
     cashDepositGraceDays: number;
+    stockCountRecountPercent: number;
+    stockCountRecountValue: number;
+    cycleCountSize: number;
   }>,
 ): Promise<CooperativeSettings> {
   assertCoopAdmin(actor);
@@ -123,6 +126,21 @@ export async function updateCooperativeSettings(
     (!Number.isInteger(input.cashDepositGraceDays) || input.cashDepositGraceDays < 1)
   ) {
     throw new AppError(400, "cashDepositGraceDays must be a whole number of at least 1");
+  }
+  if (
+    input.stockCountRecountPercent !== undefined &&
+    !(input.stockCountRecountPercent >= 0 && input.stockCountRecountPercent <= 100)
+  ) {
+    throw new AppError(400, "stockCountRecountPercent must be between 0 and 100");
+  }
+  if (input.stockCountRecountValue !== undefined && !(input.stockCountRecountValue >= 0)) {
+    throw new AppError(400, "stockCountRecountValue must be zero or more");
+  }
+  if (
+    input.cycleCountSize !== undefined &&
+    (!Number.isInteger(input.cycleCountSize) || input.cycleCountSize < 1)
+  ) {
+    throw new AppError(400, "cycleCountSize must be a whole number of at least 1");
   }
   const settings = await getCooperativeSettings();
   const updated = await prisma.cooperativeSettings.update({
@@ -143,6 +161,13 @@ export async function updateCooperativeSettings(
       ...(input.cashDepositGraceDays !== undefined
         ? { cashDepositGraceDays: input.cashDepositGraceDays }
         : {}),
+      ...(input.stockCountRecountPercent !== undefined
+        ? { stockCountRecountPercent: money(input.stockCountRecountPercent) }
+        : {}),
+      ...(input.stockCountRecountValue !== undefined
+        ? { stockCountRecountValue: money(input.stockCountRecountValue) }
+        : {}),
+      ...(input.cycleCountSize !== undefined ? { cycleCountSize: input.cycleCountSize } : {}),
     },
   });
 
