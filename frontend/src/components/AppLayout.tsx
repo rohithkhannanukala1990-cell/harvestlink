@@ -119,6 +119,11 @@ export function AppLayout() {
               </NavLink>
             )}
             {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+              <NavLink to="/shrinkage" className={linkClass}>
+                Shrinkage
+              </NavLink>
+            )}
+            {isRole("STORE_ADMIN", "COOP_ADMIN") && (
               <NavLink to="/settings" className={linkClass}>
                 Settings
               </NavLink>

@@ -255,6 +255,80 @@ export type DailyCloseReport = {
   };
 };
 
+export type ShrinkageSource =
+  | "EXPIRY_JOB"
+  | "RECALL"
+  | "REFUND_NO_RESTOCK"
+  | "STOCK_COUNT"
+  | "MANUAL_ADJUSTMENT"
+  | "OTHER_WRITE_OFF";
+
+export type ShrinkageTotals = {
+  value: string;
+  units: number;
+  events: number;
+  salesAtCost: string;
+  /** null when there were no sales at cost to divide by. */
+  ratePercent: string | null;
+};
+
+export type ShrinkageProductRow = ShrinkageTotals & {
+  productId: string;
+  sku: string;
+  productName: string;
+  category: string;
+};
+
+/** GET /reports/shrinkage */
+export type ShrinkageReport = {
+  storeId: string | null;
+  storeName: string | null;
+  from: string;
+  to: string;
+  granularity: "day" | "week" | "month";
+  totals: ShrinkageTotals & { countOverageValue: string; countOverageUnits: number };
+  byReason: Array<{ reason: string; value: string; units: number; events: number; sharePercent: string }>;
+  bySource: Array<{ source: ShrinkageSource; value: string; units: number; events: number }>;
+  byProduct: ShrinkageProductRow[];
+  byCategory: Array<ShrinkageTotals & { category: string }>;
+  byLot: Array<{
+    lotId: string;
+    lotNumber: string;
+    productId: string;
+    sku: string;
+    productName: string;
+    supplierId: string | null;
+    supplierName: string | null;
+    value: string;
+    units: number;
+    events: number;
+  }>;
+  bySupplier: Array<ShrinkageTotals & { supplierId: string | null; supplierName: string }>;
+  topLossProducts: ShrinkageProductRow[];
+  trend: Array<ShrinkageTotals & { bucketStart: string; networkRatePercent: string | null }>;
+  comparison: {
+    storeRatePercent: string | null;
+    networkRatePercent: string | null;
+    networkValue: string;
+    networkSalesAtCost: string;
+    /** COOP_ADMIN only; empty for a store admin. */
+    stores: Array<ShrinkageTotals & { storeId: string; storeName: string }>;
+  };
+  offlineStockConflicts: {
+    rows: number;
+    open: number;
+    unitsOversold: number;
+    products: Array<{
+      productId: string;
+      sku: string;
+      productName: string;
+      rows: number;
+      open: number;
+      unitsOversold: number;
+    }>;
+  };
+};
+
 export type VarianceDirection = "SHORT" | "OVER" | "BALANCED";
 
 export type VarianceShift = {

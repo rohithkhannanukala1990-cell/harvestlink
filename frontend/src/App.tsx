@@ -23,6 +23,7 @@ import { RecallsPage } from "./pages/Recalls.tsx";
 import { SalesHistoryPage } from "./pages/SalesHistory.tsx";
 import { SettingsPage } from "./pages/Settings.tsx";
 import { SettlementPage } from "./pages/Settlement.tsx";
+import { ShrinkagePage } from "./pages/Shrinkage.tsx";
 import { SuppliersPage } from "./pages/Suppliers.tsx";
 
 function RequireAuth() {
@@ -62,6 +63,7 @@ export default function App() {
           <Route element={<RequireRoles roles={["STORE_ADMIN", "COOP_ADMIN"]} />}>
             <Route path="settlement" element={<SettlementPage />} />
             <Route path="daily-close" element={<DailyClosePage />} />
+            <Route path="shrinkage" element={<ShrinkagePage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="suppliers" element={<SuppliersPage />} />
             <Route path="suppliers/:id" element={<SuppliersPage />} />

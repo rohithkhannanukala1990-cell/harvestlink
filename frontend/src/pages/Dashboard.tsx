@@ -6,14 +6,17 @@
  * - GET /products — low-stock flags (same roles; COOP_ADMIN needs storeId)
  * - GET /settlement/:storeId/summary — amount owed (STORE_ADMIN, COOP_ADMIN only)
  * - GET /settlement/:storeId/cash-position — cash to deposit and its age (same roles)
+ * - GET /reports/shrinkage?storeId — last 30 days' shrinkage rate vs network (same roles)
  *
  * Cashiers see sales + low stock; settlement and cash cards are hidden for CASHIER.
  */
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { apiRequest, todayRangeIso } from "../api/client";
 import type { Product, Sale, SettlementSummary, StoreCashPosition } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
+import { fetchShrinkage, formatRate, shrinkageRateTone } from "../components/ShrinkageRate";
 import {
   DataTable,
   Money,
@@ -62,6 +65,12 @@ export function DashboardPage() {
       apiRequest<StoreCashPosition>(`/settlement/${activeStoreId}/cash-position`),
   });
 
+  const shrinkageQuery = useQuery({
+    queryKey: ["shrinkage", activeStoreId, "last-30-days"],
+    enabled: !!activeStoreId && isRole("STORE_ADMIN", "COOP_ADMIN"),
+    queryFn: () => fetchShrinkage({ storeId: activeStoreId }),
+  });
+
   if (!activeStoreId) {
     return (
       <p className="text-ink-muted">
@@ -74,6 +83,7 @@ export function DashboardPage() {
   const todaysTotal = todaysSales.reduce((sum, s) => sum + Number(s.total), 0);
   const lowStock = productsQuery.data?.products.filter((p) => p.lowStock) ?? [];
   const cash = cashQuery.data;
+  const shrinkage = shrinkageQuery.data;
 
   const lowStockColumns: DataTableColumn<Product>[] = [
     {
@@ -148,6 +158,30 @@ export function DashboardPage() {
             subLine={cash ? cashPositionPrompt(cash) : undefined}
             tone={cash ? cashPositionTone(cash) : "default"}
           />
+        )}
+        {isRole("STORE_ADMIN", "COOP_ADMIN") && (
+          <Link to="/shrinkage" className="block rounded-lg">
+            <StatCard
+              label="Shrinkage rate · 30 days"
+              value={shrinkage ? formatRate(shrinkage.totals.ratePercent) : "…"}
+              subLine={
+                shrinkage ? (
+                  <>
+                    {formatMoney(shrinkage.totals.value)} lost · network{" "}
+                    {formatRate(shrinkage.comparison.networkRatePercent)}
+                  </>
+                ) : undefined
+              }
+              tone={
+                shrinkage
+                  ? shrinkageRateTone(
+                      shrinkage.totals.ratePercent,
+                      shrinkage.comparison.networkRatePercent,
+                    )
+                  : "default"
+              }
+            />
+          </Link>
         )}
       </div>
 

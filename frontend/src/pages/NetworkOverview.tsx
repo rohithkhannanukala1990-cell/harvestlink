@@ -5,6 +5,7 @@
  * - GET /stores — every store with todaysSales, stockAlertCount, currentlyOwed
  * - GET /settlement/network-summary — co-op-wide rollup totals (Phase 6)
  * - GET /settlement/network-cash-position — undeposited cash per store, worst first
+ * - GET /reports/shrinkage — last 30 days' shrinkage rate for the network and each store
  *
  * Rows follow the cash-position order so the store whose cash has waited longest is on top.
  */
@@ -13,6 +14,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { apiRequest } from "../api/client.ts";
 import type { SettlementSummary, Store, StoreCashPosition } from "../api/types.ts";
 import { useAuth } from "../auth/AuthContext.tsx";
+import { fetchShrinkage, formatRate, shrinkageRateTone } from "../components/ShrinkageRate.tsx";
 import {
   Button,
   DataTable,
@@ -63,6 +65,11 @@ export function NetworkOverviewPage() {
       ),
   });
 
+  const shrinkageQuery = useQuery({
+    queryKey: ["shrinkage", null, "last-30-days"],
+    queryFn: () => fetchShrinkage({}),
+  });
+
   function openStoreDashboard(storeId: string) {
     setStoreId(storeId);
     navigate("/");
@@ -77,6 +84,11 @@ export function NetworkOverviewPage() {
       (worstFirst.get(b.id) ?? Number.MAX_SAFE_INTEGER),
   );
   const network = networkQuery.data;
+  const shrinkage = shrinkageQuery.data;
+  const networkShrinkageRate = shrinkage?.comparison.networkRatePercent ?? null;
+  const shrinkageByStore = new Map(
+    (shrinkage?.comparison.stores ?? []).map((s) => [s.storeId, s]),
+  );
 
   const columns: DataTableColumn<StoreRow>[] = [
     {
@@ -141,6 +153,28 @@ export function NetworkOverviewPage() {
       },
     },
     {
+      id: "shrinkage",
+      header: "Shrinkage · 30d",
+      numeric: true,
+      cell: (store) => {
+        if (!shrinkage) return <span className="text-ink-muted">…</span>;
+        const row = shrinkageByStore.get(store.id);
+        if (!row) return <span className="text-ink-muted">—</span>;
+        const above = shrinkageRateTone(row.ratePercent, networkShrinkageRate) === "warning";
+        return (
+          <span className="inline-flex flex-col items-end">
+            <span className={`tabular ${above ? "font-semibold text-state-warning" : "text-ink"}`}>
+              {formatRate(row.ratePercent)}
+              {above && <span className="ml-1 text-xs">▲ above network</span>}
+            </span>
+            <span className="text-xs text-ink-muted">
+              <Money value={row.value} className="text-ink-muted" /> lost
+            </span>
+          </span>
+        );
+      },
+    },
+    {
       id: "actions",
       header: "Actions",
       cell: (store) => (
@@ -174,7 +208,7 @@ export function NetworkOverviewPage() {
         description="COOP_ADMIN view across every store. Use Switch store in the header (or Open store below) before POS, Inventory, or Settlement for a specific location."
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard
           label="Stores"
           value={network ? String(network.storeCount) : "…"}
@@ -192,6 +226,20 @@ export function NetworkOverviewPage() {
           value={formatMoney(network?.currentlyOwed ?? 0)}
           tone="alert"
         />
+        <Link to="/shrinkage?scope=network" className="block rounded-lg">
+          <StatCard
+            label="Shrinkage rate · 30 days"
+            value={shrinkage ? formatRate(networkShrinkageRate) : "…"}
+            subLine={
+              shrinkage ? (
+                <>
+                  {formatMoney(shrinkage.comparison.networkValue)} lost of{" "}
+                  {formatMoney(shrinkage.comparison.networkSalesAtCost)} sold at cost
+                </>
+              ) : undefined
+            }
+          />
+        </Link>
       </div>
 
       <DataTable
