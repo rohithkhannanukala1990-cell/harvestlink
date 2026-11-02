@@ -173,5 +173,180 @@ describe("purchasing receiveGoods", () => {
     expect(suggestions[0]!.supplierId).toBe(supplier.id);
     // deficit = 10-2+1 = 9 → max(9,12)=12 → already on case
     expect(suggestions[0]!.lines[0]!.suggestedQty).toBe(12);
+    expect(suggestions[0]!.lines[0]!.onOrder).toBe(0);
+    expect(suggestions[0]!.lines[0]!.position).toBe(2);
+  });
+});
+
+describe("suggestReorderDrafts open-PO pipeline", () => {
+  async function seedLowStockWithPreferred(sku: string) {
+    const store = await createStore();
+    const admin = await createUser({
+      email: `reorder-${sku}-${Date.now()}@test.local`,
+      role: Role.STORE_ADMIN,
+      storeId: store.id,
+    });
+    const product = await createProduct(store.id, {
+      stock: 2,
+      reserved: 0,
+      reorderAt: 10,
+      cost: 1,
+      sku,
+    });
+    const supplier = await purchasing.createSupplier(asAuthUser(admin), {
+      name: `Supplier ${sku}`,
+    });
+    await purchasing.upsertSupplierProduct(asAuthUser(admin), {
+      supplierId: supplier.id,
+      productId: product.id,
+      caseSize: 1,
+      caseCost: 2,
+      unitCost: 2,
+      minOrderQty: 1,
+      isPreferred: true,
+    });
+    return { store, admin, product, supplier };
+  }
+
+  it("does not suggest a SKU already covered by an open SUBMITTED PO", async () => {
+    const { store, admin, product, supplier } = await seedLowStockWithPreferred("COV1");
+    const po = await purchasing.createPurchaseOrder(asAuthUser(admin), {
+      supplierId: supplier.id,
+      storeId: store.id,
+      lines: [{ productId: product.id, orderedQty: 20, unitCost: 2 }],
+    });
+    await purchasing.submitPurchaseOrder(asAuthUser(admin), po.id);
+
+    const suggestions = await purchasing.suggestReorderDrafts(asAuthUser(admin), store.id);
+    expect(suggestions).toHaveLength(0);
+  });
+
+  it("PARTIALLY_RECEIVED onOrder uses outstanding only (ordered − received)", async () => {
+    const store = await createStore();
+    const admin = await createUser({
+      email: `partial-${Date.now()}@test.local`,
+      role: Role.STORE_ADMIN,
+      storeId: store.id,
+    });
+    const product = await createProduct(store.id, {
+      stock: 0,
+      reserved: 0,
+      reorderAt: 20,
+      cost: 1,
+      sku: `PART-${Date.now()}`,
+      skipLot: true,
+    });
+    const supplier = await purchasing.createSupplier(asAuthUser(admin), { name: "Partial Co" });
+    await purchasing.upsertSupplierProduct(asAuthUser(admin), {
+      supplierId: supplier.id,
+      productId: product.id,
+      caseSize: 1,
+      caseCost: 2,
+      unitCost: 2,
+      minOrderQty: 1,
+      isPreferred: true,
+    });
+
+    const po = await purchasing.createPurchaseOrder(asAuthUser(admin), {
+      supplierId: supplier.id,
+      storeId: store.id,
+      lines: [{ productId: product.id, orderedQty: 10, unitCost: 2 }],
+    });
+    await purchasing.submitPurchaseOrder(asAuthUser(admin), po.id);
+    await purchasing.receiveGoods(asAuthUser(admin), po.id, {
+      lines: [
+        {
+          poLineId: po.lines[0]!.id,
+          quantityReceived: 3,
+          unitCostActual: 2,
+        },
+      ],
+    });
+
+    const suggestions = await purchasing.suggestReorderDrafts(asAuthUser(admin), store.id);
+    expect(suggestions).toHaveLength(1);
+    const line = suggestions[0]!.lines[0]!;
+    // available = 3 (received), onOrder = 7 outstanding, position = 10
+    expect(line.available).toBe(3);
+    expect(line.onOrder).toBe(7);
+    expect(line.position).toBe(10);
+    expect(line.openPoNumbers).toEqual([po.poNumber]);
+    // deficit = 20 - 10 + 1 = 11
+    expect(line.suggestedQty).toBe(11);
+  });
+
+  it("shortClosed outstanding does not count toward onOrder", async () => {
+    const store = await createStore();
+    const admin = await createUser({
+      email: `short-${Date.now()}@test.local`,
+      role: Role.STORE_ADMIN,
+      storeId: store.id,
+    });
+    const product = await createProduct(store.id, {
+      stock: 2,
+      reserved: 0,
+      reorderAt: 10,
+      cost: 1,
+      sku: `SHORT-${Date.now()}`,
+    });
+    const supplier = await purchasing.createSupplier(asAuthUser(admin), { name: "Short Co" });
+    await purchasing.upsertSupplierProduct(asAuthUser(admin), {
+      supplierId: supplier.id,
+      productId: product.id,
+      caseSize: 1,
+      caseCost: 2,
+      unitCost: 2,
+      minOrderQty: 1,
+      isPreferred: true,
+    });
+
+    const po = await purchasing.createPurchaseOrder(asAuthUser(admin), {
+      supplierId: supplier.id,
+      storeId: store.id,
+      lines: [{ productId: product.id, orderedQty: 20, unitCost: 2 }],
+    });
+    await purchasing.submitPurchaseOrder(asAuthUser(admin), po.id);
+    // Receive 1 and close short — without shortClosed, onOrder would cover the SKU.
+    await purchasing.receiveGoods(asAuthUser(admin), po.id, {
+      lines: [
+        {
+          poLineId: po.lines[0]!.id,
+          quantityReceived: 1,
+          unitCostActual: 2,
+          closeShort: true,
+          acknowledgeShortReceipt: true,
+        },
+      ],
+    });
+
+    const suggestions = await purchasing.suggestReorderDrafts(asAuthUser(admin), store.id);
+    expect(suggestions).toHaveLength(1);
+    const line = suggestions[0]!.lines[0]!;
+    // available = 2+1 = 3; shortClosed ⇒ onOrder 0; position 3 ≤ 10
+    expect(line.onOrder).toBe(0);
+    expect(line.openPoNumbers).toEqual([]);
+    expect(line.position).toBe(3);
+    expect(line.suggestedQty).toBe(10 - 3 + 1);
+  });
+
+  it("DRAFT POs are listed as draftOnOrder but do not cover position", async () => {
+    const { store, admin, product, supplier } = await seedLowStockWithPreferred("DRAFT1");
+    const draft = await purchasing.createPurchaseOrder(asAuthUser(admin), {
+      supplierId: supplier.id,
+      storeId: store.id,
+      lines: [{ productId: product.id, orderedQty: 50, unitCost: 2 }],
+    });
+    expect(draft.status).toBe(PurchaseOrderStatus.DRAFT);
+
+    const suggestions = await purchasing.suggestReorderDrafts(asAuthUser(admin), store.id);
+    expect(suggestions).toHaveLength(1);
+    const line = suggestions[0]!.lines[0]!;
+    expect(line.onOrder).toBe(0);
+    expect(line.openPoNumbers).toEqual([]);
+    expect(line.draftOnOrder).toBe(50);
+    expect(line.draftPoNumbers).toEqual([draft.poNumber]);
+    // Still suggested: position = available 2 (draft ignored)
+    expect(line.position).toBe(2);
+    expect(line.suggestedQty).toBe(10 - 2 + 1);
   });
 });

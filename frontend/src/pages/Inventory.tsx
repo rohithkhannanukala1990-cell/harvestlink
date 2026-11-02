@@ -11,7 +11,7 @@
 import { useCallback, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
-import type { Lot, Product, ProductBarcode } from "../api/types";
+import type { CatalogItem, Lot, Product, ProductBarcode } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
 import { formatExpiry } from "../lib/lotDisplay";
@@ -26,19 +26,18 @@ import {
   Money,
   PageHeader,
   StatusBadge,
+  UnitCost,
+  formatMoney,
   isLotBlockedFromSale,
   type DataTableColumn,
 } from "../components/ui";
 
 const emptyForm = {
-  sku: "",
-  name: "",
-  category: "",
+  catalogItemId: "",
   price: "",
   cost: "",
   stock: "0",
   reorderAt: "5",
-  taxExempt: false,
 };
 
 function ProductBarcodes({ productId, canEdit }: { productId: string; canEdit: boolean }) {
@@ -195,6 +194,13 @@ function ProductLots({ productId }: { productId: string }) {
       ),
     },
     {
+      id: "cost",
+      header: "Unit cost",
+      numeric: true,
+      cell: (lot) =>
+        lot.unitCost != null ? <UnitCost value={lot.unitCost} /> : <span className="text-ink-muted">—</span>,
+    },
+    {
       id: "expiry",
       header: "Expiry",
       cell: (lot) => formatExpiry(lot.expiryDate, lot.daysUntilExpiry),
@@ -278,19 +284,21 @@ export function InventoryPage() {
     queryFn: () => apiRequest<{ products: Product[] }>(`/products${q ? `?${q}` : ""}`),
   });
 
+  const catalogQuery = useQuery({
+    queryKey: ["catalog"],
+    enabled: canEdit,
+    queryFn: () => apiRequest<{ items: CatalogItem[] }>("/catalog"),
+  });
+
   const saveMutation = useMutation({
     mutationFn: async () => {
       if (editing) {
         return apiRequest<{ product: Product }>(`/products/${editing.id}`, {
           method: "PATCH",
           body: {
-            sku: form.sku,
-            name: form.name,
-            category: form.category,
             price: Number(form.price),
             cost: Number(form.cost),
             reorderAt: Number(form.reorderAt),
-            taxExempt: form.taxExempt,
             ...(activeStoreId ? { storeId: activeStoreId } : {}),
           },
         });
@@ -298,14 +306,11 @@ export function InventoryPage() {
       return apiRequest<{ product: Product }>("/products", {
         method: "POST",
         body: {
-          sku: form.sku,
-          name: form.name,
-          category: form.category,
+          catalogItemId: form.catalogItemId,
           price: Number(form.price),
           cost: Number(form.cost),
           stock: Number(form.stock),
           reorderAt: Number(form.reorderAt),
-          taxExempt: form.taxExempt,
           ...(activeStoreId ? { storeId: activeStoreId } : {}),
         },
       });
@@ -329,14 +334,11 @@ export function InventoryPage() {
   function startEdit(p: Product) {
     setEditing(p);
     setForm({
-      sku: p.sku,
-      name: p.name,
-      category: p.category,
+      catalogItemId: p.catalogItemId ?? "",
       price: String(p.price),
       cost: String(p.cost),
       stock: String(p.stock),
       reorderAt: String(p.reorderAt),
-      taxExempt: Boolean(p.taxExempt),
     });
   }
 
@@ -364,6 +366,13 @@ export function InventoryPage() {
       header: "Price",
       numeric: true,
       cell: (p) => <Money value={p.price} />,
+    },
+    {
+      id: "cost",
+      header: "Cost",
+      numeric: true,
+      cell: (p) =>
+        p.cost != null ? <UnitCost value={p.cost} /> : <span className="text-ink-muted">—</span>,
     },
     {
       id: "tax",
@@ -436,15 +445,36 @@ export function InventoryPage() {
 
       {canEdit && (
         <Card title={editing ? `Edit ${editing.sku}` : "Add product"}>
+          <p className="mb-3 text-sm text-ink-muted">
+            SKU name, category and tax status come from the network catalog. Price must stay at or
+            below the co-op shelf ceiling.
+          </p>
           <form onSubmit={onSubmit} data-scanner="off" className="grid gap-3 sm:grid-cols-4">
+            {!editing && (
+              <label className="block text-sm text-ink sm:col-span-2">
+                <span className="mb-1 block font-medium">Catalog SKU</span>
+                <select
+                  className="w-full rounded-md border border-border-strong bg-surface-raised px-3 py-2"
+                  value={form.catalogItemId}
+                  onChange={(e) => setForm((f) => ({ ...f, catalogItemId: e.target.value }))}
+                  required
+                >
+                  <option value="">Select catalog item…</option>
+                  {(catalogQuery.data?.items ?? [])
+                    .filter((i) => i.isActive !== false)
+                    .map((i) => (
+                      <option key={i.id} value={i.id}>
+                        {i.sku} — {i.name} (max {formatMoney(i.maxShelfPrice)})
+                      </option>
+                    ))}
+                </select>
+              </label>
+            )}
             {(
               [
-                ["sku", "SKU"],
-                ["name", "Name"],
-                ["category", "Category"],
                 ["price", "Price"],
                 ["cost", "Cost"],
-                ["stock", "Stock"],
+                ...(!editing ? ([["stock", "Stock"]] as const) : []),
                 ["reorderAt", "Reorder at"],
               ] as const
             ).map(([key, label]) => (
@@ -452,19 +482,10 @@ export function InventoryPage() {
                 key={key}
                 label={label}
                 value={form[key]}
-                disabled={Boolean(editing && key === "stock")}
                 onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
                 required
               />
             ))}
-            <label className="flex items-end gap-2 text-sm text-ink sm:col-span-2">
-              <input
-                type="checkbox"
-                checked={form.taxExempt}
-                onChange={(e) => setForm((f) => ({ ...f, taxExempt: e.target.checked }))}
-              />
-              Tax exempt (e.g. groceries)
-            </label>
             <div className="flex items-end gap-2 sm:col-span-4">
               <Button type="submit" loading={saveMutation.isPending}>
                 {editing ? "Update" : "Create"}

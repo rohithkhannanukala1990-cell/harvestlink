@@ -17,15 +17,18 @@ import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as inventoryService from "../services/inventory.service.js";
 
 const createProductSchema = z.object({
-  sku: z.string().min(1),
-  name: z.string().min(1),
-  category: z.string().min(1),
-  price: z.number().nonnegative(),
+  catalogItemId: z.string().min(1).optional(),
+  sku: z.string().min(1).optional(),
+  name: z.string().min(1).optional(),
+  category: z.string().min(1).optional(),
+  price: z.number().nonnegative().optional(),
   cost: z.number().nonnegative(),
   stock: z.number().int().nonnegative(),
   reorderAt: z.number().int().nonnegative(),
   taxExempt: z.boolean().optional(),
   storeId: z.string().min(1).optional(),
+}).refine((body) => !!body.catalogItemId || !!body.sku, {
+  message: "catalogItemId or sku is required",
 });
 
 const updateProductSchema = z
@@ -69,7 +72,7 @@ inventoryRouter.get("/", async (req, res) => {
       req.user!,
       typeof req.query.storeId === "string" ? req.query.storeId : undefined,
     );
-    const products = await inventoryService.listProducts(storeId);
+    const products = await inventoryService.listProducts(storeId, req.user!);
     res.status(200).json({ products });
   } catch (error) {
     handleError(res, error);
@@ -84,7 +87,7 @@ inventoryRouter.get("/expiring", async (req, res) => {
     );
     const daysRaw = typeof req.query.days === "string" ? Number(req.query.days) : 30;
     const days = Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : NaN;
-    const lots = await inventoryService.listExpiringLots(storeId, days);
+    const lots = await inventoryService.listExpiringLots(storeId, days, req.user!);
     res.status(200).json({ lots, days });
   } catch (error) {
     handleError(res, error);
@@ -97,7 +100,7 @@ inventoryRouter.get("/:id/lots", async (req, res) => {
       req.user!,
       typeof req.query.storeId === "string" ? req.query.storeId : undefined,
     );
-    const lots = await inventoryService.listLotsForProduct(storeId, req.params.id);
+    const lots = await inventoryService.listLotsForProduct(storeId, req.params.id, req.user!);
     res.status(200).json({ lots });
   } catch (error) {
     handleError(res, error);
@@ -114,7 +117,12 @@ inventoryRouter.post("/", requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN), async 
 
     const { storeId: bodyStoreId, ...input } = parsed.data;
     const storeId = inventoryService.resolveStoreScope(req.user!, bodyStoreId);
-    const product = await inventoryService.createProduct(storeId, input);
+    const product = await inventoryService.createProduct(
+      storeId,
+      input,
+      req.user!,
+      clientIp(req),
+    );
     res.status(201).json({ product });
   } catch (error) {
     handleError(res, error);
@@ -134,7 +142,13 @@ inventoryRouter.patch("/:id", requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN), as
       req.user!,
       bodyStoreId ?? (typeof req.query.storeId === "string" ? req.query.storeId : undefined),
     );
-    const product = await inventoryService.updateProduct(req.params.id, storeId, input);
+    const product = await inventoryService.updateProduct(
+      req.params.id,
+      storeId,
+      input,
+      req.user!,
+      clientIp(req),
+    );
     res.status(200).json({ product });
   } catch (error) {
     handleError(res, error);

@@ -13,10 +13,10 @@ import {
   Card,
   DataTable,
   Field,
-  Money,
   PageHeader,
   SelectField,
   StatusBadge,
+  UnitCost,
   type DataTableColumn,
 } from "../components/ui";
 
@@ -277,7 +277,7 @@ function SupplierDetail({ id }: { id: string }) {
                 {p.isPreferred ? " · preferred" : ""}
               </span>
               <span className="text-ink-muted">
-                unit <Money value={p.unitCost} /> · case{" "}
+                unit <UnitCost value={p.unitCost} /> · case{" "}
                 <span className="tabular">{p.caseSize}</span> · min{" "}
                 <span className="tabular">{p.minOrderQty}</span>
               </span>

@@ -25,7 +25,7 @@ export {
 } from "./DataTable.tsx";
 export { Field, SelectField, type FieldProps, type SelectFieldProps } from "./Field.tsx";
 export { PageHeader, type PageHeaderProps } from "./PageHeader.tsx";
-export { Money, formatMoney, type MoneyProps } from "./Money.tsx";
+export { Money, UnitCost, formatMoney, formatUnitCost, type MoneyProps } from "./Money.tsx";
 export { Keypad, type KeypadProps } from "./Keypad.tsx";
 export { MemberVotingBadge } from "./MemberVotingBadge.tsx";
 export {

@@ -2,6 +2,7 @@
  * Factories for money-path tests — store, users, products, members.
  */
 import {
+  LocationType,
   MemberStatus,
   LotStatus,
   Prisma,
@@ -21,12 +22,19 @@ export async function createStore(input?: {
   name?: string;
   operatorPercent?: number;
   isActive?: boolean;
+  locationType?: LocationType;
+  taxRate?: number;
 }): Promise<Store> {
+  const locationType = input?.locationType ?? LocationType.RETAIL_STORE;
+  const operatorPercent =
+    locationType === LocationType.WAREHOUSE ? 0 : (input?.operatorPercent ?? 10);
   return prisma.store.create({
     data: {
       name: input?.name ?? "Test Store",
       address: "1 Test Lane",
-      operatorPercent: new Prisma.Decimal(input?.operatorPercent ?? 10),
+      locationType,
+      operatorPercent: new Prisma.Decimal(operatorPercent),
+      taxRate: new Prisma.Decimal(input?.taxRate ?? 0),
       isActive: input?.isActive ?? true,
     },
   });
@@ -67,14 +75,36 @@ export async function createProduct(
   const reserved = input?.reserved ?? 0;
   const cost = new Prisma.Decimal(input?.cost ?? 4);
   const sku = input?.sku ?? `SKU-${Math.random().toString(36).slice(2, 8)}`;
+  const name = input?.name ?? "Test Product";
+  const price = new Prisma.Decimal(input?.price ?? 10);
+
+  let catalog = await prisma.catalogItem.findUnique({ where: { sku } });
+  if (!catalog) {
+    catalog = await prisma.catalogItem.create({
+      data: {
+        sku,
+        name,
+        category: "Test",
+        taxExempt: false,
+        unitsPerCase: 1,
+        maxShelfPrice: price,
+      },
+    });
+  } else if (price.gt(catalog.maxShelfPrice)) {
+    catalog = await prisma.catalogItem.update({
+      where: { id: catalog.id },
+      data: { maxShelfPrice: price },
+    });
+  }
 
   const product = await prisma.product.create({
     data: {
       storeId,
+      catalogItemId: catalog.id,
       sku,
-      name: input?.name ?? "Test Product",
+      name,
       category: "Test",
-      price: new Prisma.Decimal(input?.price ?? 10),
+      price,
       cost,
       stock,
       reserved,

@@ -46,8 +46,10 @@ export function AppLayout() {
     refetchInterval: 60_000,
   });
 
-  const activeStoreName =
-    storesQuery.data?.stores.find((s) => s.id === activeStoreId)?.name ?? null;
+  const activeStore =
+    storesQuery.data?.stores.find((s) => s.id === activeStoreId) ?? null;
+  const activeStoreName = activeStore?.name ?? null;
+  const atWarehouse = activeStore?.locationType === "WAREHOUSE";
 
   const activeRecalls = recallsBannerQuery.data?.recalls ?? [];
 
@@ -68,6 +70,11 @@ export function AppLayout() {
               </NavLink>
             )}
             {isRole("COOP_ADMIN") && (
+              <NavLink to="/catalog" className={linkClass}>
+                Catalog
+              </NavLink>
+            )}
+            {isRole("COOP_ADMIN") && (
               <NavLink to="/audit" className={linkClass}>
                 Audit
               </NavLink>
@@ -80,15 +87,19 @@ export function AppLayout() {
             <NavLink to="/" end className={linkClass}>
               Dashboard
             </NavLink>
-            <NavLink to="/pos" className={linkClass}>
-              POS
-            </NavLink>
+            {!atWarehouse && (
+              <NavLink to="/pos" className={linkClass}>
+                POS
+              </NavLink>
+            )}
             <NavLink to="/sales" className={linkClass}>
               Sales
             </NavLink>
-            <NavLink to="/drawer" className={linkClass}>
-              Drawer
-            </NavLink>
+            {!atWarehouse && (
+              <NavLink to="/drawer" className={linkClass}>
+                Drawer
+              </NavLink>
+            )}
             <NavLink to="/inventory" className={linkClass}>
               Inventory
             </NavLink>
@@ -147,13 +158,18 @@ export function AppLayout() {
                   </option>
                   {(storesQuery.data?.stores ?? []).map((s) => (
                     <option key={s.id} value={s.id}>
-                      {s.name}
+                      {s.locationType === "WAREHOUSE" ? `${s.name} (Warehouse)` : s.name}
                     </option>
                   ))}
                 </select>
                 {activeStoreName && (
-                  <span className="hidden opacity-80 sm:inline">
+                  <span className="hidden items-center gap-2 opacity-80 sm:inline-flex">
                     Viewing: {activeStoreName}
+                    {atWarehouse && (
+                      <span className="rounded bg-ink-inverse/20 px-1.5 py-0.5 text-xs font-semibold tracking-wide">
+                        Warehouse
+                      </span>
+                    )}
                   </span>
                 )}
               </label>

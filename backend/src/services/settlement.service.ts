@@ -51,7 +51,7 @@
  * Payouts above currentlyOwed are rejected for STORE_ADMIN. COOP_ADMIN may override
  * for edge cases (goodwill, correction) but that override is logged for audit.
  */
-import { Prisma, Role, type Payout } from "@prisma/client";
+import { LocationType, Prisma, Role, type Payout } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
@@ -332,7 +332,9 @@ export async function listPayouts(
  * so per-store and network numbers cannot disagree by construction.
  */
 export async function getNetworkSettlementSummary(): Promise<NetworkSettlementSummary> {
+  // Retail stores only — warehouses have no operator payout / POS sales.
   const stores = await prisma.store.findMany({
+    where: { locationType: LocationType.RETAIL_STORE },
     orderBy: { name: "asc" },
     select: { id: true },
   });

@@ -474,6 +474,7 @@ export async function getShrinkageReport(
   const to = new Date(toStart.getTime() + MS_PER_DAY - 1);
   const granularity = granularityFor(spanDays);
 
+  // Include warehouses — the co-op's own losses at the DC matter as much as store shrink.
   const stores = await prisma.store.findMany({ select: { id: true, name: true } });
   const storeName = storeId ? stores.find((s) => s.id === storeId)?.name ?? null : null;
   if (storeId && storeName === null) throw new AppError(404, "Store not found");

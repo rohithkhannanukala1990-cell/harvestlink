@@ -27,10 +27,12 @@ import {
 } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
+import { lockLots, lockProducts, type LockedProductRow } from "../lib/locks.js";
 import { moneyDec } from "../lib/money.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 import { getCooperativeSettings } from "./membership.service.js";
+import { setLotRemaining } from "./stockEngine.js";
 
 type DbClient = Prisma.TransactionClient | typeof prisma;
 
@@ -1204,7 +1206,7 @@ async function buildReview(db: DbClient, count: StockCount): Promise<ReviewCount
       lotId: line.lotId,
       lotNumber: line.lot?.lotNumber ?? null,
       lotStatus: line.lot?.status ?? null,
-      unitCost: line.lot ? line.lot.unitCost.toFixed(2) : null,
+      unitCost: line.lot ? line.lot.unitCost.toFixed(4) : null,
       status: line.status,
       expectedQuantity: line.expectedQuantity,
       soldDuringCount: sold.get(line.id) ?? 0,
@@ -1342,15 +1344,28 @@ export async function approveCount(
 
     const varianceLines = lines.filter((l) => (l.variance ?? 0) !== 0);
     const lotIds = [...new Set(varianceLines.map((l) => l.lotId).filter((id): id is string => !!id))];
-    const lots = lotIds.length
-      ? await tx.$queryRaw<LockedLot[]>`
-          SELECT id, "lotNumber", "productId", status, "quantityRemaining", "quantityReserved", "unitCost"
-          FROM "Lot"
-          WHERE id IN (${Prisma.join(lotIds)})
-          FOR UPDATE
-        `
-      : [];
+    // Product → Lot before adjusting either (lib/locks.ts). Product ids come from the lines.
+    const productIds = [
+      ...new Set(
+        varianceLines
+          .map((l) => l.productId)
+          .filter((id): id is string => !!id),
+      ),
+    ];
+    const lockedProducts = await lockProducts(tx, productIds);
+    const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+    const locked = await lockLots(tx, lotIds);
+    const lots: LockedLot[] = locked.map((l) => ({
+      id: l.id,
+      lotNumber: l.lotNumber,
+      productId: l.productId,
+      status: l.status as LotStatus,
+      quantityRemaining: l.quantityRemaining,
+      quantityReserved: l.quantityReserved,
+      unitCost: l.unitCost,
+    }));
     const lotById = new Map(lots.map((l) => [l.id, l]));
+    const lockedLotById = new Map(locked.map((l) => [l.id, l]));
 
     const blocked = varianceLines.filter((l) => {
       const lot = l.lotId ? lotById.get(l.lotId) : undefined;
@@ -1379,59 +1394,37 @@ export async function approveCount(
       const variance = line.variance!;
       const isBlocked = BLOCKED_LOT_STATUSES.includes(lot.status);
 
-      const previousQty = lot.quantityRemaining;
-      const unclamped = previousQty + variance;
+      const unclamped = lot.quantityRemaining + variance;
       const targetQty = Math.max(0, unclamped);
-      if (lot.status === LotStatus.ACTIVE && targetQty < lot.quantityReserved) {
-        throw new AppError(
-          409,
-          "Adjustment would drop a lot below units held by pending sales; settle them before approving",
-          { lineId: line.id, lotId: lot.id, quantityReserved: lot.quantityReserved, targetQty },
-        );
-      }
-      const delta = targetQty - previousQty;
 
       await tx.stockCountLine.update({ where: { id: line.id }, data: { reasonCode } });
 
-      const nextStatus =
-        lot.status === LotStatus.ACTIVE && targetQty === 0
-          ? LotStatus.DEPLETED
-          : lot.status === LotStatus.DEPLETED && targetQty > 0
-            ? LotStatus.ACTIVE
-            : lot.status;
-
-      if (delta !== 0 || nextStatus !== lot.status) {
-        await tx.lot.update({
-          where: { id: lot.id },
-          data: { quantityRemaining: targetQty, status: nextStatus },
-        });
-      }
-
-      // Product.stock is the rollup of ACTIVE lots only (npm run verify:stock).
-      const rollupDelta =
-        (nextStatus === LotStatus.ACTIVE ? targetQty : 0) -
-        (lot.status === LotStatus.ACTIVE ? previousQty : 0);
+      const product = productById.get(lot.productId) as LockedProductRow | undefined;
+      if (!product) throw new AppError(500, "Product missing at count approval", { productId: lot.productId });
+      const lockedLot = lockedLotById.get(lot.id)!;
+      const previousStock = product.stock;
+      const { previousQty, delta, rollupDelta, nextStatus } = await setLotRemaining(
+        tx,
+        product,
+        lockedLot,
+        targetQty,
+      );
+      product.stock = previousStock + rollupDelta;
+      lockedLot.quantityRemaining = targetQty;
+      lockedLot.status = nextStatus;
 
       const reason = isBlocked
         ? `STOCK_COUNT:${reasonCode} (${lot.status} lot, override)`
         : `STOCK_COUNT:${reasonCode}`;
 
       if (rollupDelta !== 0) {
-        const product = await tx.product.findUniqueOrThrow({
-          where: { id: lot.productId },
-          select: { stock: true },
-        });
-        await tx.product.update({
-          where: { id: lot.productId },
-          data: { stock: { increment: rollupDelta } },
-        });
         await tx.stockAdjustment.create({
           data: {
             productId: lot.productId,
             storeId: count.storeId,
             adjustedById: actor.id,
-            previousStock: product.stock,
-            newStock: product.stock + rollupDelta,
+            previousStock,
+            newStock: previousStock + rollupDelta,
             delta: rollupDelta,
             reason,
             lotId: lot.id,

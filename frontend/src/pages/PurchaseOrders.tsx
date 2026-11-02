@@ -214,10 +214,31 @@ export function PurchaseOrdersPage() {
                   <ul className="text-xs text-ink-muted">
                     {s.lines.map((l) => (
                       <li key={l.productId}>
-                        {l.sku} avail{" "}
+                        {l.sku} pos{" "}
                         <span className="tabular">
-                          {l.available}/{l.reorderAt}
-                        </span>{" "}
+                          {l.position}/{l.reorderAt}
+                        </span>
+                        {l.onOrder > 0 ? (
+                          <>
+                            {" "}
+                            (on order <span className="tabular">{l.onOrder}</span>
+                            {l.openPoNumbers.length > 0
+                              ? ` · ${l.openPoNumbers.join(", ")}`
+                              : ""}
+                            )
+                          </>
+                        ) : null}
+                        {l.draftOnOrder > 0 ? (
+                          <>
+                            {" "}
+                            <span className="text-state-warning">
+                              draft <span className="tabular">{l.draftOnOrder}</span>
+                              {l.draftPoNumbers.length > 0
+                                ? ` · ${l.draftPoNumbers.join(", ")}`
+                                : ""}
+                            </span>
+                          </>
+                        ) : null}{" "}
                         → order <span className="tabular">{l.suggestedQty}</span>
                       </li>
                     ))}

@@ -10,7 +10,9 @@
  */
 import cron from "node-cron";
 import { LotStatus } from "@prisma/client";
+import { isDeadlockError, lockLots, lockProducts } from "../lib/locks.js";
 import { prisma } from "../lib/prisma.js";
+import { leaveSellableRollup } from "../services/stockEngine.js";
 
 let started = false;
 
@@ -47,24 +49,25 @@ export async function runExpireLotsOnce(now = new Date()): Promise<{
 
     try {
       const didExpire = await prisma.$transaction(async (tx) => {
-        const claimed = await tx.lot.updateMany({
-          where: {
-            id: lot.id,
-            status: LotStatus.ACTIVE,
-            quantityReserved: 0,
-          },
-          data: { status: LotStatus.EXPIRED },
-        });
-        if (claimed.count !== 1) {
+        // Product → Lot before leaving the sellable rollup (lib/locks.ts).
+        const [product] = await lockProducts(tx, [lot.productId]);
+        const [locked] = await lockLots(tx, [lot.id]);
+        if (
+          !product ||
+          !locked ||
+          locked.status !== LotStatus.ACTIVE ||
+          locked.quantityReserved > 0
+        ) {
           return false;
         }
 
-        const writeOffQty = Math.max(0, lot.quantityRemaining);
+        const writeOffQty = await leaveSellableRollup(
+          tx,
+          product,
+          locked,
+          LotStatus.EXPIRED,
+        );
         if (writeOffQty > 0) {
-          await tx.product.update({
-            where: { id: lot.productId },
-            data: { stock: { decrement: writeOffQty } },
-          });
           await tx.inventoryWriteOff.create({
             data: {
               storeId: lot.storeId,
@@ -104,6 +107,8 @@ export async function runExpireLotsOnce(now = new Date()): Promise<{
           at: new Date().toISOString(),
         }),
       );
+      // Deadlocks must surface — ordering bugs should not be swallowed here.
+      if (isDeadlockError(error)) throw error;
     }
   }
 

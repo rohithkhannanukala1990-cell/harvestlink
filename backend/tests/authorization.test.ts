@@ -1,11 +1,27 @@
 /**
  * CASHIER tokens must be rejected on settlement and admin-only routes.
+ * Inventory/lot/product GETs are allowed but must never leak cost fields.
  */
 import { Role } from "@prisma/client";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { createProduct, seedCashierStore, signTestToken } from "./helpers/factories.js";
+
+const COST_KEY = /cost|landed|margin|supplierPrice/i;
+
+/** Collect every object key in a JSON tree (nested). */
+function collectKeys(value: unknown, keys: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    for (const item of value) collectKeys(item, keys);
+  } else if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      keys.push(k);
+      collectKeys(v, keys);
+    }
+  }
+  return keys;
+}
 
 describe("authorization", () => {
   it("rejects a CASHIER token on every settlement and admin route", async () => {
@@ -77,10 +93,43 @@ describe("authorization", () => {
       .get("/products")
       .set({ Authorization: `Bearer ${token}` });
     expect(products.status).toBe(200);
+    expect(products.body.products[0].price).toBeDefined();
+    expect(products.body.products[0].cost).toBeUndefined();
 
     const sales = await request(app)
       .get("/sales")
       .set({ Authorization: `Bearer ${token}` });
     expect(sales.status).toBe(200);
+  });
+
+  it("CASHIER inventory/lot/product/traceability GETs never expose cost keys", async () => {
+    const { store, cashier } = await seedCashierStore();
+    const product = await createProduct(store.id, { stock: 5 });
+    const token = signTestToken(cashier);
+    const app = createApp();
+    const auth = { Authorization: `Bearer ${token}` };
+
+    const paths = [
+      "/products",
+      "/inventory",
+      `/products/${product.id}/lots`,
+      `/inventory/${product.id}/lots`,
+      "/lots",
+      "/inventory/expiring?days=30",
+      `/products/expiring?days=30`,
+      `/traceability/lots/${product.id}/forward`,
+      `/traceability/lots/${product.id}/genealogy`,
+      "/traceability/backward?saleId=fake-sale-id",
+      "/traceability/sales/fake-sale-id/backward",
+      "/traceability/sale-items/fake-item-id/backward",
+    ];
+
+    for (const path of paths) {
+      const res = await request(app).get(path).set(auth);
+      const keys = collectKeys(res.body);
+      for (const key of keys) {
+        expect(key, `${path} leaked key "${key}"`).not.toMatch(COST_KEY);
+      }
+    }
   });
 });

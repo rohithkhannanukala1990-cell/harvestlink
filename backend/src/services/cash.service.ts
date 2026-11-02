@@ -16,6 +16,7 @@
  */
 import {
   CashDepositStatus,
+  LocationType,
   Prisma,
   Role,
   type CashDeposit,
@@ -514,7 +515,11 @@ export async function getNetworkCashPositions(
   asOf: Date = new Date(),
 ): Promise<{ graceDays: number; stores: StoreCashPosition[] }> {
   const [stores, settings] = await Promise.all([
-    prisma.store.findMany({ orderBy: { name: "asc" } }),
+    // Retail stores only — warehouses have no cash drawers / undeposited till cash.
+    prisma.store.findMany({
+      where: { locationType: LocationType.RETAIL_STORE },
+      orderBy: { name: "asc" },
+    }),
     getCooperativeSettings(),
   ]);
 

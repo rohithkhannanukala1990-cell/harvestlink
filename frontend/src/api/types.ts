@@ -23,11 +23,13 @@ export type AuthUser = {
 export type Product = {
   id: string;
   storeId: string;
+  catalogItemId?: string | null;
   sku: string;
   name: string;
   category: string;
   price: string | number;
-  cost: string | number;
+  /** Omitted for CASHIER — cost is admin-only on product DTOs. */
+  cost?: string | number;
   /** Physical on-hand units. */
   stock: number;
   /** Units held by unpaid PENDING sales. */
@@ -44,6 +46,29 @@ export type Product = {
   lowStock?: boolean;
   createdAt: string;
   updatedAt: string;
+};
+
+export type CatalogItem = {
+  id: string;
+  sku: string;
+  name: string;
+  category: string;
+  taxExempt: boolean;
+  isActive: boolean;
+  unitsPerCase: number;
+  casesPerPallet: number | null;
+  caseWeightKg: string | number | null;
+  caseGtin: string | null;
+  maxShelfPrice: string | number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CatalogDisagreement = {
+  sku: string;
+  field: "name" | "category" | "taxExempt";
+  chosen: string | boolean;
+  values: Array<{ value: string | boolean; count: number; storeIds: string[] }>;
 };
 
 /** Co-op-wide settings (singleton). Voting threshold lives here — never hardcoded. */
@@ -172,9 +197,11 @@ export type Lot = {
   quantityReserved: number;
   expiryDate: string | null;
   receivedAt: string;
-  unitCost: string;
+  /** Omitted for CASHIER — unit cost is admin-only. */
+  unitCost?: string;
   countryOfOrigin: string | null;
-  supplier: { id: string; name: string } | null;
+  /** Omitted for CASHIER. */
+  supplier?: { id: string; name: string } | null;
   daysUntilExpiry: number | null;
 };
 
@@ -213,10 +240,14 @@ export type Payout = {
   createdAt: string;
 };
 
+export type LocationType = "RETAIL_STORE" | "WAREHOUSE";
+
 export type Store = {
   id: string;
   name: string;
   address: string;
+  /** RETAIL_STORE (POS) or WAREHOUSE (no POS; co-op operated). */
+  locationType?: LocationType;
   operatorPercent: string | number;
   taxRate?: string | number;
   refundPolicy?: string;
@@ -525,6 +556,14 @@ export type ReorderSuggestion = {
     sku: string;
     name: string;
     available: number;
+    /** Outstanding on SUBMITTED / PARTIALLY_RECEIVED POs. */
+    onOrder: number;
+    openPoNumbers: string[];
+    /** Qty on DRAFT POs (not counted in position). */
+    draftOnOrder: number;
+    draftPoNumbers: string[];
+    /** available + onOrder. */
+    position: number;
     reorderAt: number;
     caseSize: number;
     minOrderQty: number;
