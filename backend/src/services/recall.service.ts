@@ -19,9 +19,15 @@ import {
 import { env } from "../config/env.js";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
+import { lockLots, lockProducts } from "../lib/locks.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 import * as salesService from "./sales.service.js";
+import {
+  leaveSellableRollup,
+  recallDepleteLot,
+  returnToSellableRollup,
+} from "./stockEngine.js";
 import { traceForward } from "./traceability.service.js";
 import nodemailer from "nodemailer";
 
@@ -91,6 +97,32 @@ export async function initiateRecall(
       }
     }
 
+    // Product → Lot before quarantine writes (lib/locks.ts).
+    const lockedProducts = await lockProducts(
+      tx,
+      lots.map((l) => l.productId),
+    );
+    const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+    const lockedLots = await lockLots(
+      tx,
+      lots.map((l) => l.id),
+    );
+    const lockedById = new Map(lockedLots.map((l) => [l.id, l]));
+    for (const lot of lots) {
+      const locked = lockedById.get(lot.id);
+      if (!locked) continue;
+      lot.quantityRemaining = locked.quantityRemaining;
+      lot.quantityReserved = locked.quantityReserved;
+      lot.status = locked.status as LotStatus;
+      if (lot.quantityReserved > 0) {
+        throw new AppError(
+          409,
+          "Cannot recall lot with open reservations — finalize or expire pending sales first",
+          { lotId: lot.id, quantityReserved: lot.quantityReserved },
+        );
+      }
+    }
+
     const recallNumber = await nextRecallNumber(tx);
     const recall = await tx.recall.create({
       data: {
@@ -106,18 +138,16 @@ export async function initiateRecall(
     const recallLots = [];
     for (const lot of lots) {
       if (lot.status === LotStatus.ACTIVE) {
-        // Leave ACTIVE rollup: quarantine removes sellable units from Product.stock cache.
-        const writeOffQty = Math.max(0, lot.quantityRemaining);
-        await tx.lot.update({
-          where: { id: lot.id },
-          data: { status: LotStatus.QUARANTINED },
-        });
-        if (writeOffQty > 0) {
-          await tx.product.update({
-            where: { id: lot.productId },
-            data: { stock: { decrement: writeOffQty } },
+        const product = productById.get(lot.productId);
+        const lockedLot = lockedById.get(lot.id);
+        if (!product || !lockedLot) {
+          throw new AppError(500, "Missing locked product/lot at recall initiate", {
+            lotId: lot.id,
           });
         }
+        await leaveSellableRollup(tx, product, lockedLot, LotStatus.QUARANTINED);
+        lockedLot.status = LotStatus.QUARANTINED;
+        lot.status = LotStatus.QUARANTINED;
       }
 
       const rl = await tx.recallLot.create({
@@ -287,18 +317,29 @@ export async function activateRecall(
       });
     }
 
+    // Product → Lot before writing lot status/qty (lib/locks.ts).
+    const lockedProducts = await lockProducts(
+      tx,
+      recall.lots.map((rl) => rl.lot.productId),
+    );
+    const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+    const lockedLots = await lockLots(
+      tx,
+      recall.lots.map((rl) => rl.lotId),
+    );
+    const lockedById = new Map(lockedLots.map((l) => [l.id, l]));
+
     let unitsWrittenOff = 0;
     for (const rl of recall.lots) {
       const lot = rl.lot;
-      const remaining = Math.max(0, lot.quantityRemaining);
-
-      await tx.lot.update({
-        where: { id: lot.id },
-        data: {
-          status: LotStatus.RECALLED,
-          quantityRemaining: 0,
-        },
-      });
+      const product = productById.get(lot.productId);
+      const lockedLot = lockedById.get(lot.id);
+      if (!product || !lockedLot) {
+        throw new AppError(500, "Missing locked product/lot at recall activate", {
+          lotId: lot.id,
+        });
+      }
+      const remaining = await recallDepleteLot(tx, product, lockedLot);
 
       if (remaining > 0) {
         // Product.stock already reduced at quarantine when leaving ACTIVE.
@@ -732,20 +773,28 @@ export async function cancelRecall(
 
   // Return quarantined lots to ACTIVE and restore Product.stock rollup.
   await prisma.$transaction(async (tx) => {
-    for (const rl of recall.lots) {
+    const restoring = recall.lots.filter((rl) => rl.lot.status === LotStatus.QUARANTINED);
+    const lockedProducts = await lockProducts(
+      tx,
+      restoring.map((rl) => rl.lot.productId),
+    );
+    const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+    const lockedLots = await lockLots(
+      tx,
+      restoring.map((rl) => rl.lotId),
+    );
+    const lockedById = new Map(lockedLots.map((l) => [l.id, l]));
+
+    for (const rl of restoring) {
       const lot = rl.lot;
-      if (lot.status === LotStatus.QUARANTINED) {
-        await tx.lot.update({
-          where: { id: lot.id },
-          data: { status: LotStatus.ACTIVE },
+      const product = productById.get(lot.productId);
+      const lockedLot = lockedById.get(lot.id);
+      if (!product || !lockedLot) {
+        throw new AppError(500, "Missing locked product/lot at recall cancel", {
+          lotId: lot.id,
         });
-        if (lot.quantityRemaining > 0) {
-          await tx.product.update({
-            where: { id: lot.productId },
-            data: { stock: { increment: lot.quantityRemaining } },
-          });
-        }
       }
+      await returnToSellableRollup(tx, product, lockedLot);
     }
     await tx.recall.update({
       where: { id: recallId },

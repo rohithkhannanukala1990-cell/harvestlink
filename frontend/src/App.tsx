@@ -7,6 +7,7 @@ import type { Role } from "./api/types.ts";
 import { useAuth } from "./auth/AuthContext.tsx";
 import { AppLayout } from "./components/AppLayout.tsx";
 import { AuditPage } from "./pages/Audit.tsx";
+import { CatalogPage } from "./pages/Catalog.tsx";
 import { CountScanPage } from "./pages/CountScan.tsx";
 import { DailyClosePage } from "./pages/DailyClose.tsx";
 import { DashboardPage } from "./pages/Dashboard.tsx";
@@ -61,6 +62,7 @@ export default function App() {
           <Route path="members" element={<MembersPage />} />
           <Route element={<RequireRoles roles={["COOP_ADMIN"]} />}>
             <Route path="network" element={<NetworkOverviewPage />} />
+            <Route path="catalog" element={<CatalogPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="recalls" element={<RecallsPage />} />
           </Route>

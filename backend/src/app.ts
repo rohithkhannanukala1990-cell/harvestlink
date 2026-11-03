@@ -9,6 +9,7 @@ import { env } from "./config/env.js";
 import { authRouter } from "./routes/auth.routes.js";
 import { barcodeRouter } from "./routes/barcode.routes.js";
 import { auditRouter } from "./routes/audit.routes.js";
+import { catalogRouter } from "./routes/catalog.routes.js";
 import { drawerRouter } from "./routes/drawer.routes.js";
 import { inventoryRouter } from "./routes/inventory.routes.js";
 import { lotsRouter } from "./routes/lots.routes.js";
@@ -72,6 +73,7 @@ export function createApp(): Express {
 
   app.use("/auth", authRouter);
   app.use("/audit", auditRouter);
+  app.use("/catalog", catalogRouter);
   app.use("/products", inventoryRouter);
   app.use("/inventory", inventoryRouter);
   app.use("/lots", lotsRouter);

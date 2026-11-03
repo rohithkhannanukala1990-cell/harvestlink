@@ -23,6 +23,7 @@ import {
   LotStatusBadge,
   PageHeader,
   SelectField,
+  UnitCost,
   isLotBlockedFromSale,
   type DataTableColumn,
 } from "../components/ui";
@@ -195,6 +196,13 @@ export function LotsPage() {
       header: "Qty",
       numeric: true,
       cell: (lot) => <span className="tabular">{lot.quantityRemaining}</span>,
+    },
+    {
+      id: "cost",
+      header: "Unit cost",
+      numeric: true,
+      cell: (lot) =>
+        lot.unitCost != null ? <UnitCost value={lot.unitCost} /> : <span className="text-ink-muted">—</span>,
     },
     {
       id: "expiry",

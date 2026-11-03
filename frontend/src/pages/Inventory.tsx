@@ -7,11 +7,13 @@
  * Barcodes: a product can carry several (manufacturer UPC/EAN, case GTIN, store codes); the SKU is
  * always scannable too. Scanning anywhere on the page opens the product; the product form and the
  * "Add barcode" box are excluded so a scan there types into the field instead.
+ *
+ * Manual stock changes adjust a specific lot (every unit lives in a lot).
  */
 import { useCallback, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
-import type { Lot, Product, ProductBarcode } from "../api/types";
+import type { CatalogItem, Lot, Product, ProductBarcode } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
 import { formatExpiry } from "../lib/lotDisplay";
@@ -26,19 +28,18 @@ import {
   Money,
   PageHeader,
   StatusBadge,
+  UnitCost,
+  formatMoney,
   isLotBlockedFromSale,
   type DataTableColumn,
 } from "../components/ui";
 
 const emptyForm = {
-  sku: "",
-  name: "",
-  category: "",
+  catalogItemId: "",
   price: "",
   cost: "",
   stock: "0",
   reorderAt: "5",
-  taxExempt: false,
 };
 
 function ProductBarcodes({ productId, canEdit }: { productId: string; canEdit: boolean }) {
@@ -155,14 +156,42 @@ function ProductBarcodes({ productId, canEdit }: { productId: string; canEdit: b
   );
 }
 
-function ProductLots({ productId }: { productId: string }) {
+function ProductLots({ productId, canEdit }: { productId: string; canEdit: boolean }) {
   const { activeStoreId } = useAuth();
+  const qc = useQueryClient();
   const q = storeQuery(activeStoreId);
+  const [adjustLotId, setAdjustLotId] = useState("");
+  const [newQuantity, setNewQuantity] = useState("");
+  const [reason, setReason] = useState("");
+  const [adjustError, setAdjustError] = useState<string | null>(null);
+
   const lotsQuery = useQuery({
     queryKey: ["products", productId, "lots", activeStoreId],
     enabled: !!activeStoreId,
     queryFn: () =>
       apiRequest<{ lots: Lot[] }>(`/products/${productId}/lots${q ? `?${q}` : ""}`),
+  });
+
+  const adjustMutation = useMutation({
+    mutationFn: () =>
+      apiRequest(`/products/${productId}/stock`, {
+        method: "PATCH",
+        body: {
+          lotId: adjustLotId,
+          newQuantity: Number(newQuantity),
+          reason,
+          ...(activeStoreId ? { storeId: activeStoreId } : {}),
+        },
+      }),
+    onSuccess: () => {
+      setNewQuantity("");
+      setReason("");
+      setAdjustError(null);
+      void qc.invalidateQueries({ queryKey: ["products", productId, "lots"] });
+      void qc.invalidateQueries({ queryKey: ["products"] });
+    },
+    onError: (err) =>
+      setAdjustError(err instanceof ApiError ? err.message : "Could not adjust lot quantity"),
   });
 
   if (lotsQuery.isLoading) {
@@ -193,6 +222,13 @@ function ProductLots({ productId }: { productId: string }) {
           ) : null}
         </span>
       ),
+    },
+    {
+      id: "cost",
+      header: "Unit cost",
+      numeric: true,
+      cell: (lot) =>
+        lot.unitCost != null ? <UnitCost value={lot.unitCost} /> : <span className="text-ink-muted">—</span>,
     },
     {
       id: "expiry",
@@ -226,7 +262,7 @@ function ProductLots({ productId }: { productId: string }) {
   ];
 
   return (
-    <div className="p-2">
+    <div className="space-y-3 p-2">
       <DataTable
         columns={columns}
         rows={lots}
@@ -234,6 +270,63 @@ function ProductLots({ productId }: { productId: string }) {
         emptyMessage="No lots"
         className="border-0"
       />
+      {canEdit && (
+        <form
+          data-scanner="off"
+          className="flex flex-wrap items-end gap-2 border-t border-border-hairline pt-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (adjustLotId && reason.trim()) adjustMutation.mutate();
+          }}
+        >
+          <label className="block text-sm text-ink">
+            <span className="mb-1 block font-medium">Adjust lot</span>
+            <select
+              className="rounded-md border border-border-strong bg-surface-raised px-3 py-2"
+              value={adjustLotId}
+              onChange={(e) => {
+                const id = e.target.value;
+                setAdjustLotId(id);
+                const lot = lots.find((l) => l.id === id);
+                if (lot) setNewQuantity(String(lot.quantityRemaining));
+              }}
+              required
+            >
+              <option value="">Select lot…</option>
+              {lots.map((lot) => (
+                <option key={lot.id} value={lot.id}>
+                  {lot.lotNumber} ({lot.status}, qty {lot.quantityRemaining})
+                </option>
+              ))}
+            </select>
+          </label>
+          <Field
+            label="New quantity"
+            type="number"
+            min={0}
+            step={1}
+            className="w-28"
+            value={newQuantity}
+            onChange={(e) => setNewQuantity(e.target.value)}
+            required
+          />
+          <Field
+            label="Reason"
+            className="min-w-[12rem]"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            required
+          />
+          <Button type="submit" loading={adjustMutation.isPending}>
+            Adjust
+          </Button>
+          {adjustError && (
+            <p className="basis-full text-sm text-state-danger" role="alert">
+              {adjustError}
+            </p>
+          )}
+        </form>
+      )}
     </div>
   );
 }
@@ -241,6 +334,7 @@ function ProductLots({ productId }: { productId: string }) {
 export function InventoryPage() {
   const { activeStoreId, isRole } = useAuth();
   const canEdit = isRole("STORE_ADMIN", "COOP_ADMIN");
+  const canEditCost = isRole("COOP_ADMIN");
   const qc = useQueryClient();
   const q = storeQuery(activeStoreId);
   const [form, setForm] = useState(emptyForm);
@@ -278,19 +372,21 @@ export function InventoryPage() {
     queryFn: () => apiRequest<{ products: Product[] }>(`/products${q ? `?${q}` : ""}`),
   });
 
+  const catalogQuery = useQuery({
+    queryKey: ["catalog"],
+    enabled: canEdit,
+    queryFn: () => apiRequest<{ items: CatalogItem[] }>("/catalog"),
+  });
+
   const saveMutation = useMutation({
     mutationFn: async () => {
       if (editing) {
         return apiRequest<{ product: Product }>(`/products/${editing.id}`, {
           method: "PATCH",
           body: {
-            sku: form.sku,
-            name: form.name,
-            category: form.category,
             price: Number(form.price),
-            cost: Number(form.cost),
+            ...(canEditCost ? { cost: Number(form.cost) } : {}),
             reorderAt: Number(form.reorderAt),
-            taxExempt: form.taxExempt,
             ...(activeStoreId ? { storeId: activeStoreId } : {}),
           },
         });
@@ -298,14 +394,11 @@ export function InventoryPage() {
       return apiRequest<{ product: Product }>("/products", {
         method: "POST",
         body: {
-          sku: form.sku,
-          name: form.name,
-          category: form.category,
+          catalogItemId: form.catalogItemId,
           price: Number(form.price),
           cost: Number(form.cost),
           stock: Number(form.stock),
           reorderAt: Number(form.reorderAt),
-          taxExempt: form.taxExempt,
           ...(activeStoreId ? { storeId: activeStoreId } : {}),
         },
       });
@@ -329,14 +422,11 @@ export function InventoryPage() {
   function startEdit(p: Product) {
     setEditing(p);
     setForm({
-      sku: p.sku,
-      name: p.name,
-      category: p.category,
+      catalogItemId: p.catalogItemId ?? "",
       price: String(p.price),
-      cost: String(p.cost),
+      cost: String(p.cost ?? ""),
       stock: String(p.stock),
       reorderAt: String(p.reorderAt),
-      taxExempt: Boolean(p.taxExempt),
     });
   }
 
@@ -364,6 +454,13 @@ export function InventoryPage() {
       header: "Price",
       numeric: true,
       cell: (p) => <Money value={p.price} />,
+    },
+    {
+      id: "cost",
+      header: "Cost",
+      numeric: true,
+      cell: (p) =>
+        p.cost != null ? <UnitCost value={p.cost} /> : <span className="text-ink-muted">—</span>,
     },
     {
       id: "tax",
@@ -421,6 +518,15 @@ export function InventoryPage() {
       : []),
   ];
 
+  const formFields = (
+    [
+      ["price", "Price"],
+      ...(!editing || canEditCost ? ([["cost", "Cost"]] as const) : []),
+      ...(!editing ? ([["stock", "Opening stock"]] as const) : []),
+      ["reorderAt", "Reorder at"],
+    ] as const
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -436,35 +542,41 @@ export function InventoryPage() {
 
       {canEdit && (
         <Card title={editing ? `Edit ${editing.sku}` : "Add product"}>
+          <p className="mb-3 text-sm text-ink-muted">
+            SKU name, category and tax status come from the network catalog. Price must stay at or
+            below the co-op shelf ceiling. Opening stock creates an OPENING lot; later quantity
+            changes adjust a lot. Cost edits after create are COOP_ADMIN only.
+          </p>
           <form onSubmit={onSubmit} data-scanner="off" className="grid gap-3 sm:grid-cols-4">
-            {(
-              [
-                ["sku", "SKU"],
-                ["name", "Name"],
-                ["category", "Category"],
-                ["price", "Price"],
-                ["cost", "Cost"],
-                ["stock", "Stock"],
-                ["reorderAt", "Reorder at"],
-              ] as const
-            ).map(([key, label]) => (
+            {!editing && (
+              <label className="block text-sm text-ink sm:col-span-2">
+                <span className="mb-1 block font-medium">Catalog SKU</span>
+                <select
+                  className="w-full rounded-md border border-border-strong bg-surface-raised px-3 py-2"
+                  value={form.catalogItemId}
+                  onChange={(e) => setForm((f) => ({ ...f, catalogItemId: e.target.value }))}
+                  required
+                >
+                  <option value="">Select catalog item…</option>
+                  {(catalogQuery.data?.items ?? [])
+                    .filter((i) => i.isActive !== false)
+                    .map((i) => (
+                      <option key={i.id} value={i.id}>
+                        {i.sku} — {i.name} (max {formatMoney(i.maxShelfPrice)})
+                      </option>
+                    ))}
+                </select>
+              </label>
+            )}
+            {formFields.map(([key, label]) => (
               <Field
                 key={key}
                 label={label}
                 value={form[key]}
-                disabled={Boolean(editing && key === "stock")}
                 onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
                 required
               />
             ))}
-            <label className="flex items-end gap-2 text-sm text-ink sm:col-span-2">
-              <input
-                type="checkbox"
-                checked={form.taxExempt}
-                onChange={(e) => setForm((f) => ({ ...f, taxExempt: e.target.checked }))}
-              />
-              Tax exempt (e.g. groceries)
-            </label>
             <div className="flex items-end gap-2 sm:col-span-4">
               <Button type="submit" loading={saveMutation.isPending}>
                 {editing ? "Update" : "Create"}
@@ -502,7 +614,7 @@ export function InventoryPage() {
           render: (p) => (
             <>
               <ProductBarcodes productId={p.id} canEdit={canEdit} />
-              <ProductLots productId={p.id} />
+              <ProductLots productId={p.id} canEdit={canEdit} />
             </>
           ),
         }}

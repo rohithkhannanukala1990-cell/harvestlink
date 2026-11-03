@@ -20,6 +20,7 @@
     "db:backup": "node scripts/run-backup.mjs",
     "db:migrate-members": "tsx scripts/migrate-members-to-coop.ts",
     "db:migrate-legacy-lots": "tsx scripts/migrate-legacy-lots.ts",
+    "db:backfill-catalog": "tsx scripts/backfill-catalog.ts",
     "verify:stock": "tsx scripts/verify-stock.ts"
   },
   "prisma": {

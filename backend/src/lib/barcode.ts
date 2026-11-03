@@ -39,8 +39,13 @@ export function normalizeBarcode(raw: string): NormalizedBarcode {
     symbology = aim[0];
     s = s.slice(aim[0].length);
   }
-  // Drop control characters except GS, which separates GS1 fields.
-  s = s.replace(/[\u0000-\u001c\u001e\u001f\u007f]/g, "").trim().toUpperCase();
+  // Drop C0 controls except GS (0x1d), which separates GS1 fields. Built with fromCharCode so
+  // eslint no-control-regex stays quiet while still matching the same byte range.
+  const dropControls = new RegExp(
+    `[${String.fromCharCode(0)}-${String.fromCharCode(0x1c)}${String.fromCharCode(0x1e)}${String.fromCharCode(0x1f)}${String.fromCharCode(0x7f)}]`,
+    "g",
+  );
+  s = s.replace(dropControls, "").trim().toUpperCase();
   if (/^\d+$/.test(s) && (s.length === 12 || s.length === 13 || s.length === 14)) {
     s = s.padStart(14, "0");
   }

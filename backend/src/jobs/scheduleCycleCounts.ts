@@ -27,6 +27,7 @@ export async function runScheduleCycleCountsOnce(now = new Date()): Promise<{
     return { enabled: false, createdCountIds: [], skippedStoreIds: [] };
   }
 
+  // Include warehouses — warehouse on-hand needs the same cadence as retail.
   const stores = await prisma.store.findMany({
     where: { isActive: true },
     select: { id: true, name: true },

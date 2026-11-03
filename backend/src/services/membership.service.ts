@@ -29,6 +29,7 @@ import {
   DividendAllocationMethod,
   DividendStatus,
   MemberStatus,
+  LocationType,
   MembershipFeeStatus,
   Prisma,
   Role,
@@ -121,9 +122,20 @@ export async function updateCooperativeSettings(
     cycleCountFrequencyDays: number;
     highValueThreshold: number;
     cycleCountSize: number;
+    mainWarehouseId: string | null;
   }>,
 ): Promise<CooperativeSettings> {
   assertCoopAdmin(actor);
+
+  if (input.mainWarehouseId !== undefined && input.mainWarehouseId !== null) {
+    const warehouse = await prisma.store.findUnique({ where: { id: input.mainWarehouseId } });
+    if (!warehouse) {
+      throw new AppError(404, "mainWarehouseId store not found");
+    }
+    if (warehouse.locationType !== LocationType.WAREHOUSE) {
+      throw new AppError(400, "mainWarehouseId must reference a WAREHOUSE location");
+    }
+  }
   if (
     input.cashDepositGraceDays !== undefined &&
     (!Number.isInteger(input.cashDepositGraceDays) || input.cashDepositGraceDays < 1)
@@ -181,6 +193,7 @@ export async function updateCooperativeSettings(
         ? { highValueThreshold: money(input.highValueThreshold) }
         : {}),
       ...(input.cycleCountSize !== undefined ? { cycleCountSize: input.cycleCountSize } : {}),
+      ...(input.mainWarehouseId !== undefined ? { mainWarehouseId: input.mainWarehouseId } : {}),
     },
   });
 

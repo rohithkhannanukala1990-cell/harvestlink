@@ -1,23 +1,32 @@
 /**
  * Store settings + co-op network listing for Harvestlink.
  *
+ * "Store" means any stock-holding location (RETAIL_STORE or WAREHOUSE). Don't rename the model.
+ * Warehouses share lots / FEFO / counts / recalls on storeId; POS and cash drawers do not apply.
+ *
  * operatorPercent changes apply only to FUTURE sales — past Sale rows keep their
  * snapshotted operatorPercent / operatorAmount from checkout time (Phases 1 & 4).
- *
- * Network listing (COOP_ADMIN) was deferred until the single-store flow was solid:
- * store-scoping bugs (JWT storeId vs query storeId, wrong inventory, settlement bleed)
- * are far easier to debug when there is only ever one store under test. Multi-store
- * overview builds on that once POS / inventory / settlement are trustworthy per store.
  */
-import { Prisma, Role, type Store } from "@prisma/client";
+import { LocationType, Prisma, Role, type Store } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 
+export type CreateStoreInput = {
+  name: string;
+  address: string;
+  locationType?: LocationType;
+  operatorPercent?: number;
+  taxRate?: number;
+  refundPolicy?: string;
+  isActive?: boolean;
+};
+
 export type UpdateStoreInput = {
   name?: string;
   address?: string;
+  locationType?: LocationType;
   /** Only COOP_ADMIN may set this — affects future sales only, never historical ones. */
   operatorPercent?: number;
   taxRate?: number;
@@ -58,6 +67,16 @@ function utcDayBounds(now = new Date()): { from: Date; to: Date } {
   const to = new Date(from);
   to.setUTCHours(23, 59, 59, 999);
   return { from, to };
+}
+
+/** Warehouses are co-op operated — operator commission is always zero. */
+export function assertWarehouseOperatorPercent(
+  locationType: LocationType,
+  operatorPercent: number,
+): void {
+  if (locationType === LocationType.WAREHOUSE && operatorPercent !== 0) {
+    throw new AppError(400, "A warehouse must have operatorPercent 0");
+  }
 }
 
 async function statsForStore(store: Store): Promise<StoreWithStats> {
@@ -104,19 +123,30 @@ async function statsForStore(store: Store): Promise<StoreWithStats> {
 /**
  * Lists stores the caller may see, each with basic network stats.
  * COOP_ADMIN gets every store — used by Network Overview and the Switch store control.
+ * Optional locationType filter (e.g. ?locationType=WAREHOUSE).
  * CASHIER responses omit currentlyOwed (settlement payable is admin-only).
  */
-export async function listStores(actor: AuthUser): Promise<StoreWithStats[]> {
+export async function listStores(
+  actor: AuthUser,
+  filter?: { locationType?: LocationType },
+): Promise<StoreWithStats[]> {
   let stores: Store[];
 
   if (actor.role === Role.COOP_ADMIN) {
-    stores = await prisma.store.findMany({ orderBy: { name: "asc" } });
+    // Include both retail and warehouses unless the client asks for one kind.
+    stores = await prisma.store.findMany({
+      where: filter?.locationType ? { locationType: filter.locationType } : undefined,
+      orderBy: { name: "asc" },
+    });
   } else {
     if (!actor.storeId) {
       throw new AppError(403, "User is not assigned to a store");
     }
     const store = await prisma.store.findUnique({ where: { id: actor.storeId } });
     stores = store ? [store] : [];
+    if (filter?.locationType && stores[0] && stores[0].locationType !== filter.locationType) {
+      stores = [];
+    }
   }
 
   const withStats = await Promise.all(stores.map((store) => statsForStore(store)));
@@ -140,6 +170,38 @@ export async function getStore(storeId: string): Promise<Store> {
   return store;
 }
 
+export async function createStore(actor: AuthUser, input: CreateStoreInput): Promise<Store> {
+  if (actor.role !== Role.COOP_ADMIN) {
+    throw new AppError(403, "Only COOP_ADMIN can create locations");
+  }
+  const locationType = input.locationType ?? LocationType.RETAIL_STORE;
+  const operatorPercent =
+    input.operatorPercent !== undefined
+      ? input.operatorPercent
+      : locationType === LocationType.WAREHOUSE
+        ? 0
+        : 0;
+  assertWarehouseOperatorPercent(locationType, operatorPercent);
+  if (operatorPercent < 0 || operatorPercent > 100) {
+    throw new AppError(400, "operatorPercent must be between 0 and 100");
+  }
+  if (input.taxRate !== undefined && (input.taxRate < 0 || input.taxRate > 100)) {
+    throw new AppError(400, "taxRate must be between 0 and 100");
+  }
+
+  return prisma.store.create({
+    data: {
+      name: input.name.trim(),
+      address: input.address.trim(),
+      locationType,
+      operatorPercent: new Prisma.Decimal(operatorPercent),
+      taxRate: new Prisma.Decimal(input.taxRate ?? 0),
+      ...(input.refundPolicy !== undefined ? { refundPolicy: input.refundPolicy } : {}),
+      isActive: input.isActive ?? true,
+    },
+  });
+}
+
 export async function updateStore(
   storeId: string,
   actor: AuthUser,
@@ -154,7 +216,34 @@ export async function updateStore(
     );
   }
 
-  if (input.operatorPercent !== undefined) {
+  if (input.locationType !== undefined && input.locationType !== existing.locationType) {
+    if (actor.role !== Role.COOP_ADMIN) {
+      throw new AppError(403, "Only COOP_ADMIN can change locationType");
+    }
+    const [lotCount, saleCount] = await Promise.all([
+      prisma.lot.count({ where: { storeId } }),
+      prisma.sale.count({ where: { storeId } }),
+    ]);
+    if (lotCount > 0 || saleCount > 0) {
+      throw new AppError(409, "locationType cannot change once a location has lots or sales", {
+        lotCount,
+        saleCount,
+      });
+    }
+  }
+
+  const nextType = input.locationType ?? existing.locationType;
+  let nextOperatorPercent =
+    input.operatorPercent !== undefined
+      ? input.operatorPercent
+      : Number(existing.operatorPercent.toString());
+
+  if (nextType === LocationType.WAREHOUSE) {
+    if (input.operatorPercent !== undefined) {
+      assertWarehouseOperatorPercent(nextType, input.operatorPercent);
+    }
+    nextOperatorPercent = 0;
+  } else if (input.operatorPercent !== undefined) {
     if (input.operatorPercent < 0 || input.operatorPercent > 100) {
       throw new AppError(400, "operatorPercent must be between 0 and 100");
     }
@@ -171,8 +260,9 @@ export async function updateStore(
       ...(input.address !== undefined ? { address: input.address } : {}),
       ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
       ...(input.refundPolicy !== undefined ? { refundPolicy: input.refundPolicy } : {}),
-      ...(input.operatorPercent !== undefined
-        ? { operatorPercent: new Prisma.Decimal(input.operatorPercent) }
+      ...(input.locationType !== undefined ? { locationType: input.locationType } : {}),
+      ...(input.operatorPercent !== undefined || nextType === LocationType.WAREHOUSE
+        ? { operatorPercent: new Prisma.Decimal(nextOperatorPercent) }
         : {}),
       ...(input.taxRate !== undefined ? { taxRate: new Prisma.Decimal(input.taxRate) } : {}),
     },
@@ -180,7 +270,7 @@ export async function updateStore(
 
   // Critical money control: operator earnings rate — always audit when it changes.
   if (
-    input.operatorPercent !== undefined &&
+    (input.operatorPercent !== undefined || nextType === LocationType.WAREHOUSE) &&
     !existing.operatorPercent.equals(updated.operatorPercent)
   ) {
     await writeAuditLog({

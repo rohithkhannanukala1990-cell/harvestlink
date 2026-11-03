@@ -78,11 +78,16 @@ export function NetworkOverviewPage() {
   const cashPositions = cashQuery.data?.stores ?? [];
   const cashByStore = new Map(cashPositions.map((p) => [p.storeId, p]));
   const worstFirst = new Map(cashPositions.map((p, index) => [p.storeId, index]));
-  const stores = [...(storesQuery.data?.stores ?? [])].sort(
-    (a, b) =>
-      (worstFirst.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
-      (worstFirst.get(b.id) ?? Number.MAX_SAFE_INTEGER),
-  );
+  const allLocations = storesQuery.data?.stores ?? [];
+  // Warehouses separately — never mix into retail sales / cash / owed comparisons.
+  const warehouses = allLocations.filter((s) => s.locationType === "WAREHOUSE");
+  const stores = allLocations
+    .filter((s) => s.locationType !== "WAREHOUSE")
+    .sort(
+      (a, b) =>
+        (worstFirst.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+        (worstFirst.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+    );
   const network = networkQuery.data;
   const shrinkage = shrinkageQuery.data;
   const networkShrinkageRate = shrinkage?.comparison.networkRatePercent ?? null;
@@ -96,7 +101,12 @@ export function NetworkOverviewPage() {
       header: "Store",
       cell: (store) => (
         <div>
-          <div className="font-semibold text-ink">{store.name}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-ink">{store.name}</span>
+            {store.locationType === "WAREHOUSE" && (
+              <StatusBadge label="Warehouse" tone="neutral" />
+            )}
+          </div>
           <div className="text-xs text-ink-muted">{store.address}</div>
           {!store.isActive && (
             <span className="mt-1 inline-block">
@@ -182,21 +192,56 @@ export function NetworkOverviewPage() {
           <Button type="button" variant="quiet" onClick={() => openStoreDashboard(store.id)}>
             Open dashboard
           </Button>
-          <Link
-            to="/pos"
-            className="inline-flex min-h-[44px] items-center rounded-md border border-border-strong bg-surface-raised px-4 text-sm font-semibold text-ink"
-            onClick={() => setStoreId(store.id)}
-          >
-            POS
-          </Link>
-          <Link
-            to="/settlement"
-            className="inline-flex min-h-[44px] items-center rounded-md border border-border-strong bg-surface-raised px-4 text-sm font-semibold text-ink"
-            onClick={() => setStoreId(store.id)}
-          >
-            Settlement
-          </Link>
+          {store.locationType !== "WAREHOUSE" && (
+            <Link
+              to="/pos"
+              className="inline-flex min-h-[44px] items-center rounded-md border border-border-strong bg-surface-raised px-4 text-sm font-semibold text-ink"
+              onClick={() => setStoreId(store.id)}
+            >
+              POS
+            </Link>
+          )}
+          {store.locationType !== "WAREHOUSE" && (
+            <Link
+              to="/settlement"
+              className="inline-flex min-h-[44px] items-center rounded-md border border-border-strong bg-surface-raised px-4 text-sm font-semibold text-ink"
+              onClick={() => setStoreId(store.id)}
+            >
+              Settlement
+            </Link>
+          )}
         </span>
+      ),
+    },
+  ];
+
+  const warehouseColumns: DataTableColumn<StoreRow>[] = [
+    {
+      id: "store",
+      header: "Warehouse",
+      cell: (store) => (
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-ink">{store.name}</span>
+            <StatusBadge label="Warehouse" tone="neutral" />
+          </div>
+          <div className="text-xs text-ink-muted">{store.address}</div>
+        </div>
+      ),
+    },
+    {
+      id: "alerts",
+      header: "Stock alerts",
+      numeric: true,
+      cell: (store) => <span className="tabular text-ink">{store.stockAlertCount}</span>,
+    },
+    {
+      id: "actions",
+      header: "Actions",
+      cell: (store) => (
+        <Button type="button" variant="quiet" onClick={() => openStoreDashboard(store.id)}>
+          Open inventory
+        </Button>
       ),
     },
   ];
@@ -246,8 +291,23 @@ export function NetworkOverviewPage() {
         columns={columns}
         rows={stores}
         rowKey={(s) => s.id}
-        emptyMessage={storesQuery.isLoading ? "Loading stores…" : "No stores yet."}
+        emptyMessage={storesQuery.isLoading ? "Loading stores…" : "No retail stores yet."}
       />
+
+      {warehouses.length > 0 && (
+        <div className="space-y-3">
+          <h2 className="text-lg font-semibold text-ink">Warehouses</h2>
+          <p className="text-sm text-ink-muted">
+            Co-op operated — no POS or operator payout. Inventory, counts, and shrinkage still apply.
+          </p>
+          <DataTable
+            columns={warehouseColumns}
+            rows={warehouses}
+            rowKey={(s) => s.id}
+            emptyMessage="No warehouses."
+          />
+        </div>
+      )}
     </div>
   );
 }

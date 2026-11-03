@@ -19,6 +19,7 @@ import { BarcodeKind, LotStatus, Prisma, Role } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { isValidGtin, lookupCandidates, normalizeBarcode, parseGs1, type Gs1Data } from "../lib/barcode.js";
 import { AppError } from "../lib/errors.js";
+import { lockLots, lockProducts } from "../lib/locks.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 
@@ -308,8 +309,14 @@ export async function setLotBarcode(
 ): Promise<{ id: string; barcode: string | null }> {
   assertAdmin(actor);
   return prisma.$transaction(async (tx) => {
-    const lot = await tx.lot.findUnique({ where: { id: lotId }, select: { id: true, storeId: true, barcode: true } });
+    const lot = await tx.lot.findUnique({
+      where: { id: lotId },
+      select: { id: true, storeId: true, barcode: true, productId: true },
+    });
     if (!lot || lot.storeId !== storeId) throw new AppError(404, "Lot not found");
+    // Product → Lot even for a barcode-only write (lib/locks.ts).
+    await lockProducts(tx, [lot.productId]);
+    await lockLots(tx, [lot.id]);
     const barcode = raw === null || raw.trim() === "" ? null : await claimLotBarcode(tx, storeId, raw, lotId);
     const updated = await tx.lot.update({ where: { id: lotId }, data: { barcode }, select: { id: true, barcode: true } });
     await writeAuditLog(

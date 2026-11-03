@@ -13,7 +13,6 @@
  * the actual invoiced cost for THIS receipt (never averaged away).
  */
 import {
-  LotStatus,
   Prisma,
   PurchaseOrderStatus,
   Role,
@@ -24,13 +23,15 @@ import {
 } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
+import { lockProducts } from "../lib/locks.js";
+import { moneyDec, unitCostDec } from "../lib/money.js";
 import { claimLotBarcode } from "./barcode.service.js";
+import { addLot } from "./stockEngine.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 
-function money(value: Prisma.Decimal | string | number): Prisma.Decimal {
-  return new Prisma.Decimal(value).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
-}
+/** Totals stay 2 dp. Prefer moneyDec at call sites for clarity. */
+const money = moneyDec;
 
 function assertAdmin(actor: AuthUser): void {
   if (actor.role !== Role.STORE_ADMIN && actor.role !== Role.COOP_ADMIN) {
@@ -63,9 +64,10 @@ function recomputePoTotals(
   tax: Prisma.Decimal,
   shipping: Prisma.Decimal,
 ): { subtotal: Prisma.Decimal; total: Prisma.Decimal } {
+  // Multiply at full unit precision, then round the line-sum to 2 dp.
   const subtotal = money(
     lines.reduce(
-      (sum, line) => sum.add(money(line.unitCost).mul(line.orderedQty)),
+      (sum, line) => sum.add(line.unitCost.mul(line.orderedQty)),
       new Prisma.Decimal(0),
     ),
   );
@@ -236,7 +238,7 @@ export async function upsertSupplierProduct(
         supplierSku: input.supplierSku?.trim() ?? "",
         caseSize,
         caseCost: money(input.caseCost),
-        unitCost: money(input.unitCost),
+        unitCost: unitCostDec(input.unitCost),
         minOrderQty,
         isPreferred: input.isPreferred ?? false,
       },
@@ -244,7 +246,7 @@ export async function upsertSupplierProduct(
         supplierSku: input.supplierSku?.trim() ?? "",
         caseSize,
         caseCost: money(input.caseCost),
-        unitCost: money(input.unitCost),
+        unitCost: unitCostDec(input.unitCost),
         minOrderQty,
         ...(input.isPreferred !== undefined ? { isPreferred: input.isPreferred } : {}),
       },
@@ -356,7 +358,7 @@ export async function createPurchaseOrder(actor: AuthUser, input: CreatePoInput)
     if (!Number.isInteger(line.orderedQty) || line.orderedQty <= 0) {
       throw new AppError(400, "orderedQty must be a positive integer");
     }
-    const unitCost = money(line.unitCost);
+    const unitCost = unitCostDec(line.unitCost);
     return {
       productId: line.productId,
       orderedQty: line.orderedQty,
@@ -435,7 +437,7 @@ export async function updatePurchaseOrder(
       if (!Number.isInteger(line.orderedQty) || line.orderedQty <= 0) {
         throw new AppError(400, "orderedQty must be a positive integer");
       }
-      const unitCost = money(line.unitCost);
+      const unitCost = unitCostDec(line.unitCost);
       return {
         productId: line.productId,
         orderedQty: line.orderedQty,
@@ -636,6 +638,15 @@ export async function receiveGoods(
       unitCostActual: string;
     }> = [];
 
+    // Product before Lot create / Product.stock write (lib/locks.ts). New lots have no prior row.
+    const lockedProducts = await lockProducts(
+      tx,
+      input.lines
+        .map((raw) => lineById.get(raw.poLineId)?.productId)
+        .filter((id): id is string => !!id),
+    );
+    const lockedProductById = new Map(lockedProducts.map((p) => [p.id, p]));
+
     const receipt = await tx.goodsReceipt.create({
       data: {
         poId,
@@ -711,7 +722,7 @@ export async function receiveGoods(
         shortClosed = true;
       }
 
-      const unitCostActual = money(raw.unitCostActual);
+      const unitCostActual = unitCostDec(raw.unitCostActual);
       const expiryDate = parseOptionalDate(raw.expiryDate);
       const harvestDate = parseOptionalDate(raw.harvestDate);
       const countryOfOrigin = raw.countryOfOrigin?.trim() || null;
@@ -740,6 +751,9 @@ export async function receiveGoods(
 
       // Accepted units only — rejected stay out of sellable stock (no Lot).
       if (qtyIn > 0) {
+        const locked = lockedProductById.get(poLine.productId);
+        if (!locked) throw new AppError(404, "Product not found", { productId: poLine.productId });
+        // Cost / sku still need the full product row (locked product is a projection).
         const product = await tx.product.findUnique({ where: { id: poLine.productId } });
         if (!product) throw new AppError(404, "Product not found", { productId: poLine.productId });
 
@@ -764,26 +778,22 @@ export async function receiveGoods(
           ? await claimLotBarcode(tx, product.storeId, raw.lotBarcode)
           : null;
 
-        const lot = await tx.lot.create({
-          data: {
-            lotNumber,
-            barcode: lotBarcode,
-            productId: product.id,
-            storeId: product.storeId,
-            supplierId: po.supplierId,
-            goodsReceiptLineId: receiptLine.id,
-            harvestDate,
-            packDate: null,
-            expiryDate,
-            quantityReceived: qtyIn,
-            quantityRemaining: qtyIn,
-            quantityReserved: 0,
-            status: LotStatus.ACTIVE,
-            countryOfOrigin,
-            receivedAt,
-            unitCost: unitCostActual,
-          },
+        const previousStock = locked.stock;
+        const lot = await addLot(tx, locked, {
+          lotNumber,
+          barcode: lotBarcode,
+          storeId: product.storeId,
+          supplierId: po.supplierId,
+          goodsReceiptLineId: receiptLine.id,
+          harvestDate,
+          packDate: null,
+          expiryDate,
+          quantity: qtyIn,
+          countryOfOrigin,
+          receivedAt,
+          unitCost: unitCostActual,
         });
+        locked.stock = previousStock + qtyIn;
 
         if (!suppliedLotNumber) {
           await tx.goodsReceiptLine.update({
@@ -792,15 +802,7 @@ export async function receiveGoods(
           });
         }
 
-        const previousStock = product.stock;
         const newStock = previousStock + qtyIn;
-
-        // Product.stock is a cached rollup — must move with the Lot in this same transaction.
-        await tx.product.update({
-          where: { id: product.id },
-          data: { stock: newStock },
-        });
-
         await tx.stockAdjustment.create({
           data: {
             productId: product.id,
@@ -820,9 +822,11 @@ export async function receiveGoods(
           if (previousStock <= 0) {
             newCost = unitCostActual;
           } else {
-            const numerator = money(product.cost).mul(previousStock).add(unitCostActual.mul(qtyIn));
+            const numerator = unitCostDec(product.cost)
+              .mul(previousStock)
+              .add(unitCostActual.mul(qtyIn));
             const denominator = previousStock + qtyIn;
-            newCost = money(numerator.div(denominator));
+            newCost = unitCostDec(numerator.div(denominator));
           }
           await tx.product.update({
             where: { id: product.id },
@@ -830,10 +834,10 @@ export async function receiveGoods(
           });
           costChanges.push({
             productId: product.id,
-            before: money(product.cost).toFixed(2),
-            after: newCost.toFixed(2),
+            before: unitCostDec(product.cost).toFixed(4),
+            after: newCost.toFixed(4),
             quantityReceived: qtyIn,
-            unitCostActual: unitCostActual.toFixed(2),
+            unitCostActual: unitCostActual.toFixed(4),
           });
         }
       }
@@ -915,7 +919,24 @@ export type ReorderSuggestion = {
     sku: string;
     name: string;
     storeId: string;
+    /** On-hand sellable = stock − reserved. */
     available: number;
+    /**
+     * Outstanding units already committed on SUBMITTED / PARTIALLY_RECEIVED POs
+     * (Σ orderedQty − receivedQty, excluding shortClosed lines).
+     */
+    onOrder: number;
+    /** Open PO numbers that contribute to onOrder. */
+    openPoNumbers: string[];
+    /**
+     * Units sitting on DRAFT POs for this SKU — not counted in position, but listed so
+     * the buyer does not open a duplicate draft.
+     */
+    draftOnOrder: number;
+    /** DRAFT PO numbers corresponding to draftOnOrder. */
+    draftPoNumbers: string[];
+    /** available + onOrder (DRAFT excluded). Suggest when ≤ reorderAt. */
+    position: number;
     reorderAt: number;
     caseSize: number;
     minOrderQty: number;
@@ -926,9 +947,86 @@ export type ReorderSuggestion = {
   suggestedSubtotal: string;
 };
 
+type PoPipelineAgg = {
+  onOrder: number;
+  openPoNumbers: string[];
+  draftOnOrder: number;
+  draftPoNumbers: string[];
+};
+
 /**
- * For products at/below reorderAt (using available = stock − reserved), propose draft
- * PO lines grouped by preferred supplier, rounded up to caseSize and minOrderQty.
+ * Pipeline qty already spoken for on open / draft POs for the given products.
+ *
+ * onOrder counts SUBMITTED + PARTIALLY_RECEIVED only (outstanding = ordered − received,
+ * shortClosed lines ignored). DRAFT qty is returned separately as draftOnOrder.
+ *
+ * Phase 3 extends this for stores ordering from the warehouse.
+ */
+async function aggregateOpenPoPipeline(
+  productIds: string[],
+): Promise<Map<string, PoPipelineAgg>> {
+  const byProduct = new Map<string, PoPipelineAgg>();
+  for (const id of productIds) {
+    byProduct.set(id, {
+      onOrder: 0,
+      openPoNumbers: [],
+      draftOnOrder: 0,
+      draftPoNumbers: [],
+    });
+  }
+  if (productIds.length === 0) return byProduct;
+
+  const lines = await prisma.purchaseOrderLine.findMany({
+    where: {
+      productId: { in: productIds },
+      shortClosed: false,
+      po: {
+        status: {
+          in: [
+            PurchaseOrderStatus.DRAFT,
+            PurchaseOrderStatus.SUBMITTED,
+            PurchaseOrderStatus.PARTIALLY_RECEIVED,
+          ],
+        },
+      },
+    },
+    select: {
+      productId: true,
+      orderedQty: true,
+      receivedQty: true,
+      po: { select: { poNumber: true, status: true } },
+    },
+  });
+
+  for (const line of lines) {
+    const agg = byProduct.get(line.productId);
+    if (!agg) continue;
+    const outstanding = Math.max(0, line.orderedQty - line.receivedQty);
+    if (outstanding <= 0) continue;
+
+    if (line.po.status === PurchaseOrderStatus.DRAFT) {
+      agg.draftOnOrder += outstanding;
+      if (!agg.draftPoNumbers.includes(line.po.poNumber)) {
+        agg.draftPoNumbers.push(line.po.poNumber);
+      }
+    } else {
+      // SUBMITTED or PARTIALLY_RECEIVED
+      agg.onOrder += outstanding;
+      if (!agg.openPoNumbers.includes(line.po.poNumber)) {
+        agg.openPoNumbers.push(line.po.poNumber);
+      }
+    }
+  }
+
+  return byProduct;
+}
+
+/**
+ * For products whose pipeline position (stock − reserved + onOrder) is at/below reorderAt,
+ * propose draft PO lines grouped by preferred supplier, rounded up to caseSize and minOrderQty.
+ *
+ * DRAFT POs are excluded from onOrder/position but surfaced as draftOnOrder so buyers
+ * see an existing draft before creating another.
  */
 export async function suggestReorderDrafts(
   actor: AuthUser,
@@ -946,23 +1044,31 @@ export async function suggestReorderDrafts(
     },
   });
 
+  const pipeline = await aggregateOpenPoPipeline(products.map((p) => p.id));
   const bySupplier = new Map<string, ReorderSuggestion>();
 
   for (const product of products) {
     const available = product.stock - product.reserved;
-    if (available > product.reorderAt) continue;
+    const pipe = pipeline.get(product.id) ?? {
+      onOrder: 0,
+      openPoNumbers: [],
+      draftOnOrder: 0,
+      draftPoNumbers: [],
+    };
+    const position = available + pipe.onOrder;
+    if (position > product.reorderAt) continue;
 
     const link = product.supplierProducts[0];
     if (!link || !link.supplier.isActive) continue;
 
-    // Bring available back above reorderAt, then honor minOrderQty + case packs.
-    const deficit = product.reorderAt - available + 1;
+    // Bring position back above reorderAt, then honor minOrderQty + case packs.
+    const deficit = product.reorderAt - position + 1;
     let suggestedQty = Math.max(deficit, link.minOrderQty);
     if (link.caseSize > 1) {
       suggestedQty = Math.ceil(suggestedQty / link.caseSize) * link.caseSize;
     }
 
-    const unitCost = money(link.unitCost);
+    const unitCost = unitCostDec(link.unitCost);
     const lineTotal = money(unitCost.mul(suggestedQty));
 
     let group = bySupplier.get(link.supplierId);
@@ -981,10 +1087,15 @@ export async function suggestReorderDrafts(
       name: product.name,
       storeId: product.storeId,
       available,
+      onOrder: pipe.onOrder,
+      openPoNumbers: pipe.openPoNumbers,
+      draftOnOrder: pipe.draftOnOrder,
+      draftPoNumbers: pipe.draftPoNumbers,
+      position,
       reorderAt: product.reorderAt,
       caseSize: link.caseSize,
       minOrderQty: link.minOrderQty,
-      unitCost: unitCost.toFixed(2),
+      unitCost: unitCost.toFixed(4),
       suggestedQty,
       lineTotal: lineTotal.toFixed(2),
     });

@@ -46,13 +46,16 @@ lotsRouter.get("/", async (req, res) => {
       expiryBefore = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     }
 
-    const lots = await inventoryService.listLots({
-      storeId,
-      q: typeof req.query.q === "string" ? req.query.q : undefined,
-      status,
-      expiryBefore,
-      productId: typeof req.query.productId === "string" ? req.query.productId : undefined,
-    });
+    const lots = await inventoryService.listLots(
+      {
+        storeId,
+        q: typeof req.query.q === "string" ? req.query.q : undefined,
+        status,
+        expiryBefore,
+        productId: typeof req.query.productId === "string" ? req.query.productId : undefined,
+      },
+      req.user!,
+    );
     res.status(200).json({ lots });
   } catch (error) {
     handleError(res, error);

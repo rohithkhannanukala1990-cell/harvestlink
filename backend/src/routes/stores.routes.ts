@@ -10,7 +10,7 @@
  * GET /settlement/network-summary (Phase 6) remains the rollup totals endpoint.
  * PATCH updates name/address (store/co-op admin) and operatorPercent (COOP_ADMIN only).
  */
-import { Role } from "@prisma/client";
+import { LocationType, Role } from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { AppError } from "../lib/errors.js";
@@ -20,10 +20,13 @@ import { requirePasswordChanged } from "../middleware/requirePasswordChanged.mid
 import { requireRole } from "../middleware/requireRole.middleware.js";
 import * as storesService from "../services/stores.service.js";
 
+const locationTypeSchema = z.nativeEnum(LocationType);
+
 const updateStoreSchema = z
   .object({
     name: z.string().min(1).optional(),
     address: z.string().min(1).optional(),
+    locationType: locationTypeSchema.optional(),
     operatorPercent: z.number().min(0).max(100).optional(),
     taxRate: z.number().min(0).max(100).optional(),
     refundPolicy: z.string().min(1).optional(),
@@ -49,7 +52,15 @@ storesRouter.use(requirePasswordChanged);
 
 storesRouter.get("/", requireRole(Role.CASHIER, Role.STORE_ADMIN, Role.COOP_ADMIN), async (req, res) => {
   try {
-    const stores = await storesService.listStores(req.user!);
+    const raw = typeof req.query.locationType === "string" ? req.query.locationType : undefined;
+    const parsedType = raw ? locationTypeSchema.safeParse(raw) : null;
+    if (parsedType && !parsedType.success) {
+      res.status(400).json({ error: "Invalid locationType", details: parsedType.error.flatten() });
+      return;
+    }
+    const stores = await storesService.listStores(req.user!, {
+      locationType: parsedType?.success ? parsedType.data : undefined,
+    });
     res.status(200).json({ stores });
   } catch (error) {
     handleError(res, error);

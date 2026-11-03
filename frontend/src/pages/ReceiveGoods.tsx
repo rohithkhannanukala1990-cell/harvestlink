@@ -21,9 +21,9 @@ import {
   Card,
   Field,
   Keypad,
-  Money,
   PageHeader,
   StatusBadge,
+  UnitCost,
 } from "../components/ui";
 
 type ScanTarget = "lotNumber" | "lotBarcode";
@@ -315,7 +315,7 @@ export function ReceiveGoodsPage() {
                 {line.product?.sku} · need{" "}
                 <span className="tabular">{remaining(line)}</span> of{" "}
                 <span className="tabular">{line.orderedQty}</span> · PO{" "}
-                <Money value={line.unitCost} />
+                <UnitCost value={line.unitCost} />
               </div>
               {draft?.quantityReceived && (
                 <div className="mt-1 text-base font-medium text-ink">

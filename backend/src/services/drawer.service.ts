@@ -2,7 +2,14 @@
  * Cash drawer open / close / current for Harvestlink stores.
  * Cash sales require an open drawer (enforced in createSale).
  */
-import { PaymentMethod, PaymentStatus, Prisma, Role, type CashDrawer } from "@prisma/client";
+import {
+  LocationType,
+  PaymentMethod,
+  PaymentStatus,
+  Prisma,
+  Role,
+  type CashDrawer,
+} from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
@@ -35,6 +42,15 @@ export async function openDrawer(
 
   if (!Number.isFinite(openingFloat) || openingFloat < 0) {
     throw new AppError(400, "openingFloat must be a non-negative number");
+  }
+
+  const store = await prisma.store.findUnique({ where: { id: storeId } });
+  if (!store) {
+    throw new AppError(404, "Store not found");
+  }
+  // POS entry-point only — warehouses have no till.
+  if (store.locationType === LocationType.WAREHOUSE) {
+    throw new AppError(409, "Cash drawers are not opened at a warehouse");
   }
 
   const existing = await getCurrentDrawer(storeId);

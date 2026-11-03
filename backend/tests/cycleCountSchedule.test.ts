@@ -66,7 +66,7 @@ describe("cycle count schedule", () => {
       cycleCountSize: 10,
     });
 
-    const highNew = await createProduct(store.id, { sku: "HIGH-NEW", stock: 50, cost: 4 });
+    await createProduct(store.id, { sku: "HIGH-NEW", stock: 50, cost: 4 });
     const highRecent = await createProduct(store.id, { sku: "HIGH-RECENT", stock: 50, cost: 4 });
     const lowRecent = await createProduct(store.id, { sku: "LOW-RECENT", stock: 10, cost: 1 });
     const lowVariance = await createProduct(store.id, { sku: "LOW-VAR", stock: 10, cost: 1 });

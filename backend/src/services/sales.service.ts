@@ -43,11 +43,28 @@ import {
 import { env } from "../config/env.js";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
+import {
+  lockActiveLotsForProducts,
+  lockLots,
+  lockProducts,
+} from "../lib/locks.js";
 import { prisma } from "../lib/prisma.js";
 import { getStripe, toStripeCents } from "../lib/stripe.js";
 import { moneyDec } from "../lib/money.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
+import {
+  allocateFefo,
+  consumeDirect,
+  consumeReserved,
+  release,
+  reserve,
+  restockToLots,
+  type LotAllocation,
+  type WorkingLot,
+} from "./stockEngine.js";
+
+export type { LotAllocation } from "./stockEngine.js";
 import { resolveBenefits } from "./benefits.service.js";
 
 export { resolveStoreScope };
@@ -125,36 +142,6 @@ export type CreateSaleResult = {
   benefitSkips?: Array<{ benefitId: string; description: string; reason: string }>;
 };
 
-type LockedProductRow = {
-  id: string;
-  storeId: string;
-  sku: string;
-  name: string;
-  category: string;
-  price: Prisma.Decimal;
-  stock: number;
-  reserved: number;
-  taxExempt: boolean;
-};
-
-type LockedLotRow = {
-  id: string;
-  productId: string;
-  storeId: string;
-  quantityRemaining: number;
-  quantityReserved: number;
-  unitCost: Prisma.Decimal;
-  expiryDate: Date | null;
-  receivedAt: Date;
-  status: string;
-};
-
-export type LotAllocation = {
-  lotId: string;
-  quantity: number;
-  unitCost: Prisma.Decimal;
-};
-
 function stockNeededByProduct(items: SaleLineInput[]): Map<string, number> {
   const quantityByProductId = new Map<string, number>();
   for (const item of items) {
@@ -169,82 +156,8 @@ function stockNeededByProduct(items: SaleLineInput[]): Map<string, number> {
   return quantityByProductId;
 }
 
-type WorkingLot = LockedLotRow & {
-  /** Units already allocated to earlier lines in this transaction (planning only). */
-  taken: number;
-};
-
 function workingLotAvailable(lot: WorkingLot): number {
   return lot.quantityRemaining - lot.quantityReserved - lot.taken;
-}
-
-/**
- * FEFO allocate `qty` across mutable lot rows (already locked + FEFO-ordered).
- * Offline cash may drive the final lot's remaining negative when available is short.
- */
-function allocateLotsFefo(
-  lots: WorkingLot[],
-  qty: number,
-  options: { offlineSync: boolean; sku: string; productId: string },
-): LotAllocation[] {
-  const totalAvail = lots.reduce((s, l) => s + Math.max(0, workingLotAvailable(l)), 0);
-  if (totalAvail < qty && !options.offlineSync) {
-    throw new AppError(409, "Insufficient stock for product", {
-      productId: options.productId,
-      sku: options.sku,
-      requested: qty,
-      available: totalAvail,
-      stock: lots.reduce((s, l) => s + l.quantityRemaining, 0),
-      reserved: lots.reduce((s, l) => s + l.quantityReserved, 0),
-    });
-  }
-  if (lots.length === 0) {
-    throw new AppError(409, "Insufficient stock for product", {
-      productId: options.productId,
-      sku: options.sku,
-      requested: qty,
-      available: 0,
-    });
-  }
-
-  const allocations: LotAllocation[] = [];
-  let remaining = qty;
-
-  for (const lot of lots) {
-    if (remaining <= 0) break;
-    const avail = Math.max(0, workingLotAvailable(lot));
-    if (avail <= 0) continue;
-    const take = Math.min(remaining, avail);
-    allocations.push({ lotId: lot.id, quantity: take, unitCost: lot.unitCost });
-    lot.taken += take;
-    remaining -= take;
-  }
-
-  if (remaining > 0 && options.offlineSync) {
-    const target = lots[lots.length - 1]!;
-    const existing = allocations.find((a) => a.lotId === target.id);
-    if (existing) existing.quantity += remaining;
-    else {
-      allocations.push({
-        lotId: target.id,
-        quantity: remaining,
-        unitCost: target.unitCost,
-      });
-    }
-    target.taken += remaining;
-    remaining = 0;
-  }
-
-  if (remaining > 0) {
-    throw new AppError(409, "Insufficient stock for product", {
-      productId: options.productId,
-      sku: options.sku,
-      requested: qty,
-      available: totalAvail,
-    });
-  }
-
-  return allocations;
 }
 
 /**
@@ -263,47 +176,38 @@ function tierDiscountPercent(
 /**
  * Releases lot.quantityReserved + Product.reserved for every line on a PENDING sale.
  * Does not change physical stock / quantityRemaining.
+ * Locks Product then Lot (see lib/locks.ts) before writing either.
  */
 async function releaseReservationForSale(
   tx: Prisma.TransactionClient,
   saleId: string,
-  storeId: string,
 ): Promise<void> {
   const items = await tx.saleItem.findMany({
     where: { saleId },
     include: { lotAllocations: true },
   });
+  const lockedProducts = await lockProducts(
+    tx,
+    items.map((item) => item.productId),
+  );
+  const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+  const lockedLots = await lockLots(
+    tx,
+    items.flatMap((item) => item.lotAllocations.map((a) => a.lotId)),
+  );
   for (const item of items) {
-    for (const alloc of item.lotAllocations) {
-      const lotUpdated = await tx.lot.updateMany({
-        where: {
-          id: alloc.lotId,
-          quantityReserved: { gte: alloc.quantity },
-        },
-        data: { quantityReserved: { decrement: alloc.quantity } },
-      });
-      if (lotUpdated.count !== 1) {
-        throw new AppError(500, "Failed to release lot reservation", {
-          lotId: alloc.lotId,
-          quantity: alloc.quantity,
-        });
-      }
-    }
-
-    const updated = await tx.product.updateMany({
-      where: {
-        id: item.productId,
-        storeId,
-        reserved: { gte: item.quantity },
-      },
-      data: { reserved: { decrement: item.quantity } },
-    });
-    if (updated.count !== 1) {
+    const product = productById.get(item.productId);
+    if (!product) {
       throw new AppError(500, "Failed to release stock reservation", {
         productId: item.productId,
-        quantity: item.quantity,
       });
     }
+    const allocations: LotAllocation[] = item.lotAllocations.map((a) => ({
+      lotId: a.lotId,
+      quantity: a.quantity,
+      unitCost: new Prisma.Decimal(0),
+    }));
+    await release(tx, product, lockedLots, allocations);
   }
 }
 
@@ -423,13 +327,8 @@ export async function createSale(
       }
 
       // Load catalog rows (prices / tax). Availability is enforced on LOTS below.
-      const lockedProducts = await tx.$queryRaw<LockedProductRow[]>`
-        SELECT id, "storeId", sku, name, category, price, stock, reserved, "taxExempt"
-        FROM "Product"
-        WHERE id IN (${Prisma.join(productIds)})
-          AND "storeId" = ${storeId}
-        FOR UPDATE
-      `;
+      // Product then ACTIVE lots — see lib/locks.ts LOCK ORDER.
+      const lockedProducts = (await lockProducts(tx, productIds)).filter((p) => p.storeId === storeId);
 
       if (lockedProducts.length !== productIds.length) {
         const found = new Set(lockedProducts.map((p) => p.id));
@@ -442,17 +341,7 @@ export async function createSale(
       const productById = new Map(lockedProducts.map((p) => [p.id, p]));
 
       // FEFO lot lock — ACTIVE only (QUARANTINED / RECALLED / EXPIRED never sell).
-      // First expired, first out. NULLS LAST for legacy unknown expiry.
-      const lockedLots = await tx.$queryRaw<LockedLotRow[]>`
-        SELECT id, "productId", "storeId", "quantityRemaining", "quantityReserved",
-               "unitCost", "expiryDate", "receivedAt", status::text AS status
-        FROM "Lot"
-        WHERE "productId" IN (${Prisma.join(productIds)})
-          AND "storeId" = ${storeId}
-          AND status = 'ACTIVE'
-        ORDER BY "productId" ASC, "expiryDate" ASC NULLS LAST, "receivedAt" ASC, id ASC
-        FOR UPDATE
-      `;
+      const lockedLots = await lockActiveLotsForProducts(tx, productIds, storeId);
 
       const workingLotsByProduct = new Map<string, WorkingLot[]>();
       for (const lot of lockedLots) {
@@ -497,7 +386,7 @@ export async function createSale(
           }
         }
 
-        const allocs = allocateLotsFefo(lots, item.quantity, {
+        const allocs = allocateFefo(lots, item.quantity, {
           offlineSync,
           sku: product.sku,
           productId: product.id,
@@ -522,9 +411,11 @@ export async function createSale(
           taxRate: Prisma.Decimal;
           memberDiscountBearer: DiscountBearer;
           memberDiscountSharedPercent: Prisma.Decimal;
+          locationType: string;
         }>
       >`
-        SELECT id, "operatorPercent", "isActive", "taxRate", "memberDiscountBearer", "memberDiscountSharedPercent"
+        SELECT id, "operatorPercent", "isActive", "taxRate", "memberDiscountBearer", "memberDiscountSharedPercent",
+               "locationType"::text AS "locationType"
         FROM "Store"
         WHERE id = ${storeId}
         FOR UPDATE
@@ -536,6 +427,10 @@ export async function createSale(
       }
       if (!store.isActive) {
         throw new AppError(400, "Store is inactive and cannot accept sales");
+      }
+      // POS entry-point only — store orders (Phase 3) will draw warehouse stock via the stock engine.
+      if (store.locationType === "WAREHOUSE") {
+        throw new AppError(409, "Point-of-sale sales are not taken at a warehouse");
       }
 
       // Offline cash was already taken during the outage — do not block sync on drawer state.
@@ -715,26 +610,8 @@ export async function createSale(
         // Consume lots immediately (cash is PAID). May leave remaining negative on offlineSync.
         for (let i = 0; i < lineAllocations.length; i++) {
           const allocs = lineAllocations[i]!;
-          const lineQty = input.items[i]!.quantity;
-          for (const alloc of allocs) {
-            await tx.lot.update({
-              where: { id: alloc.lotId },
-              data: {
-                quantityRemaining: { decrement: alloc.quantity },
-              },
-            });
-            const lotAfter = await tx.lot.findUniqueOrThrow({ where: { id: alloc.lotId } });
-            if (lotAfter.quantityRemaining === 0) {
-              await tx.lot.update({
-                where: { id: alloc.lotId },
-                data: { status: LotStatus.DEPLETED },
-              });
-            }
-          }
-          await tx.product.update({
-            where: { id: input.items[i]!.productId },
-            data: { stock: { decrement: lineQty } },
-          });
+          const product = productById.get(input.items[i]!.productId)!;
+          await consumeDirect(tx, product, lockedLots, allocs, { offlineSync });
         }
 
         const created = await tx.sale.create({
@@ -824,17 +701,8 @@ export async function createSale(
       // Card path: hold reservation on lots + Product.reserved across the payment gap.
       for (let i = 0; i < lineAllocations.length; i++) {
         const allocs = lineAllocations[i]!;
-        const lineQty = input.items[i]!.quantity;
-        for (const alloc of allocs) {
-          await tx.lot.update({
-            where: { id: alloc.lotId },
-            data: { quantityReserved: { increment: alloc.quantity } },
-          });
-        }
-        await tx.product.update({
-          where: { id: input.items[i]!.productId },
-          data: { reserved: { increment: lineQty } },
-        });
+        const product = productById.get(input.items[i]!.productId)!;
+        await reserve(tx, product, lockedLots, allocs);
       }
 
       const pendingSale = await tx.sale.create({
@@ -1083,6 +951,7 @@ export async function createTerminalConnectionToken(): Promise<{ secret: string 
 export async function finalizePaidSale(saleId: string): Promise<SaleWithItems> {
   try {
     return await prisma.$transaction(async (tx) => {
+      // LOCK ORDER rule 0: claim the Sale document before any Product/Lot locks.
       const sales = await tx.$queryRaw<Sale[]>`
         SELECT * FROM "Sale" WHERE id = ${saleId} FOR UPDATE
       `;
@@ -1122,19 +991,36 @@ export async function finalizePaidSale(saleId: string): Promise<SaleWithItems> {
         throw new AppError(500, "Sale has no line items");
       }
 
+      // Product → Lot before any stock/reservation writes (lib/locks.ts).
+      const lockedProducts = await lockProducts(
+        tx,
+        items.map((item) => item.productId),
+      );
+      const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+      const lockedLots = await lockLots(
+        tx,
+        items.flatMap((item) => item.lotAllocations.map((a) => a.lotId)),
+      );
+      const lotById = new Map(lockedLots.map((l) => [l.id, l]));
+
       for (const item of items) {
         if (item.lotAllocations.length === 0) {
           throw new AppError(500, "Sale item has no lot allocations", {
             saleItemId: item.id,
           });
         }
+        const product = productById.get(item.productId);
+        if (!product) {
+          throw new AppError(500, "Product missing at finalization", { productId: item.productId });
+        }
 
-        const lotRows = await tx.lot.findMany({
-          where: { id: { in: item.lotAllocations.map((a) => a.lotId) } },
-        });
-        const lotById = new Map(lotRows.map((l) => [l.id, l]));
+        const allocations: LotAllocation[] = item.lotAllocations.map((a) => ({
+          lotId: a.lotId,
+          quantity: a.quantity,
+          unitCost: new Prisma.Decimal(0),
+        }));
 
-        const reservationIntact = item.lotAllocations.every((alloc) => {
+        const reservationIntact = allocations.every((alloc) => {
           const lot = lotById.get(alloc.lotId);
           return (
             lot != null &&
@@ -1144,79 +1030,12 @@ export async function finalizePaidSale(saleId: string): Promise<SaleWithItems> {
         });
 
         if (reservationIntact) {
-          for (const alloc of item.lotAllocations) {
-            await tx.lot.update({
-              where: { id: alloc.lotId },
-              data: {
-                quantityRemaining: { decrement: alloc.quantity },
-                quantityReserved: { decrement: alloc.quantity },
-              },
-            });
-            const lotAfter = await tx.lot.findUniqueOrThrow({ where: { id: alloc.lotId } });
-            if (lotAfter.quantityRemaining === 0) {
-              await tx.lot.update({
-                where: { id: alloc.lotId },
-                data: { status: LotStatus.DEPLETED },
-              });
-            }
-          }
-          const productUpd = await tx.product.updateMany({
-            where: {
-              id: item.productId,
-              storeId: sale.storeId,
-              reserved: { gte: item.quantity },
-              stock: { gte: item.quantity },
-            },
-            data: {
-              stock: { decrement: item.quantity },
-              reserved: { decrement: item.quantity },
-            },
-          });
-          if (productUpd.count !== 1) {
-            throw new AppError(500, "Failed to finalize product reservation rollup", {
-              productId: item.productId,
-              quantity: item.quantity,
-            });
-          }
+          await consumeReserved(tx, product, lockedLots, allocations);
           continue;
         }
 
         // Last-chance claim after expiry released the hold: take from available lot qty.
-        for (const alloc of item.lotAllocations) {
-          const claim = await tx.$executeRaw`
-            UPDATE "Lot"
-            SET "quantityRemaining" = "quantityRemaining" - ${alloc.quantity},
-                status = CASE
-                  WHEN ("quantityRemaining" - ${alloc.quantity}) = 0 THEN 'DEPLETED'::"LotStatus"
-                  ELSE status
-                END
-            WHERE id = ${alloc.lotId}
-              AND "storeId" = ${sale.storeId}
-              AND status = 'ACTIVE'
-              AND ("quantityRemaining" - "quantityReserved") >= ${alloc.quantity}
-          `;
-          if (claim !== 1) {
-            throw new AppError(409, "Insufficient stock at payment finalization", {
-              productId: item.productId,
-              lotId: alloc.lotId,
-              quantity: alloc.quantity,
-            });
-          }
-        }
-
-        const productClaim = await tx.$executeRaw`
-          UPDATE "Product"
-          SET stock = stock - ${item.quantity}
-          WHERE id = ${item.productId}
-            AND "storeId" = ${sale.storeId}
-            AND (stock - reserved) >= ${item.quantity}
-        `;
-        if (productClaim !== 1) {
-          throw new AppError(409, "Insufficient stock at payment finalization", {
-            productId: item.productId,
-            quantity: item.quantity,
-          });
-        }
+        await consumeDirect(tx, product, lockedLots, allocations, { requireAvailable: true });
       }
 
       return tx.sale.update({
@@ -1283,7 +1102,7 @@ async function settleUnpaidSale(
         });
       }
 
-      await releaseReservationForSale(tx, saleId, sale.storeId);
+      await releaseReservationForSale(tx, saleId);
 
       return tx.sale.update({
         where: { id: saleId },
@@ -1552,6 +1371,7 @@ export async function finalizeSucceededRefund(
       throw new AppError(404, "SaleRefund not found");
     }
 
+    // LOCK ORDER rule 0: claim the Sale document before any Product/Lot locks (refund finalisation).
     const locked = await tx.$queryRaw<Sale[]>`
       SELECT * FROM "Sale" WHERE id = ${refund.saleId} FOR UPDATE
     `;
@@ -1574,31 +1394,55 @@ export async function finalizeSucceededRefund(
     const items = await tx.saleItem.findMany({ where: { saleId: sale.id } });
     const itemById = new Map(items.map((item) => [item.id, item]));
 
-    for (const line of refund.lines) {
-      const item = itemById.get(line.saleItemId);
-      if (!item) {
-        throw new AppError(500, "Refund line references missing SaleItem");
+    // When restocking, lock Product → Lot before writing either (lib/locks.ts).
+    if (refund.restock) {
+      const restockItems = refund.lines
+        .map((line) => itemById.get(line.saleItemId))
+        .filter((item): item is NonNullable<typeof item> => item != null);
+      const allocationsByItem = new Map<
+        string,
+        Array<{ id: string; lotId: string; quantity: number }>
+      >();
+      for (const item of restockItems) {
+        allocationsByItem.set(
+          item.id,
+          await tx.saleItemLot.findMany({
+            where: { saleItemId: item.id },
+            orderBy: { id: "asc" },
+            select: { id: true, lotId: true, quantity: true },
+          }),
+        );
       }
-      const remaining = item.quantity - item.refundedQuantity;
-      if (line.quantity > remaining) {
-        throw new AppError(409, "Refund line exceeds remaining quantity at finalize", {
-          saleItemId: line.saleItemId,
+      const lockedProducts = await lockProducts(
+        tx,
+        restockItems.map((item) => item.productId),
+      );
+      const productById = new Map(lockedProducts.map((p) => [p.id, p]));
+      const lockedLots = await lockLots(
+        tx,
+        [...allocationsByItem.values()].flatMap((allocs) => allocs.map((a) => a.lotId)),
+      );
+
+      for (const line of refund.lines) {
+        const item = itemById.get(line.saleItemId);
+        if (!item) {
+          throw new AppError(500, "Refund line references missing SaleItem");
+        }
+        const remaining = item.quantity - item.refundedQuantity;
+        if (line.quantity > remaining) {
+          throw new AppError(409, "Refund line exceeds remaining quantity at finalize", {
+            saleItemId: line.saleItemId,
+          });
+        }
+
+        await tx.saleItem.update({
+          where: { id: item.id },
+          data: { refundedQuantity: { increment: line.quantity } },
         });
-      }
+        item.refundedQuantity += line.quantity;
 
-      await tx.saleItem.update({
-        where: { id: item.id },
-        data: { refundedQuantity: { increment: line.quantity } },
-      });
-      item.refundedQuantity += line.quantity;
-
-      if (refund.restock) {
         // Returned goods go back to the ORIGINAL lots from SaleItemLot (traceability).
-        // Walk allocations in sale order; skip units already refunded on this line.
-        const allocations = await tx.saleItemLot.findMany({
-          where: { saleItemId: item.id },
-          orderBy: { id: "asc" },
-        });
+        const allocations = allocationsByItem.get(item.id) ?? [];
         if (allocations.length === 0) {
           throw new AppError(500, "Sale item has no lot allocations for restock", {
             saleItemId: item.id,
@@ -1607,6 +1451,7 @@ export async function finalizeSucceededRefund(
 
         let skip = item.refundedQuantity - line.quantity; // already-refunded before this line
         let toRestore = line.quantity;
+        const restorations: Array<{ lotId: string; quantity: number }> = [];
         for (const alloc of allocations) {
           if (toRestore <= 0) break;
           const skipHere = Math.min(alloc.quantity, skip);
@@ -1614,17 +1459,7 @@ export async function finalizeSucceededRefund(
           const capacity = alloc.quantity - skipHere;
           const restore = Math.min(capacity, toRestore);
           if (restore <= 0) continue;
-
-          const lot = await tx.lot.update({
-            where: { id: alloc.lotId },
-            data: { quantityRemaining: { increment: restore } },
-          });
-          if (lot.status === LotStatus.DEPLETED && lot.quantityRemaining > 0) {
-            await tx.lot.update({
-              where: { id: alloc.lotId },
-              data: { status: LotStatus.ACTIVE },
-            });
-          }
+          restorations.push({ lotId: alloc.lotId, quantity: restore });
           toRestore -= restore;
         }
         if (toRestore > 0) {
@@ -1634,11 +1469,33 @@ export async function finalizeSucceededRefund(
           });
         }
 
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { stock: { increment: line.quantity } },
+        const product = productById.get(item.productId);
+        if (!product) {
+          throw new AppError(500, "Product missing at refund restock", { productId: item.productId });
+        }
+        await restockToLots(tx, product, lockedLots, restorations);
+      }
+    }
+
+    if (!refund.restock) {
+      for (const line of refund.lines) {
+        const item = itemById.get(line.saleItemId);
+        if (!item) {
+          throw new AppError(500, "Refund line references missing SaleItem");
+        }
+        const remaining = item.quantity - item.refundedQuantity;
+        if (line.quantity > remaining) {
+          throw new AppError(409, "Refund line exceeds remaining quantity at finalize", {
+            saleItemId: line.saleItemId,
+          });
+        }
+
+        await tx.saleItem.update({
+          where: { id: item.id },
+          data: { refundedQuantity: { increment: line.quantity } },
         });
-      } else {
+        item.refundedQuantity += line.quantity;
+
         await tx.inventoryWriteOff.create({
           data: {
             storeId: sale.storeId,

@@ -140,7 +140,13 @@ enum LotStatus {
   DEPLETED
 }
 
-/// A physical retail location in the co-op network, including the operator commission rate for that store.
+/// Stock-holding location kind. Warehouses share Store / storeId with retail (lots, FEFO, counts…).
+enum LocationType {
+  RETAIL_STORE
+  WAREHOUSE
+}
+
+/// A stock-holding location in the co-op network (retail store or warehouse). Don't rename the model.
 model Store {
   /// Primary key uniquely identifying this store.
   id              String   @id @default(cuid())
@@ -148,8 +154,11 @@ model Store {
   name            String
   /// Street / mailing address of the store for records and logistics.
   address         String
+  /// RETAIL_STORE (POS) or WAREHOUSE (no POS; co-op operated). Immutable once lots or sales exist.
+  locationType    LocationType @default(RETAIL_STORE)
   /// Fixed percentage of store sales the operator earns (snapshotted onto each Sale so history stays stable).
   /// Applied to PRE-TAX subtotal only — sales tax is remitted to the state, not co-op revenue.
+  /// Must be 0 for WAREHOUSE (the co-op runs it).
   operatorPercent Decimal  @db.Decimal(5, 2)
   /// Sales-tax rate (%) applied to non-exempt line items at this store.
   taxRate         Decimal  @default(0) @db.Decimal(5, 2)
@@ -192,6 +201,8 @@ model Store {
   stockCounts StockCount[]
   /// Scannable codes registered against this store's products.
   productBarcodes ProductBarcode[]
+  /// CooperativeSettings rows that name this location as the main warehouse (0–1 in practice).
+  mainWarehouseFor CooperativeSettings[] @relation("MainWarehouse")
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -257,26 +268,81 @@ model User {
   stockCountLinesCounted   StockCountLine[] @relation("StockCountLineCountedBy")
   /// Count lines this user recounted.
   stockCountLinesRecounted StockCountLine[] @relation("StockCountLineRecountedBy")
+  /// Catalog backfill disagreements this user marked resolved.
+  catalogDisagreementsResolved CatalogDisagreement[] @relation("CatalogDisagreementResolvedBy")
 
   @@index([storeId])
 }
 
-/// A sellable SKU in a store's catalog, including pricing and inventory levels.
+/// Which CatalogItem identity field locations disagreed on during backfill.
+enum CatalogDisagreementField {
+  name
+  category
+  taxExempt
+}
+
+/// Open (or resolved) SKU identity mismatch across locations — survives multi-host deploys
+/// (unlike a local JSON file). One open row per sku+field; resolve records who accepted chosenValue.
+model CatalogDisagreement {
+  id               String                    @id @default(cuid())
+  sku              String
+  field            CatalogDisagreementField
+  /// Distinct values with the store ids that hold each (JSON array).
+  values           Json
+  /// Mode / chosen master value (string form; booleans as "true"/"false").
+  chosenValue      String
+  resolvedAt       DateTime?
+  resolvedByUserId String?
+  createdAt        DateTime                  @default(now())
+
+  resolvedBy User? @relation("CatalogDisagreementResolvedBy", fields: [resolvedByUserId], references: [id])
+
+  @@index([resolvedAt])
+  @@index([sku, field])
+}
+
+/// Network master for a SKU — shared identity across every stock-holding location.
+/// Location Products copy sku/name/category/taxExempt from here; only local price/cost/stock vary.
+model CatalogItem {
+  id             String   @id @default(cuid())
+  /// Network-unique SKU code.
+  sku            String   @unique
+  name           String
+  category       String
+  taxExempt      Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  /// Sellable units in one case (≥ 1).
+  unitsPerCase   Int      @default(1)
+  /// Cases that make a full pallet; null when the SKU is not shipped as full pallets.
+  casesPerPallet Int?
+  caseWeightKg   Decimal? @db.Decimal(12, 3)
+  caseGtin       String?
+  /// Co-op ceiling at retail stores — Product.price at a RETAIL_STORE must be ≤ this.
+  maxShelfPrice  Decimal  @db.Decimal(12, 2)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  products Product[]
+}
+
+/// A location's instance of a CatalogItem (stock + local retail price / cost).
 model Product {
   /// Primary key uniquely identifying this product row.
   id        String   @id @default(cuid())
   /// Store that owns this catalog entry (SKU uniqueness is per store, not global).
   storeId   String
-  /// Store-local stock keeping unit code used at POS and receiving.
+  /// Network master SKU this location row mirrors (null only until backfill).
+  catalogItemId String?
+  /// Store-local stock keeping unit code used at POS and receiving — owned by CatalogItem.
   sku       String
-  /// Display name of the product on receipts and inventory screens.
+  /// Display name — owned by CatalogItem; edit the master, not this row.
   name      String
-  /// Merchandising category for filtering and reporting.
+  /// Merchandising category — owned by CatalogItem.
   category  String
-  /// Current retail selling price charged to the customer.
+  /// Current retail selling price charged to the customer (≤ CatalogItem.maxShelfPrice at retail).
   price     Decimal  @db.Decimal(12, 2)
-  /// Unit cost to the co-op / store, used for margin analysis.
-  cost      Decimal  @db.Decimal(12, 2)
+  /// Unit cost to the co-op / store, used for margin analysis (4 dp; rollup totals stay 2 dp).
+  cost      Decimal  @db.Decimal(14, 4)
   /// Units physically on hand at this store (shelf / backroom count).
   /// Do NOT treat this alone as sellable qty while unpaid PENDING sales exist.
   stock     Int
@@ -287,7 +353,7 @@ model Product {
   reserved  Int      @default(0)
   /// Stock level at which a reorder should be triggered (compared to available stock).
   reorderAt Int
-  /// When true, this SKU is sales-tax exempt (common for groceries).
+  /// When true, this SKU is sales-tax exempt (common for groceries) — owned by CatalogItem.
   taxExempt Boolean  @default(false)
   /// When this product was first added to the catalog.
   createdAt DateTime @default(now())
@@ -296,6 +362,7 @@ model Product {
 
   /// Owning store for this catalog item.
   store     Store      @relation(fields: [storeId], references: [id])
+  catalogItem CatalogItem? @relation(fields: [catalogItemId], references: [id])
   /// Line items on sales that referenced this product.
   saleItems SaleItem[]
   /// Audit trail of non-sale stock changes for this product.
@@ -317,6 +384,7 @@ model Product {
 
   /// Speeds store-scoped catalog and inventory queries.
   @@index([storeId])
+  @@index([catalogItemId])
   /// Two stores may each have "SKU-001"; uniqueness is (storeId, sku).
   @@unique([storeId, sku])
 }
@@ -419,10 +487,14 @@ model CooperativeSettings {
   highValueThreshold       Decimal @default(500) @db.Decimal(12, 2)
   /// Maximum products in one cycle count.
   cycleCountSize           Int     @default(20)
+  /// Location that receives containers (Phase 2) and supplies stores (Phase 3). Must be a WAREHOUSE.
+  mainWarehouseId       String?
   /// When this settings row was created.
   createdAt             DateTime @default(now())
   /// When settings were last updated.
   updatedAt             DateTime @updatedAt
+
+  mainWarehouse Store? @relation("MainWarehouse", fields: [mainWarehouseId], references: [id])
 }
 
 /// The one-time joining fee that makes someone a member. Confers NO voting rights.
@@ -960,8 +1032,8 @@ model SaleItemLot {
   lotId            String
   /// Units taken from this lot for the sale line.
   quantity         Int
-  /// Lot.unitCost frozen at sale time (margin / COGS).
-  unitCostSnapshot Decimal @db.Decimal(12, 2)
+  /// Lot.unitCost frozen at sale time (margin / COGS). 4 dp; line money stays 2 dp.
+  unitCostSnapshot Decimal @db.Decimal(14, 4)
 
   saleItem SaleItem @relation(fields: [saleItemId], references: [id], onDelete: Cascade)
   lot      Lot      @relation(fields: [lotId], references: [id])
@@ -1042,8 +1114,8 @@ model InventoryWriteOff {
   quantity     Int
   reason       String
   /// Lot unit cost at write-off time; null on rows written before valuation was recorded.
-  unitCost     Decimal? @db.Decimal(12, 2)
-  /// quantity × unitCost; null on rows written before valuation was recorded.
+  unitCost     Decimal? @db.Decimal(14, 4)
+  /// quantity × unitCost (rounded to 2 dp); null on rows written before valuation was recorded.
   value        Decimal? @db.Decimal(12, 2)
   createdAt    DateTime @default(now())
 
@@ -1258,10 +1330,10 @@ model SupplierProduct {
   supplierSku  String   @default("")
   /// Units per case (order quantities often round up to whole cases).
   caseSize     Int      @default(1)
-  /// Cost for one full case (informational; unitCost is used on PO lines).
+  /// Cost for one full case (informational; unitCost is used on PO lines). Stays 2 dp.
   caseCost     Decimal  @db.Decimal(12, 2)
-  /// Cost per sellable unit from this supplier (default PO line unitCost).
-  unitCost     Decimal  @db.Decimal(12, 2)
+  /// Cost per sellable unit from this supplier (default PO line unitCost). 4 dp.
+  unitCost     Decimal  @db.Decimal(14, 4)
   /// Minimum order quantity in units (enforced on reorder suggestions).
   minOrderQty  Int      @default(1)
   /// When true, reorder suggestions prefer this supplier for the product.
@@ -1336,9 +1408,9 @@ model PurchaseOrderLine {
   orderedQty  Int
   /// Cumulative units accepted into stock across all goods receipts.
   receivedQty Int     @default(0)
-  /// Negotiated / expected unit cost at order time (snapshot).
-  unitCost    Decimal @db.Decimal(12, 2)
-  /// orderedQty × unitCost at last recalculation.
+  /// Negotiated / expected unit cost at order time (snapshot). 4 dp.
+  unitCost    Decimal @db.Decimal(14, 4)
+  /// orderedQty × unitCost at last recalculation (2 dp).
   lineTotal   Decimal @db.Decimal(12, 2)
   /// When true, this line was closed short (short-receipt acknowledged).
   shortClosed Boolean @default(false)
@@ -1393,8 +1465,8 @@ model GoodsReceiptLine {
   quantityRejected  Int     @default(0)
   /// Required when quantityRejected > 0.
   rejectionReason   String?
-  /// Actual invoiced unit cost on this receipt (may differ from PO unitCost).
-  unitCostActual    Decimal   @db.Decimal(12, 2)
+  /// Actual invoiced unit cost on this receipt (may differ from PO unitCost). 4 dp.
+  unitCostActual    Decimal   @db.Decimal(14, 4)
   /// Supplier / dock lot number for the accepted units; null → auto-generated on receive.
   lotNumber         String?
   /// Sell-by / use-by date for the received lot (FEFO); null if unknown / N/A.
@@ -1452,10 +1524,10 @@ model Lot {
   countryOfOrigin    String?
   /// When this lot was received into the store.
   receivedAt         DateTime
-  /// Cost basis for THIS lot (per unit).
+  /// Cost basis for THIS lot (per unit). 4 dp — multiply by qty then round to 2 dp for value.
   /// Lot-level cost is the foundation for accurate margin. Two lots of the same product bought at
   /// different prices have different costs; a single product-level cost averages away the truth.
-  unitCost           Decimal   @db.Decimal(12, 2)
+  unitCost           Decimal   @db.Decimal(14, 4)
   /// Scannable lot label (supplier GS1-128 or a store-printed label), normalized like
   /// ProductBarcode.code. Scanning it goes straight to this lot — needed for lot-level counts.
   barcode            String?
