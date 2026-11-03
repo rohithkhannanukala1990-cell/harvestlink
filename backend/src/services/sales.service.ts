@@ -47,8 +47,6 @@ import {
   lockActiveLotsForProducts,
   lockLots,
   lockProducts,
-  type LockedLotRow,
-  type LockedProductRow,
 } from "../lib/locks.js";
 import { prisma } from "../lib/prisma.js";
 import { getStripe, toStripeCents } from "../lib/stripe.js";
@@ -183,7 +181,6 @@ function tierDiscountPercent(
 async function releaseReservationForSale(
   tx: Prisma.TransactionClient,
   saleId: string,
-  _storeId: string,
 ): Promise<void> {
   const items = await tx.saleItem.findMany({
     where: { saleId },
@@ -954,6 +951,7 @@ export async function createTerminalConnectionToken(): Promise<{ secret: string 
 export async function finalizePaidSale(saleId: string): Promise<SaleWithItems> {
   try {
     return await prisma.$transaction(async (tx) => {
+      // LOCK ORDER rule 0: claim the Sale document before any Product/Lot locks.
       const sales = await tx.$queryRaw<Sale[]>`
         SELECT * FROM "Sale" WHERE id = ${saleId} FOR UPDATE
       `;
@@ -1104,7 +1102,7 @@ async function settleUnpaidSale(
         });
       }
 
-      await releaseReservationForSale(tx, saleId, sale.storeId);
+      await releaseReservationForSale(tx, saleId);
 
       return tx.sale.update({
         where: { id: saleId },
@@ -1373,6 +1371,7 @@ export async function finalizeSucceededRefund(
       throw new AppError(404, "SaleRefund not found");
     }
 
+    // LOCK ORDER rule 0: claim the Sale document before any Product/Lot locks (refund finalisation).
     const locked = await tx.$queryRaw<Sale[]>`
       SELECT * FROM "Sale" WHERE id = ${refund.saleId} FOR UPDATE
     `;

@@ -3,7 +3,7 @@
  *
  * Thin layer: parse/validate the request, enforce auth/roles, call inventory.service.
  * Cashiers and store admins only see their JWT store; COOP_ADMIN must pass ?storeId=
- * to view or manage any store's catalog. Create/edit/delete/stock are STORE_ADMIN or
+ * to view or manage any store's catalog. Create/edit/delete/lot adjust are STORE_ADMIN or
  * COOP_ADMIN only — cashiers may list products for POS but not change the catalog.
  */
 import { Role } from "@prisma/client";
@@ -46,8 +46,9 @@ const updateProductSchema = z
     message: "At least one product field is required",
   });
 
-const adjustStockSchema = z.object({
-  newStock: z.number().int().nonnegative(),
+const adjustLotSchema = z.object({
+  lotId: z.string().min(1),
+  newQuantity: z.number().int().nonnegative(),
   reason: z.string().min(1),
   storeId: z.string().min(1).optional(),
 });
@@ -173,9 +174,9 @@ inventoryRouter.patch(
   requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
   async (req, res) => {
     try {
-      const parsed = adjustStockSchema.safeParse(req.body);
+      const parsed = adjustLotSchema.safeParse(req.body);
       if (!parsed.success) {
-        res.status(400).json({ error: "Invalid stock adjustment", details: parsed.error.flatten() });
+        res.status(400).json({ error: "Invalid lot adjustment", details: parsed.error.flatten() });
         return;
       }
 
@@ -184,7 +185,7 @@ inventoryRouter.patch(
         req.user!,
         bodyStoreId ?? (typeof req.query.storeId === "string" ? req.query.storeId : undefined),
       );
-      const result = await inventoryService.adjustStock(req.params.id, storeId, req.user!, {
+      const result = await inventoryService.adjustLot(req.params.id, storeId, req.user!, {
         ...input,
         ipAddress: clientIp(req),
       });

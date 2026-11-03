@@ -21,7 +21,7 @@ import { moneyDec, unitCostDec } from "../lib/money.js";
 import { prisma } from "../lib/prisma.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
-import { createProductRow, leaveSellableRollup, setProductStock } from "./stockEngine.js";
+import { addLot, createProductRow, leaveSellableRollup, setLotRemaining } from "./stockEngine.js";
 
 export { resolveStoreScope };
 
@@ -112,12 +112,13 @@ export type UpdateProductInput = Partial<{
   taxExempt: boolean;
 }>;
 
-export type AdjustStockInput = {
-  /** Absolute on-hand quantity to set after the adjustment. */
-  newStock: number;
-  /** Required audit explanation (shrinkage, cycle count, receiving fix, etc.). */
+export type AdjustLotInput = {
+  lotId: string;
+  /** Absolute quantityRemaining to set on the lot after the adjustment. */
+  newQuantity: number;
+  /** Required audit explanation (shrinkage, damage, receiving fix, etc.). */
   reason: string;
-  /** Client IP for the platform AuditLog (in addition to StockAdjustment.reason). */
+  /** Client IP for the platform AuditLog. */
   ipAddress?: string | null;
 };
 
@@ -256,66 +257,106 @@ export async function createProduct(
     throw new AppError(400, "Store not found or inactive");
   }
 
-  const catalog = input.catalogItemId
-    ? await prisma.catalogItem.findUnique({ where: { id: input.catalogItemId } })
-    : input.sku
-      ? await prisma.catalogItem.findUnique({ where: { sku: input.sku.trim() } })
-      : null;
-  if (!catalog || !catalog.isActive) {
-    throw new AppError(
-      400,
-      "Product must link to an active CatalogItem (pass catalogItemId or a known sku)",
-    );
-  }
-
-  let price: Prisma.Decimal;
-  if (store.locationType === LocationType.WAREHOUSE) {
-    // Warehouse products are never sold at a till — store the catalog ceiling as price.
-    price = catalog.maxShelfPrice;
-  } else {
-    if (input.price === undefined) {
-      throw new AppError(400, "price is required at a retail store");
-    }
-    price = moneyDec(input.price);
-    if (price.gt(catalog.maxShelfPrice)) {
-      throw new AppError(400, "Price exceeds the co-op shelf ceiling for this SKU", {
-        maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
-        price: price.toFixed(2),
-        sku: catalog.sku,
-      });
-    }
+  if (store.locationType !== LocationType.WAREHOUSE && input.price === undefined) {
+    throw new AppError(400, "price is required at a retail store");
   }
 
   try {
-    const product = await createProductRow(prisma, {
-      storeId,
-      catalogItemId: catalog.id,
-      sku: catalog.sku,
-      name: catalog.name,
-      category: catalog.category,
-      price,
-      cost: unitCostDec(input.cost),
-      stock: input.stock,
-      reorderAt: input.reorderAt,
-      taxExempt: catalog.taxExempt,
-    });
-    await writeAuditLog({
-      userId: actor.id,
-      storeId,
-      action: AuditAction.PRODUCT_PRICE_CHANGE,
-      entityType: "Product",
-      entityId: product.id,
-      before: null,
-      after: {
-        price: product.price.toFixed(2),
-        reason: "PRODUCT_CREATE",
+    // Ceiling check runs inside the tx after re-reading CatalogItem so a concurrent
+    // maxShelfPrice change cannot be missed between read and Product create.
+    const product = await prisma.$transaction(async (tx) => {
+      const catalog = input.catalogItemId
+        ? await tx.catalogItem.findUnique({ where: { id: input.catalogItemId } })
+        : input.sku
+          ? await tx.catalogItem.findUnique({ where: { sku: input.sku.trim() } })
+          : null;
+      if (!catalog || !catalog.isActive) {
+        throw new AppError(
+          400,
+          "Product must link to an active CatalogItem (pass catalogItemId or a known sku)",
+        );
+      }
+
+      let price: Prisma.Decimal;
+      if (store.locationType === LocationType.WAREHOUSE) {
+        // Warehouse products are never sold at a till — store the catalog ceiling as price.
+        price = catalog.maxShelfPrice;
+      } else {
+        price = moneyDec(input.price!);
+        if (price.gt(catalog.maxShelfPrice)) {
+          throw new AppError(400, "Price exceeds the co-op shelf ceiling for this SKU", {
+            maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
+            price: price.toFixed(2),
+            sku: catalog.sku,
+          });
+        }
+      }
+
+      // Product.stock always starts at 0; opening units live in an OPENING lot (addLot).
+      const created = await createProductRow(tx, {
+        storeId,
         catalogItemId: catalog.id,
-        maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
-      },
-      ipAddress: ipAddress ?? null,
+        sku: catalog.sku,
+        name: catalog.name,
+        category: catalog.category,
+        price,
+        cost: unitCostDec(input.cost),
+        stock: 0,
+        reorderAt: input.reorderAt,
+        taxExempt: catalog.taxExempt,
+      });
+
+      if (input.stock > 0) {
+        if (!(input.cost >= 0) || Number.isNaN(input.cost)) {
+          throw new AppError(400, "cost is required when opening stock is greater than zero");
+        }
+        const [locked] = await lockProducts(tx, [created.id]);
+        if (!locked) throw new AppError(500, "Failed to lock newly created product");
+        const yyyymmdd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const openingLot = await addLot(tx, locked, {
+          lotNumber: `OPENING-${catalog.sku}-${yyyymmdd}`,
+          storeId,
+          supplierId: null,
+          quantity: input.stock,
+          unitCost: unitCostDec(input.cost),
+        });
+        await tx.stockAdjustment.create({
+          data: {
+            productId: created.id,
+            storeId,
+            adjustedById: actor.id,
+            previousStock: 0,
+            newStock: input.stock,
+            delta: input.stock,
+            reason: "OPENING_STOCK",
+            lotId: openingLot.id,
+          },
+        });
+      }
+
+      await writeAuditLog(
+        {
+          userId: actor.id,
+          storeId,
+          action: AuditAction.PRODUCT_PRICE_CHANGE,
+          entityType: "Product",
+          entityId: created.id,
+          before: null,
+          after: {
+            price: created.price.toFixed(2),
+            reason: "PRODUCT_CREATE",
+            catalogItemId: catalog.id,
+            maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
+          },
+          ipAddress: ipAddress ?? null,
+        },
+        { tx },
+      );
+      return tx.product.findUniqueOrThrow({ where: { id: created.id } });
     });
     return toProductView(product, actor.role);
   } catch (error) {
+    if (error instanceof AppError) throw error;
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       throw new AppError(409, "SKU already exists for this store");
     }
@@ -340,7 +381,8 @@ async function getScopedProduct(productId: string, storeId: string): Promise<Pro
 
 /**
  * Updates local fields (price/cost/reorderAt). Identity fields are owned by CatalogItem —
- * editing them here is rejected. Stock changes go through adjustStock.
+ * editing them here is rejected. Stock changes go through adjustLot.
+ * Product.cost is COOP_ADMIN only (weighted average on receipt is the normal path).
  */
 export async function updateProduct(
   productId: string,
@@ -365,36 +407,48 @@ export async function updateProduct(
     );
   }
 
-  let nextPrice: Prisma.Decimal | undefined;
+  if (input.cost !== undefined && actor.role !== Role.COOP_ADMIN) {
+    throw new AppError(403, "Only COOP_ADMIN may change product cost");
+  }
+
   if (input.price !== undefined) {
-    nextPrice = moneyDec(input.price);
     if (store.locationType === LocationType.WAREHOUSE && actor.role !== Role.COOP_ADMIN) {
       throw new AppError(403, "Only COOP_ADMIN may change a warehouse product price");
-    }
-    if (existing.catalogItemId) {
-      const catalog = await prisma.catalogItem.findUniqueOrThrow({
-        where: { id: existing.catalogItemId },
-      });
-      if (
-        store.locationType === LocationType.RETAIL_STORE &&
-        nextPrice.gt(catalog.maxShelfPrice)
-      ) {
-        throw new AppError(400, "Price exceeds the co-op shelf ceiling for this SKU", {
-          maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
-          price: nextPrice.toFixed(2),
-          sku: catalog.sku,
-        });
-      }
     }
   }
 
   try {
+    // Ceiling check runs inside the tx after re-reading CatalogItem so a concurrent
+    // maxShelfPrice change cannot be missed between read and Product update.
     const product = await prisma.$transaction(async (tx) => {
+      let nextPrice: Prisma.Decimal | undefined;
+      if (input.price !== undefined) {
+        nextPrice = moneyDec(input.price);
+        if (existing.catalogItemId) {
+          const catalog = await tx.catalogItem.findUniqueOrThrow({
+            where: { id: existing.catalogItemId },
+          });
+          if (
+            store.locationType === LocationType.RETAIL_STORE &&
+            nextPrice.gt(catalog.maxShelfPrice)
+          ) {
+            throw new AppError(400, "Price exceeds the co-op shelf ceiling for this SKU", {
+              maxShelfPrice: catalog.maxShelfPrice.toFixed(2),
+              price: nextPrice.toFixed(2),
+              sku: catalog.sku,
+            });
+          }
+        }
+      }
+
+      const nextCost =
+        input.cost !== undefined ? unitCostDec(input.cost) : undefined;
+
       const updated = await tx.product.update({
         where: { id: productId },
         data: {
           ...(nextPrice !== undefined ? { price: nextPrice } : {}),
-          ...(input.cost !== undefined ? { cost: unitCostDec(input.cost) } : {}),
+          ...(nextCost !== undefined ? { cost: nextCost } : {}),
           ...(input.reorderAt !== undefined ? { reorderAt: input.reorderAt } : {}),
         },
       });
@@ -409,6 +463,22 @@ export async function updateProduct(
             entityId: productId,
             before: { price: existing.price.toFixed(2) },
             after: { price: nextPrice.toFixed(2) },
+            ipAddress: ipAddress ?? null,
+          },
+          { tx },
+        );
+      }
+
+      if (nextCost !== undefined && !existing.cost.equals(nextCost)) {
+        await writeAuditLog(
+          {
+            userId: actor.id,
+            storeId,
+            action: AuditAction.PRODUCT_COST_CHANGE,
+            entityType: "Product",
+            entityId: productId,
+            before: { cost: existing.cost.toFixed(4) },
+            after: { cost: nextCost.toFixed(4), reason: "MANUAL" },
             ipAddress: ipAddress ?? null,
           },
           { tx },
@@ -447,103 +517,124 @@ export async function deleteProduct(productId: string, storeId: string): Promise
 }
 
 /**
- * Applies a manual stock adjustment to an absolute newStock value and writes an audit row.
+ * Lot-level manual quantity adjustment via setLotRemaining.
  *
- * Why a reason is required and logged:
- * - POS sales already explain inventory going down (tied to a Sale/SaleItem).
- * - Manual changes (shrinkage, damage, cycle-count recounts, receiving corrections) are
- *   otherwise invisible — without a reason, co-op settlement and shrinkage reports cannot
- *   distinguish theft/spoilage from a data-entry fix.
- * - The StockAdjustment row freezes previousStock, newStock, delta, actor, and reason so
- *   historical audits remain accurate even if the product is later renamed or restocked.
+ * /// A stock change with no lot has no cost and no traceability. Every unit lives in a lot.
  *
- * Stock is updated in the same transaction as the audit insert so a failed write never
- * leaves quantity changed without a logged reason (or vice versa).
+ * Decrease → InventoryWriteOff at the lot's unitCost (reason MANUAL:<reason>).
+ * Increase → StockAdjustment only (lotId set). Both paths write STOCK_ADJUSTMENT audit entries.
  */
-export async function adjustStock(
+export async function adjustLot(
   productId: string,
   storeId: string,
   actor: AuthUser,
-  input: AdjustStockInput,
-): Promise<{ product: ProductWithLowStock; adjustment: { id: string; delta: number; reason: string } }> {
+  input: AdjustLotInput,
+): Promise<{
+  product: ProductWithLowStock;
+  lotId: string;
+  previousQty: number;
+  newQuantity: number;
+  delta: number;
+  reason: string;
+}> {
   const reason = input.reason.trim();
   if (!reason) {
     throw new AppError(400, "A non-empty reason is required for manual stock adjustments");
   }
-
-  if (!Number.isInteger(input.newStock) || input.newStock < 0) {
-    throw new AppError(400, "newStock must be a non-negative integer");
+  if (!Number.isInteger(input.newQuantity) || input.newQuantity < 0) {
+    throw new AppError(400, "newQuantity must be a non-negative integer");
   }
 
   const result = await prisma.$transaction(async (tx) => {
-    const locked = await lockProducts(tx, [productId]);
-    const product = locked.find((p) => p.storeId === storeId) ?? null;
-
-    if (!product) {
+    // LOCK ORDER: Product then Lot.
+    const [product] = await lockProducts(tx, [productId]);
+    if (!product || product.storeId !== storeId) {
       throw new AppError(404, "Product not found for this store");
     }
-
-    if (input.newStock < product.reserved) {
-      throw new AppError(
-        400,
-        "newStock cannot be below reserved units held by PENDING sales",
-        { reserved: product.reserved, newStock: input.newStock },
-      );
+    const [lot] = await lockLots(tx, [input.lotId]);
+    if (!lot || lot.productId !== productId || lot.storeId !== storeId) {
+      throw new AppError(404, "Lot not found for this product");
     }
 
-    const previousStock = product.stock;
-    const newStock = input.newStock;
-    const delta = newStock - previousStock;
-
-    if (delta === 0) {
-      throw new AppError(400, "newStock matches current stock; no adjustment needed");
+    const productStockBefore = product.stock;
+    const adjusted = await setLotRemaining(tx, product, lot, input.newQuantity);
+    if (adjusted.delta === 0) {
+      throw new AppError(400, "newQuantity matches current lot quantity; no adjustment needed");
     }
 
-    await setProductStock(tx, product, newStock);
-    const updated = await tx.product.findUniqueOrThrow({ where: { id: productId } });
+    const productStockAfter = productStockBefore + adjusted.rollupDelta;
+    let writeOffId: string | null = null;
+    let stockAdjustmentId: string | null = null;
 
-    const adjustment = await tx.stockAdjustment.create({
-      data: {
-        productId,
-        storeId,
-        adjustedById: actor.id,
-        previousStock,
-        newStock,
-        delta,
-        reason,
-      },
-    });
+    if (adjusted.delta < 0) {
+      const qty = -adjusted.delta;
+      const unitCost = lot.unitCost;
+      const writeOff = await tx.inventoryWriteOff.create({
+        data: {
+          storeId,
+          productId,
+          lotId: lot.id,
+          quantity: qty,
+          reason: `MANUAL:${reason}`,
+          unitCost,
+          value: moneyDec(unitCost.mul(qty)),
+        },
+      });
+      writeOffId = writeOff.id;
+    } else {
+      const adjustment = await tx.stockAdjustment.create({
+        data: {
+          productId,
+          storeId,
+          adjustedById: actor.id,
+          previousStock: productStockBefore,
+          newStock: productStockAfter,
+          delta: adjusted.rollupDelta,
+          reason,
+          lotId: lot.id,
+        },
+      });
+      stockAdjustmentId = adjustment.id;
+    }
 
-    // Platform audit trail mirrors StockAdjustment (reason + before/after stock).
     await writeAuditLog(
       {
         userId: actor.id,
         storeId,
         action: AuditAction.STOCK_ADJUSTMENT,
-        entityType: "Product",
-        entityId: productId,
-        before: { stock: previousStock },
+        entityType: "Lot",
+        entityId: lot.id,
+        before: {
+          quantityRemaining: adjusted.previousQty,
+          productStock: productStockBefore,
+        },
         after: {
-          stock: newStock,
-          delta,
+          quantityRemaining: input.newQuantity,
+          productStock: productStockAfter,
+          delta: adjusted.delta,
           reason,
-          stockAdjustmentId: adjustment.id,
+          writeOffId,
+          stockAdjustmentId,
         },
         ipAddress: input.ipAddress ?? null,
       },
       { tx },
     );
 
-    return { product: updated, adjustment };
+    const updated = await tx.product.findUniqueOrThrow({ where: { id: productId } });
+    return {
+      product: updated,
+      lotId: lot.id,
+      previousQty: adjusted.previousQty,
+      newQuantity: input.newQuantity,
+      delta: adjusted.delta,
+      reason,
+    };
   });
 
   return {
+    ...result,
     product: toProductView(result.product, actor.role) as ProductWithLowStock,
-    adjustment: {
-      id: result.adjustment.id,
-      delta: result.adjustment.delta,
-      reason: result.adjustment.reason,
-    },
   };
 }
 

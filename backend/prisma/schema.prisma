@@ -268,8 +268,37 @@ model User {
   stockCountLinesCounted   StockCountLine[] @relation("StockCountLineCountedBy")
   /// Count lines this user recounted.
   stockCountLinesRecounted StockCountLine[] @relation("StockCountLineRecountedBy")
+  /// Catalog backfill disagreements this user marked resolved.
+  catalogDisagreementsResolved CatalogDisagreement[] @relation("CatalogDisagreementResolvedBy")
 
   @@index([storeId])
+}
+
+/// Which CatalogItem identity field locations disagreed on during backfill.
+enum CatalogDisagreementField {
+  name
+  category
+  taxExempt
+}
+
+/// Open (or resolved) SKU identity mismatch across locations — survives multi-host deploys
+/// (unlike a local JSON file). One open row per sku+field; resolve records who accepted chosenValue.
+model CatalogDisagreement {
+  id               String                    @id @default(cuid())
+  sku              String
+  field            CatalogDisagreementField
+  /// Distinct values with the store ids that hold each (JSON array).
+  values           Json
+  /// Mode / chosen master value (string form; booleans as "true"/"false").
+  chosenValue      String
+  resolvedAt       DateTime?
+  resolvedByUserId String?
+  createdAt        DateTime                  @default(now())
+
+  resolvedBy User? @relation("CatalogDisagreementResolvedBy", fields: [resolvedByUserId], references: [id])
+
+  @@index([resolvedAt])
+  @@index([sku, field])
 }
 
 /// Network master for a SKU — shared identity across every stock-holding location.

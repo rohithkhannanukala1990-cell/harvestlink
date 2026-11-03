@@ -7,26 +7,43 @@
  * /// The co-op owns the stock under the percentage-of-sales model, so a store pricing below the
  * /// ceiling lowers the co-op's revenue as well as its own. The audit trail shows who and when.
  */
-import { LocationType, Prisma, Role, type CatalogItem } from "@prisma/client";
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  CatalogDisagreementField,
+  LocationType,
+  Prisma,
+  Role,
+  type CatalogDisagreement as CatalogDisagreementRow,
+  type CatalogItem,
+} from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
 import { moneyDec } from "../lib/money.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
 
-const DISAGREEMENTS_PATH = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../data/catalog-disagreements.json",
-);
+export type CatalogDisagreementValue = {
+  value: string | boolean;
+  count: number;
+  storeIds: string[];
+};
 
-export type CatalogDisagreement = {
+/** API / UI shape for an unresolved (or recently resolved) catalog identity mismatch. */
+export type CatalogDisagreementView = {
+  id: string;
   sku: string;
-  field: "name" | "category" | "taxExempt";
-  chosen: string | boolean;
-  values: Array<{ value: string | boolean; count: number; storeIds: string[] }>;
+  field: CatalogDisagreementField;
+  values: CatalogDisagreementValue[];
+  chosenValue: string;
+  resolvedAt: Date | null;
+  resolvedByUserId: string | null;
+  createdAt: Date;
+};
+
+export type UpsertCatalogDisagreementInput = {
+  sku: string;
+  field: CatalogDisagreementField;
+  chosenValue: string;
+  values: CatalogDisagreementValue[];
 };
 
 export type CreateCatalogItemInput = {
@@ -81,15 +98,85 @@ export async function getCatalogItem(actor: AuthUser, id: string): Promise<Catal
   return item;
 }
 
-export async function getCatalogDisagreements(actor: AuthUser): Promise<CatalogDisagreement[]> {
+function toDisagreementView(row: CatalogDisagreementRow): CatalogDisagreementView {
+  return {
+    id: row.id,
+    sku: row.sku,
+    field: row.field,
+    values: row.values as CatalogDisagreementValue[],
+    chosenValue: row.chosenValue,
+    resolvedAt: row.resolvedAt,
+    resolvedByUserId: row.resolvedByUserId,
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * Unresolved backfill disagreements from the database.
+ * Errors propagate — never swallow a DB failure into an empty list.
+ */
+export async function getCatalogDisagreements(
+  actor: AuthUser,
+): Promise<CatalogDisagreementView[]> {
   assertCatalogReader(actor);
-  try {
-    const raw = await fs.readFile(DISAGREEMENTS_PATH, "utf8");
-    const parsed = JSON.parse(raw) as CatalogDisagreement[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+  const rows = await prisma.catalogDisagreement.findMany({
+    where: { resolvedAt: null },
+    orderBy: [{ sku: "asc" }, { field: "asc" }],
+  });
+  return rows.map(toDisagreementView);
+}
+
+/**
+ * Idempotent open-row write used by db:backfill-catalog — one unresolved row per sku+field.
+ * Re-running updates values / chosenValue on the existing open row.
+ */
+export async function upsertOpenCatalogDisagreement(
+  input: UpsertCatalogDisagreementInput,
+): Promise<CatalogDisagreementRow> {
+  const existing = await prisma.catalogDisagreement.findFirst({
+    where: { sku: input.sku, field: input.field, resolvedAt: null },
+  });
+  if (existing) {
+    return prisma.catalogDisagreement.update({
+      where: { id: existing.id },
+      data: {
+        values: input.values as Prisma.InputJsonValue,
+        chosenValue: input.chosenValue,
+      },
+    });
   }
+  return prisma.catalogDisagreement.create({
+    data: {
+      sku: input.sku,
+      field: input.field,
+      values: input.values as Prisma.InputJsonValue,
+      chosenValue: input.chosenValue,
+    },
+  });
+}
+
+/** COOP_ADMIN accepts the backfill's chosenValue for this disagreement. */
+export async function resolveCatalogDisagreement(
+  actor: AuthUser,
+  id: string,
+): Promise<CatalogDisagreementView> {
+  assertCoopAdmin(actor);
+  const existing = await prisma.catalogDisagreement.findUnique({ where: { id } });
+  if (!existing) throw new AppError(404, "Catalog disagreement not found");
+  if (existing.resolvedAt) {
+    throw new AppError(409, "Catalog disagreement is already resolved", {
+      resolvedAt: existing.resolvedAt.toISOString(),
+      resolvedByUserId: existing.resolvedByUserId,
+    });
+  }
+  const updated = await prisma.catalogDisagreement.update({
+    where: { id },
+    data: {
+      resolvedAt: new Date(),
+      resolvedByUserId: actor.id,
+    },
+  });
+  return toDisagreementView(updated);
 }
 
 export async function createCatalogItem(

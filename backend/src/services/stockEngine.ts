@@ -31,15 +31,6 @@ function assertDevTest(): boolean {
   return process.env.NODE_ENV !== "production";
 }
 
-function assertLockedProduct(product: LockedProductRow, productId: string): void {
-  if (!assertDevTest()) return;
-  if (product.id !== productId) {
-    throw new Error(
-      `stockEngine: locked product ${product.id} does not match productId ${productId} — lock Product first`,
-    );
-  }
-}
-
 function assertLockedLots(lots: LockedLotRow[], lotIds: string[]): void {
   if (!assertDevTest()) return;
   const have = new Set(lots.map((l) => l.id));
@@ -48,6 +39,37 @@ function assertLockedLots(lots: LockedLotRow[], lotIds: string[]): void {
       throw new Error(`stockEngine: lot ${id} was not in the locked set — lock Lot rows first`);
     }
   }
+}
+
+/**
+ * Dev/test: every lot being acted on must belong to the locked Product.
+ * Catches callers that pass Product A with a Lot for Product B (the old product.id===product.id check never could).
+ */
+function assertLotsBelongToProduct(
+  product: LockedProductRow,
+  lots: LockedLotRow[],
+  lotIds: string[],
+): void {
+  if (!assertDevTest()) return;
+  const byId = lotMap(lots);
+  for (const id of lotIds) {
+    const lot = byId.get(id);
+    if (!lot) continue;
+    if (lot.productId !== product.id) {
+      throw new Error(
+        `stockEngine: lot ${lot.id} belongs to product ${lot.productId}, not locked product ${product.id} — lock the correct Product first`,
+      );
+    }
+  }
+}
+
+function assertLotOps(
+  product: LockedProductRow,
+  lots: LockedLotRow[],
+  lotIds: string[],
+): void {
+  assertLockedLots(lots, lotIds);
+  assertLotsBelongToProduct(product, lots, lotIds);
 }
 
 function lotMap(lots: LockedLotRow[]): Map<string, LockedLotRow> {
@@ -135,8 +157,8 @@ export async function reserve(
   lots: LockedLotRow[],
   allocations: LotAllocation[],
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots(
+  assertLotOps(
+    product,
     lots,
     allocations.map((a) => a.lotId),
   );
@@ -160,8 +182,8 @@ export async function release(
   lots: LockedLotRow[],
   allocations: LotAllocation[],
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots(
+  assertLotOps(
+    product,
     lots,
     allocations.map((a) => a.lotId),
   );
@@ -207,8 +229,8 @@ export async function consumeReserved(
   lots: LockedLotRow[],
   allocations: LotAllocation[],
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots(
+  assertLotOps(
+    product,
     lots,
     allocations.map((a) => a.lotId),
   );
@@ -260,8 +282,8 @@ export async function consumeDirect(
   allocations: LotAllocation[],
   opts: { offlineSync?: boolean; requireAvailable?: boolean } = {},
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots(
+  assertLotOps(
+    product,
     lots,
     allocations.map((a) => a.lotId),
   );
@@ -331,37 +353,65 @@ export async function consumeDirect(
   void opts.offlineSync;
 }
 
-/** Refund restock — return units to the ORIGINAL lots (may revive DEPLETED → ACTIVE). */
+/**
+ * Refund restock — return units to the ORIGINAL lots.
+ * ACTIVE / DEPLETED: restore sellable rollup (DEPLETED → ACTIVE).
+ * QUARANTINED: restore lot remaining only (outside sellable rollup until quarantine lifts).
+ * RECALLED / EXPIRED: refuse — caller must refund with restock=false (write-off).
+ */
 export async function restockToLots(
   tx: Tx,
   product: LockedProductRow,
   lots: LockedLotRow[],
   restorations: Array<{ lotId: string; quantity: number }>,
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots(
+  assertLotOps(
+    product,
     lots,
     restorations.map((r) => r.lotId),
   );
-  let restored = 0;
+  const byId = lotMap(lots);
+  let sellableRestored = 0;
   for (const row of restorations) {
     if (row.quantity <= 0) continue;
+    const locked = byId.get(row.lotId);
+    if (!locked) {
+      throw new AppError(500, "Restock references unlocked lot", { lotId: row.lotId });
+    }
+    if (locked.status === LotStatus.RECALLED || locked.status === LotStatus.EXPIRED) {
+      throw new AppError(
+        409,
+        "Goods from a recalled/expired lot can't go back on sale — refund without restock",
+        {
+          lotId: locked.id,
+          lotNumber: locked.lotNumber,
+          status: locked.status,
+        },
+      );
+    }
+
     const lot = await tx.lot.update({
       where: { id: row.lotId },
       data: { quantityRemaining: { increment: row.quantity } },
     });
+
+    if (locked.status === LotStatus.QUARANTINED) {
+      // Outside the sellable rollup — lot remaining only.
+      continue;
+    }
+
     if (lot.status === LotStatus.DEPLETED && lot.quantityRemaining > 0) {
       await tx.lot.update({
         where: { id: row.lotId },
         data: { status: LotStatus.ACTIVE },
       });
     }
-    restored += row.quantity;
+    sellableRestored += row.quantity;
   }
-  if (restored > 0) {
+  if (sellableRestored > 0) {
     await tx.product.update({
       where: { id: product.id },
-      data: { stock: { increment: restored } },
+      data: { stock: { increment: sellableRestored } },
     });
   }
 }
@@ -387,7 +437,6 @@ export type AddLotInput = {
  * Lot.create with quantityRemaining lives here so the guard test can allow it.
  */
 export async function addLot(tx: Tx, product: LockedProductRow, data: AddLotInput): Promise<Lot> {
-  assertLockedProduct(product, product.id);
   if (data.quantity < 0) {
     throw new AppError(400, "addLot quantity must be non-negative");
   }
@@ -431,10 +480,8 @@ export async function removeFromLot(
   product: LockedProductRow,
   lot: LockedLotRow,
   qty: number,
-  _reason: string,
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots([lot], [lot.id]);
+  assertLotOps(product, [lot], [lot.id]);
   if (qty < 0) throw new AppError(400, "removeFromLot qty must be non-negative");
   if (qty === 0) return;
 
@@ -475,8 +522,7 @@ export async function setLotRemaining(
   lot: LockedLotRow,
   targetQty: number,
 ): Promise<{ previousQty: number; delta: number; rollupDelta: number; nextStatus: LotStatus }> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots([lot], [lot.id]);
+  assertLotOps(product, [lot], [lot.id]);
   if (targetQty < 0) throw new AppError(400, "targetQty must be non-negative");
 
   const previousQty = lot.quantityRemaining;
@@ -527,8 +573,7 @@ export async function leaveSellableRollup(
   lot: LockedLotRow,
   nextStatus: LotStatus,
 ): Promise<number> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots([lot], [lot.id]);
+  assertLotOps(product, [lot], [lot.id]);
   if (lot.status !== LotStatus.ACTIVE) {
     await tx.lot.update({ where: { id: lot.id }, data: { status: nextStatus } });
     return 0;
@@ -556,8 +601,7 @@ export async function recallDepleteLot(
   product: LockedProductRow,
   lot: LockedLotRow,
 ): Promise<number> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots([lot], [lot.id]);
+  assertLotOps(product, [lot], [lot.id]);
   const remaining = Math.max(0, lot.quantityRemaining);
   await tx.lot.update({
     where: { id: lot.id },
@@ -575,8 +619,7 @@ export async function returnToSellableRollup(
   product: LockedProductRow,
   lot: LockedLotRow,
 ): Promise<void> {
-  assertLockedProduct(product, product.id);
-  assertLockedLots([lot], [lot.id]);
+  assertLotOps(product, [lot], [lot.id]);
   if (lot.status !== LotStatus.QUARANTINED) return;
   await tx.lot.update({
     where: { id: lot.id },
@@ -588,22 +631,6 @@ export async function returnToSellableRollup(
       data: { stock: { increment: lot.quantityRemaining } },
     });
   }
-}
-
-/**
- * Manual absolute Product.stock set (adjustStock). Does not touch lots — caller must keep the
- * rollup honest. Kept here so no service writes Product.stock outside this module.
- */
-export async function setProductStock(
-  tx: Tx,
-  product: LockedProductRow,
-  newStock: number,
-): Promise<void> {
-  assertLockedProduct(product, product.id);
-  await tx.product.update({
-    where: { id: product.id },
-    data: { stock: newStock },
-  });
 }
 
 export type CreateProductRowInput = {

@@ -65,6 +65,22 @@ catalogRouter.get(
   },
 );
 
+catalogRouter.post(
+  "/disagreements/:id/resolve",
+  requireRole(Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const disagreement = await catalogService.resolveCatalogDisagreement(
+        req.user!,
+        req.params.id,
+      );
+      res.status(200).json({ disagreement });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
 catalogRouter.get("/:id", requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN), async (req, res) => {
   try {
     const item = await catalogService.getCatalogItem(req.user!, req.params.id);

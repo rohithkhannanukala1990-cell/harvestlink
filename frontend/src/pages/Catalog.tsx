@@ -47,6 +47,19 @@ export function CatalogPage() {
       apiRequest<{ disagreements: CatalogDisagreement[] }>("/catalog/disagreements"),
   });
 
+  const resolveMutation = useMutation({
+    mutationFn: (id: string) =>
+      apiRequest<{ disagreement: CatalogDisagreement }>(`/catalog/disagreements/${id}/resolve`, {
+        method: "POST",
+        body: {},
+      }),
+    onSuccess: () => {
+      setMessage("Disagreement marked resolved.");
+      void qc.invalidateQueries({ queryKey: ["catalog", "disagreements"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : "Resolve failed"),
+  });
+
   const saveMutation = useMutation({
     mutationFn: async () => {
       const body = {
@@ -179,23 +192,33 @@ export function CatalogPage() {
           <p className="mb-3 text-sm text-ink-muted">
             Locations disagreed on these fields during{" "}
             <code className="font-mono text-xs">npm run db:backfill-catalog</code>. The master
-            currently uses the most common value — confirm or edit the catalog row.
+            currently uses the most common value — confirm or edit the catalog row, then Resolve.
           </p>
           <ul className="space-y-2 text-sm">
             {disagreements.map((d) => (
               <li
-                key={`${d.sku}-${d.field}`}
-                className="rounded border border-border-hairline px-3 py-2"
+                key={d.id}
+                className="flex flex-wrap items-start justify-between gap-3 rounded border border-border-hairline px-3 py-2"
               >
-                <span className="font-mono text-xs">{d.sku}</span> · {d.field} → chose{" "}
-                <strong>{String(d.chosen)}</strong>
-                <div className="mt-1 text-ink-muted">
-                  {d.values.map((v) => (
-                    <span key={String(v.value)} className="mr-3">
-                      {String(v.value)} ×{v.count}
-                    </span>
-                  ))}
+                <div>
+                  <span className="font-mono text-xs">{d.sku}</span> · {d.field} → chose{" "}
+                  <strong>{d.chosenValue}</strong>
+                  <div className="mt-1 text-ink-muted">
+                    {d.values.map((v) => (
+                      <span key={String(v.value)} className="mr-3">
+                        {String(v.value)} ×{v.count}
+                      </span>
+                    ))}
+                  </div>
                 </div>
+                <Button
+                  type="button"
+                  variant="quiet"
+                  loading={resolveMutation.isPending}
+                  onClick={() => resolveMutation.mutate(d.id)}
+                >
+                  Resolve
+                </Button>
               </li>
             ))}
           </ul>

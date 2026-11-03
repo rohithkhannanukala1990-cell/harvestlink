@@ -1,22 +1,18 @@
 /**
  * Idempotent backfill: one CatalogItem per distinct Product.sku across all locations.
  *
- * Where locations disagree on name / category / taxExempt, takes the most common value and
- * PRINTS every disagreement (also written to data/catalog-disagreements.json for the Catalog UI).
- * maxShelfPrice = the highest current retail price for that SKU so no existing price is over ceiling.
- * Links every Product.catalogItemId.
+ * Where locations disagree on name / category / taxExempt, takes the most common value,
+ * PRINTS every disagreement, and upserts an open CatalogDisagreement row (shared DB — not a
+ * local JSON file). maxShelfPrice = the highest current retail price for that SKU so no
+ * existing price is over ceiling. Links every Product.catalogItemId.
  *
  * Usage: npm run db:backfill-catalog
  */
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Prisma } from "@prisma/client";
+import { CatalogDisagreementField, Prisma } from "@prisma/client";
 import { prisma } from "../src/lib/prisma.js";
-import type { CatalogDisagreement } from "../src/services/catalog.service.js";
-
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const DISAGREEMENTS_PATH = path.join(ROOT, "data", "catalog-disagreements.json");
+import { upsertOpenCatalogDisagreement } from "../src/services/catalog.service.js";
 
 type FieldKey = "name" | "category" | "taxExempt";
 
@@ -37,7 +33,24 @@ function mode<T extends string | boolean>(
   return { chosen: buckets[0]!.value, buckets };
 }
 
-async function main(): Promise<void> {
+function fieldEnum(field: FieldKey): CatalogDisagreementField {
+  switch (field) {
+    case "name":
+      return CatalogDisagreementField.name;
+    case "category":
+      return CatalogDisagreementField.category;
+    case "taxExempt":
+      return CatalogDisagreementField.taxExempt;
+  }
+}
+
+export async function backfillCatalog(): Promise<{
+  distinctSkus: number;
+  catalogItemsCreated: number;
+  productsLinked: number;
+  productsAlreadyLinked: number;
+  disagreements: number;
+}> {
   const products = await prisma.product.findMany({
     select: {
       id: true,
@@ -59,10 +72,10 @@ async function main(): Promise<void> {
     bySku.set(p.sku, list);
   }
 
-  const disagreements: CatalogDisagreement[] = [];
   let created = 0;
   let linked = 0;
   let alreadyLinked = 0;
+  let disagreementCount = 0;
 
   for (const [sku, rows] of bySku) {
     const nameMode = mode(rows.map((r) => ({ value: r.name, storeId: r.storeId })));
@@ -75,17 +88,27 @@ async function main(): Promise<void> {
       ["taxExempt", taxMode],
     ] as Array<[FieldKey, ReturnType<typeof mode>]>) {
       if (result.buckets.length > 1) {
-        const d: CatalogDisagreement = {
+        const chosenValue = String(result.chosen);
+        const values = result.buckets.map((b) => ({
+          value: b.value,
+          count: b.count,
+          storeIds: b.storeIds,
+        }));
+        const row = await upsertOpenCatalogDisagreement({
           sku,
-          field,
-          chosen: result.chosen,
-          values: result.buckets,
-        };
-        disagreements.push(d);
+          field: fieldEnum(field),
+          chosenValue,
+          values,
+        });
+        disagreementCount += 1;
         console.log(
           JSON.stringify({
             type: "CATALOG_BACKFILL_DISAGREEMENT",
-            ...d,
+            id: row.id,
+            sku,
+            field,
+            chosenValue,
+            values,
           }),
         );
       }
@@ -146,27 +169,31 @@ async function main(): Promise<void> {
     }
   }
 
-  await fs.mkdir(path.dirname(DISAGREEMENTS_PATH), { recursive: true });
-  await fs.writeFile(DISAGREEMENTS_PATH, JSON.stringify(disagreements, null, 2), "utf8");
-
-  console.log(
-    JSON.stringify({
-      type: "CATALOG_BACKFILL_SUMMARY",
-      distinctSkus: bySku.size,
-      catalogItemsCreated: created,
-      productsLinked: linked,
-      productsAlreadyLinked: alreadyLinked,
-      disagreements: disagreements.length,
-      disagreementsFile: DISAGREEMENTS_PATH,
-    }),
-  );
+  const summary = {
+    distinctSkus: bySku.size,
+    catalogItemsCreated: created,
+    productsLinked: linked,
+    productsAlreadyLinked: alreadyLinked,
+    disagreements: disagreementCount,
+  };
+  console.log(JSON.stringify({ type: "CATALOG_BACKFILL_SUMMARY", ...summary }));
+  return summary;
 }
 
-main()
-  .catch((error) => {
-    console.error("backfill-catalog failed", error);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+async function main(): Promise<void> {
+  await backfillCatalog();
+}
+
+const invokedDirectly =
+  !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) {
+  main()
+    .catch((error) => {
+      console.error("backfill-catalog failed", error);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

@@ -2,9 +2,12 @@
  * Row locks for inventory mutations.
  *
  * /// LOCK ORDER — every transaction in this codebase:
+ * ///   0. At most ONE document row being acted on (the Sale, StockCount, transfer…), claimed first
+ * ///      with SELECT … FOR UPDATE or a status-guarded updateMany. Never lock a document row after
+ * ///      a Product row.
  * ///   1. Product rows, ordered by id
  * ///   2. Lot rows, in FEFO order (productId, expiryDate NULLS LAST, receivedAt, id)
- * ///   3. Anything else (Store, Sale, StockCount, transfer rows…)
+ * ///   3. Anything else (Store, etc.)
  * /// Any code that changes a Lot must lock that lot's Product row first, even if it only means to
  * /// update the lot. Taking these in a different order deadlocks against the till.
  */

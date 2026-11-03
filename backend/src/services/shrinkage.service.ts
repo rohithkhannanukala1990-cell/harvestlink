@@ -9,8 +9,8 @@
  *   activation (RECALL), refunds with restock=false (REFUND_NO_RESTOCK) and stock count shortfalls
  *   (STOCK_COUNT:<reason>). A count approval also writes a StockAdjustment for the same units, so
  *   those adjustments are NOT read as losses.
- * - Manual StockAdjustments (adjustStock: no lot, reason not RECEIPT / STOCK_COUNT) with a negative
- *   delta have no write-off row, so they are read here, valued at product cost.
+ * - Manual lot decreases (adjustLot) write InventoryWriteOff with reason MANUAL:<text> at lot cost.
+ *   Legacy lot-less negative StockAdjustments (pre-lot adjustStock) are still read here at product cost.
  * - StockReconciliation rows (offline sales that drove stock negative) are a separate signal, not
  *   lost value: those goods were sold, and the books are corrected by a later count — which shows
  *   up here as a count adjustment if anything was really missing.
@@ -150,6 +150,8 @@ function byValueDesc<T extends { value: string }>(a: T, b: T): number {
   return Number(b.value) - Number(a.value);
 }
 
+const MANUAL_PREFIX = "MANUAL:";
+
 function classifyWriteOff(reason: string): { source: ShrinkageSource; reason: string } {
   if (reason === "EXPIRED") return { source: "EXPIRY_JOB", reason: ShrinkageReason.EXPIRY };
   if (reason === "RECALL") return { source: "RECALL", reason: "RECALL" };
@@ -159,6 +161,9 @@ function classifyWriteOff(reason: string): { source: ShrinkageSource; reason: st
   if (reason.startsWith(STOCK_COUNT_PREFIX)) {
     const code = reason.slice(STOCK_COUNT_PREFIX.length);
     return { source: "STOCK_COUNT", reason: COUNT_REASONS.has(code) ? code : ShrinkageReason.UNKNOWN };
+  }
+  if (reason.startsWith(MANUAL_PREFIX)) {
+    return { source: "MANUAL_ADJUSTMENT", reason: "MANUAL_ADJUSTMENT" };
   }
   return { source: "OTHER_WRITE_OFF", reason: "OTHER" };
 }

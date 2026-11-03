@@ -426,7 +426,10 @@ export async function generateCycleCountSchedule(
 
   return {
     ...empty,
-    selected: ranked.slice(0, size).map(({ flagged: _flagged, ...candidate }) => candidate),
+    selected: ranked.slice(0, size).map(({ flagged, ...candidate }) => {
+      void flagged;
+      return candidate;
+    }),
     dueButDeferred: Math.max(0, ranked.length - size),
     alreadyOnOpenCount,
   };
@@ -1330,6 +1333,7 @@ export async function approveCount(
     }
 
     const approvedAt = new Date();
+    // LOCK ORDER rule 0: claim the StockCount document before any Product/Lot locks.
     const claimed = await tx.stockCount.updateMany({
       where: { id: countId, status: StockCountStatus.COMPLETED, approvedAt: null },
       data: { approvedByUserId: actor.id, approvedAt },

@@ -94,10 +94,12 @@ async function seedNetwork() {
     },
   });
 
-  // Manual adjustment: 2 units at product cost $1.50.
+  // Manual lot decrease: 2 units at lot cost $1.50 → InventoryWriteOff MANUAL:…
   const dry = await createProduct(store.id, { sku: "DRY", stock: 10, cost: 1.5 });
-  await inventoryService.adjustStock(dry.id, store.id, asAuthUser(storeAdmin), {
-    newStock: 8,
+  const dryLot = await prisma.lot.findFirstOrThrow({ where: { productId: dry.id } });
+  await inventoryService.adjustLot(dry.id, store.id, asAuthUser(storeAdmin), {
+    lotId: dryLot.id,
+    newQuantity: 8,
     reason: "Water damage",
   });
 
@@ -154,7 +156,7 @@ describe("shrinkage report", () => {
 
     expect(report.byCategory.find((c) => c.category === "Dairy")!.value).toBe("12.00");
     expect(report.topLossProducts[0]!.productId).toBe(dairy.id);
-    expect(report.byLot.map((l) => l.lotNumber).sort()).toEqual(["HILL-1", "MILK-OLD"]);
+    expect(report.byLot.map((l) => l.lotNumber).sort()).toEqual(["HILL-1", "MILK-OLD", "TEST-DRY"]);
 
     const trendValue = report.trend.reduce((s, b) => s + Number(b.value), 0);
     expect(trendValue).toBeCloseTo(21, 2);

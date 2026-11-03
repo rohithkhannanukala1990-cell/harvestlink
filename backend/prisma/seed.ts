@@ -141,6 +141,8 @@ async function main() {
   /// The Houston store is a separate location from the warehouse next door. It gets stock from the
   /// warehouse like any other store (Phase 3), so the warehouse's counts and shrinkage stay its own.
   /// A store never sells directly from warehouse lots.
+  /// Opening stock (when seeded via createProduct) always goes through addLot as OPENING-<sku>-<date>
+  /// — never Product.stock alone. This seed creates locations/users only; catalog/products come later.
   // taxRate: starting Houston combined rate — admin should confirm / adjust in Settings.
   const houstonStore = await upsertLocation({
     name: "HarvestLinx Houston Store",
@@ -158,7 +160,7 @@ async function main() {
         votingThresholdAmount: 1000,
         fiscalYearEnd: "12-31",
         legalEntityName: "HarvestLinx Cooperative",
-        stateOfIncorporation: "TX",
+        stateOfIncorporation: "OH",
         mainWarehouseId: warehouse.id,
       },
     });

@@ -11,11 +11,20 @@ import { describe, expect, it } from "vitest";
 const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src");
 const ENGINE_REL = "services/stockEngine.ts";
 
-const RAW_SQL_WRITE =
-  /SET\s+(?:"quantityRemaining"|"quantityReserved"|stock|reserved)\s*=/;
+/**
+ * Raw SQL SET of qty columns — matches first or later columns in a SET list
+ * (e.g. `SET "lotNumber" = $1, "quantityRemaining" = $2`).
+ */
+export const RAW_SQL_WRITE =
+  /SET\s+(?:[^;]*?,\s*)*(?:"quantityRemaining"|"quantityReserved"|stock|reserved)\s*=/;
 
-const PRISMA_MUTATION =
-  /\.(?:lot|product)\.(?:create|update|updateMany)\s*\(/;
+/** Prisma mutations that may write qty columns (incl. upsert / createMany). */
+export const PRISMA_MUTATION =
+  /\.(?:lot|product)\.(?:create|createMany|update|updateMany|upsert)\s*\(/;
+
+/** Qty field names appearing in a Prisma call argument window. */
+const QTY_FIELD_ANYWHERE =
+  /(?:quantityRemaining|quantityReserved|\bstock\b|\breserved\b)\s*:/;
 
 /** Field assignments that mutate qty / rollup columns inside a Prisma `data` object. */
 const DATA_FIELD_WRITE = [
@@ -26,7 +35,7 @@ const DATA_FIELD_WRITE = [
 ] as const;
 
 /** Increment/decrement shorthand anywhere (almost always a write). */
-const INC_DEC_WRITE =
+export const INC_DEC_WRITE =
   /(?:quantityRemaining|quantityReserved|stock|reserved)\s*:\s*\{\s*(?:increment|decrement)\b/;
 
 function collectTsFiles(dir: string): string[] {
@@ -48,7 +57,7 @@ function stripComments(source: string): string {
 }
 
 /**
- * Given a match on `.lot/.product.(create|update|updateMany)(`, return the `data: { ... }`
+ * Given a match on `.lot/.product.(create|… )(`, return the `data: { ... }`
  * object text when present (best-effort brace match).
  */
 function extractDataObject(source: string, callIndex: number): string | null {
@@ -72,10 +81,8 @@ function extractDataObject(source: string, callIndex: number): string | null {
 function dataObjectHasQtyWrite(dataObj: string): boolean {
   // Ignore select-style / filter-only appearances inside nested where clauses of updateMany.
   const withoutWhere = dataObj.replace(/\bwhere\s*:\s*\{[\s\S]*?\n\s*\}/g, "");
-  // updateMany: `data` and `where` are siblings — extractDataObject only takes `data`.
   for (const re of DATA_FIELD_WRITE) {
     if (!re.test(withoutWhere)) continue;
-    // Filter noise: `stock: { gte: ... }` in a where wrongly nested — treat gte/gt as non-write
     const lines = withoutWhere.split(/\r?\n/);
     for (const line of lines) {
       if (!re.test(line)) continue;
@@ -87,6 +94,44 @@ function dataObjectHasQtyWrite(dataObj: string): boolean {
   return false;
 }
 
+/** Shared detector used by the repo scan and the fixture unit tests. */
+export function findStockWriteViolations(source: string, rel = "fixture.ts"): string[] {
+  const violations: string[] = [];
+  const cleaned = stripComments(source);
+
+  if (RAW_SQL_WRITE.test(cleaned)) {
+    violations.push(`${rel}: raw SQL mutates lot/product qty columns`);
+  }
+
+  if (INC_DEC_WRITE.test(cleaned)) {
+    violations.push(`${rel}: increment/decrement on lot qty or Product.stock/reserved`);
+  }
+
+  let searchFrom = 0;
+  while (searchFrom < cleaned.length) {
+    const m = PRISMA_MUTATION.exec(cleaned.slice(searchFrom));
+    if (!m || m.index === undefined) break;
+    const abs = searchFrom + m.index;
+    const line = cleaned.slice(0, abs).split(/\r?\n/).length;
+    const callWindow = cleaned.slice(abs, abs + 1200);
+    const dataObj = extractDataObject(cleaned, abs);
+    const isBulkOrUpsert = /createMany|upsert/.test(m[0]);
+    const flagged =
+      (dataObj && dataObjectHasQtyWrite(dataObj)) ||
+      // createMany / upsert often put qty fields on create/update without a nested `data: {`
+      // wrapper that extractDataObject understands — scan the call window instead.
+      (isBulkOrUpsert && QTY_FIELD_ANYWHERE.test(callWindow));
+    if (flagged) {
+      violations.push(
+        `${rel}:${line}: ${m[0].trim()} writes quantityRemaining/quantityReserved/stock/reserved`,
+      );
+    }
+    searchFrom = abs + m[0].length;
+  }
+
+  return violations;
+}
+
 describe("stockEngine write guard", () => {
   it("only stockEngine.ts writes lot qty or Product.stock/reserved", () => {
     const violations: string[] = [];
@@ -94,33 +139,53 @@ describe("stockEngine write guard", () => {
     for (const file of collectTsFiles(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file).split(path.sep).join("/");
       if (rel === ENGINE_REL) continue;
-
-      const source = stripComments(fs.readFileSync(file, "utf8"));
-
-      if (RAW_SQL_WRITE.test(source)) {
-        violations.push(`${rel}: raw SQL mutates lot/product qty columns`);
-      }
-
-      if (INC_DEC_WRITE.test(source)) {
-        violations.push(`${rel}: increment/decrement on lot qty or Product.stock/reserved`);
-      }
-
-      let searchFrom = 0;
-      while (searchFrom < source.length) {
-        const m = PRISMA_MUTATION.exec(source.slice(searchFrom));
-        if (!m || m.index === undefined) break;
-        const abs = searchFrom + m.index;
-        const dataObj = extractDataObject(source, abs);
-        if (dataObj && dataObjectHasQtyWrite(dataObj)) {
-          const line = source.slice(0, abs).split(/\r?\n/).length;
-          violations.push(
-            `${rel}:${line}: ${m[0].trim()} writes quantityRemaining/quantityReserved/stock/reserved`,
-          );
-        }
-        searchFrom = abs + m[0].length;
-      }
+      violations.push(...findStockWriteViolations(fs.readFileSync(file, "utf8"), rel));
     }
 
     expect(violations, violations.join("\n")).toEqual([]);
+  });
+
+  it("detects fixture patterns for upsert, createMany, and mid-SET raw SQL", () => {
+    const fixtures: Array<{ name: string; source: string }> = [
+      {
+        name: "lot.upsert",
+        source: `await tx.lot.upsert({
+  where: { id: "x" },
+  create: { quantityRemaining: 1, productId: "p" },
+  update: { quantityRemaining: 2 },
+});`,
+      },
+      {
+        name: "product.createMany",
+        source: `await tx.product.createMany({
+  data: [{ stock: 5, reserved: 0, sku: "S" }],
+});`,
+      },
+      {
+        name: "raw SQL mid-SET list",
+        source: `await tx.$executeRawUnsafe(
+  'UPDATE "Lot" SET "lotNumber" = $1, "quantityRemaining" = $2 WHERE id = $3'
+);`,
+      },
+      {
+        name: "product.upsert stock",
+        source: `await prisma.product.upsert({
+  where: { id: "p" },
+  create: { stock: 1, sku: "S", storeId: "st" },
+  update: { reserved: 2 },
+});`,
+      },
+      {
+        name: "lot.createMany quantityReserved",
+        source: `await tx.lot.createMany({ data: [{ quantityReserved: 3 }] });`,
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const hits = findStockWriteViolations(fixture.source, fixture.name);
+      expect(hits.length, `${fixture.name} should be detected\n${hits.join("\n")}`).toBeGreaterThan(
+        0,
+      );
+    }
   });
 });

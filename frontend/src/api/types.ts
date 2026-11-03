@@ -65,10 +65,14 @@ export type CatalogItem = {
 };
 
 export type CatalogDisagreement = {
+  id: string;
   sku: string;
   field: "name" | "category" | "taxExempt";
-  chosen: string | boolean;
+  chosenValue: string;
   values: Array<{ value: string | boolean; count: number; storeIds: string[] }>;
+  resolvedAt: string | null;
+  resolvedByUserId: string | null;
+  createdAt: string;
 };
 
 /** Co-op-wide settings (singleton). Voting threshold lives here — never hardcoded. */
