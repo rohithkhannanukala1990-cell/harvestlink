@@ -25,6 +25,8 @@ import { RecallsPage } from "./pages/Recalls.tsx";
 import { SalesHistoryPage } from "./pages/SalesHistory.tsx";
 import { SettingsPage } from "./pages/Settings.tsx";
 import { SettlementPage } from "./pages/Settlement.tsx";
+import { ShipmentDetailPage } from "./pages/ShipmentDetail.tsx";
+import { ShipmentsPage } from "./pages/Shipments.tsx";
 import { StockCountsPage } from "./pages/StockCounts.tsx";
 import { ShrinkagePage } from "./pages/Shrinkage.tsx";
 import { SuppliersPage } from "./pages/Suppliers.tsx";
@@ -65,6 +67,8 @@ export default function App() {
             <Route path="catalog" element={<CatalogPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="recalls" element={<RecallsPage />} />
+            <Route path="shipments" element={<ShipmentsPage />} />
+            <Route path="shipments/:id" element={<ShipmentDetailPage />} />
           </Route>
           <Route element={<RequireRoles roles={["STORE_ADMIN", "COOP_ADMIN"]} />}>
             <Route path="settlement" element={<SettlementPage />} />

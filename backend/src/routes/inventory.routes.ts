@@ -50,6 +50,8 @@ const adjustLotSchema = z.object({
   lotId: z.string().min(1),
   newQuantity: z.number().int().nonnegative(),
   reason: z.string().min(1),
+  overrideBlockedLot: z.boolean().optional(),
+  overrideReason: z.string().min(1).optional(),
   storeId: z.string().min(1).optional(),
 });
 

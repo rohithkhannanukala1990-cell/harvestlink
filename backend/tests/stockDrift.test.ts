@@ -93,9 +93,11 @@ describe("stock drift closures", () => {
     expect(up.product.stock).toBe(9);
 
     const stockAdj = await prisma.stockAdjustment.findFirstOrThrow({
-      where: { productId: product.id, lotId: lot.id, reason: "Found on shelf" },
+      where: { productId: product.id, lotId: lot.id, reason: "MANUAL:Found on shelf" },
     });
     expect(stockAdj.delta).toBe(2);
+    expect(stockAdj.lotPreviousQty).toBe(7);
+    expect(stockAdj.lotNewQty).toBe(9);
 
     const refreshed = await prisma.lot.findUniqueOrThrow({ where: { id: lot.id } });
     expect(refreshed.quantityRemaining).toBe(9);

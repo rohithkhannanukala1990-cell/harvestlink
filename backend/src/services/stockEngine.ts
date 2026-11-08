@@ -353,18 +353,21 @@ export async function consumeDirect(
   void opts.offlineSync;
 }
 
+export type RestockApplied = { lotId: string; quantity: number };
+
 /**
  * Refund restock — return units to the ORIGINAL lots.
  * ACTIVE / DEPLETED: restore sellable rollup (DEPLETED → ACTIVE).
  * QUARANTINED: restore lot remaining only (outside sellable rollup until quarantine lifts).
  * RECALLED / EXPIRED: refuse — caller must refund with restock=false (write-off).
+ * Returns the per-lot quantities actually applied (including QUARANTINED) for RefundRestockLot.
  */
 export async function restockToLots(
   tx: Tx,
   product: LockedProductRow,
   lots: LockedLotRow[],
   restorations: Array<{ lotId: string; quantity: number }>,
-): Promise<void> {
+): Promise<RestockApplied[]> {
   assertLotOps(
     product,
     lots,
@@ -372,6 +375,7 @@ export async function restockToLots(
   );
   const byId = lotMap(lots);
   let sellableRestored = 0;
+  const applied: RestockApplied[] = [];
   for (const row of restorations) {
     if (row.quantity <= 0) continue;
     const locked = byId.get(row.lotId);
@@ -394,6 +398,7 @@ export async function restockToLots(
       where: { id: row.lotId },
       data: { quantityRemaining: { increment: row.quantity } },
     });
+    applied.push({ lotId: row.lotId, quantity: row.quantity });
 
     if (locked.status === LotStatus.QUARANTINED) {
       // Outside the sellable rollup — lot remaining only.
@@ -414,6 +419,7 @@ export async function restockToLots(
       data: { stock: { increment: sellableRestored } },
     });
   }
+  return applied;
 }
 
 export type AddLotInput = {
@@ -429,6 +435,8 @@ export type AddLotInput = {
   countryOfOrigin?: string | null;
   receivedAt?: Date;
   unitCost: Prisma.Decimal;
+  /** Landed-cost add-on baked into unitCost (import receipts). Default 0. */
+  landedAddOnApplied?: Prisma.Decimal;
   status?: LotStatus;
 };
 
@@ -459,6 +467,7 @@ export async function addLot(tx: Tx, product: LockedProductRow, data: AddLotInpu
       countryOfOrigin: data.countryOfOrigin ?? null,
       receivedAt: data.receivedAt ?? new Date(),
       unitCost: data.unitCost,
+      landedAddOnApplied: data.landedAddOnApplied ?? new Prisma.Decimal(0),
     },
   });
   if (qty > 0 && (data.status ?? LotStatus.ACTIVE) === LotStatus.ACTIVE) {

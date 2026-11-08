@@ -25,6 +25,20 @@ const envSchema = z.object({
   SMTP_USER: z.string().optional().default(""),
   SMTP_PASS: z.string().optional().default(""),
   SMTP_FROM: z.string().optional().default(""),
+  /** local = disk under STORAGE_LOCAL_DIR; s3 = S3-compatible bucket. */
+  STORAGE_DRIVER: z.enum(["local", "s3"]).default("local"),
+  /** Directory for local document storage (dev). */
+  STORAGE_LOCAL_DIR: z.string().default("./uploads"),
+  S3_ENDPOINT: z.string().optional().default(""),
+  S3_REGION: z.string().optional().default("us-east-1"),
+  S3_BUCKET: z.string().optional().default(""),
+  S3_ACCESS_KEY_ID: z.string().optional().default(""),
+  S3_SECRET_ACCESS_KEY: z.string().optional().default(""),
+  S3_FORCE_PATH_STYLE: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -2,9 +2,10 @@
  * Row locks for inventory mutations.
  *
  * /// LOCK ORDER — every transaction in this codebase:
- * ///   0. At most ONE document row being acted on (the Sale, StockCount, transfer…), claimed first
- * ///      with SELECT … FOR UPDATE or a status-guarded updateMany. Never lock a document row after
- * ///      a Product row.
+ * ///   0. At most ONE document row being acted on (the Sale, StockCount, transfer, CatalogItem…),
+ * ///      claimed first with SELECT … FOR UPDATE or a status-guarded updateMany. Never lock a
+ * ///      document row after a Product row. CatalogItem is a rule-0 document when a price write
+ * ///      must serialise with a concurrent maxShelfPrice change (createProduct / updateProduct).
  * ///   1. Product rows, ordered by id
  * ///   2. Lot rows, in FEFO order (productId, expiryDate NULLS LAST, receivedAt, id)
  * ///   3. Anything else (Store, etc.)
@@ -14,6 +15,21 @@
 import { Prisma } from "@prisma/client";
 
 type Tx = Prisma.TransactionClient;
+
+/** CatalogItem row shape needed for shelf-ceiling checks under FOR UPDATE. */
+export type LockedCatalogItemRow = {
+  id: string;
+  sku: string;
+  name: string;
+  category: string;
+  taxExempt: boolean;
+  isActive: boolean;
+  unitsPerCase: number;
+  casesPerPallet: number | null;
+  caseWeightKg: Prisma.Decimal | null;
+  caseGtin: string | null;
+  maxShelfPrice: Prisma.Decimal;
+};
 
 export type LockedProductRow = {
   id: string;
@@ -103,4 +119,60 @@ export async function lockActiveLotsForProducts(
     ORDER BY "productId" ASC, "expiryDate" ASC NULLS LAST, "receivedAt" ASC, id ASC
     FOR UPDATE
   `;
+}
+
+/**
+ * Rule-0 document lock on a CatalogItem (ceiling / identity). Call before Product price writes
+ * that must serialise with updateCatalogItem.
+ */
+export async function lockCatalogItemById(
+  tx: Tx,
+  catalogItemId: string,
+): Promise<LockedCatalogItemRow | null> {
+  const rows = await tx.$queryRaw<LockedCatalogItemRow[]>`
+    SELECT id, sku, name, category, "taxExempt", "isActive", "unitsPerCase", "casesPerPallet",
+           "caseWeightKg", "caseGtin", "maxShelfPrice"
+    FROM "CatalogItem"
+    WHERE id = ${catalogItemId}
+    FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
+export async function lockCatalogItemBySku(
+  tx: Tx,
+  sku: string,
+): Promise<LockedCatalogItemRow | null> {
+  const rows = await tx.$queryRaw<LockedCatalogItemRow[]>`
+    SELECT id, sku, name, category, "taxExempt", "isActive", "unitsPerCase", "casesPerPallet",
+           "caseWeightKg", "caseGtin", "maxShelfPrice"
+    FROM "CatalogItem"
+    WHERE sku = ${sku}
+    FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
+export type LockedImportShipmentRow = {
+  id: string;
+  shipmentNumber: string;
+  status: string;
+  destinationStoreId: string;
+};
+
+/**
+ * Rule-0 document lock on an ImportShipment. Call before Product locks when receiving
+ * against a PO that is on a shipment (landed-cost allocation must serialise).
+ */
+export async function lockImportShipment(
+  tx: Tx,
+  shipmentId: string,
+): Promise<LockedImportShipmentRow | null> {
+  const rows = await tx.$queryRaw<LockedImportShipmentRow[]>`
+    SELECT id, "shipmentNumber", status::text AS status, "destinationStoreId"
+    FROM "ImportShipment"
+    WHERE id = ${shipmentId}
+    FOR UPDATE
+  `;
+  return rows[0] ?? null;
 }

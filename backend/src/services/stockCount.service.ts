@@ -1421,7 +1421,8 @@ export async function approveCount(
         ? `STOCK_COUNT:${reasonCode} (${lot.status} lot, override)`
         : `STOCK_COUNT:${reasonCode}`;
 
-      if (rollupDelta !== 0) {
+      if (delta !== 0) {
+        // previousStock/newStock = product rollup; delta + lotPreviousQty/lotNewQty = lot change.
         await tx.stockAdjustment.create({
           data: {
             productId: lot.productId,
@@ -1429,23 +1430,11 @@ export async function approveCount(
             adjustedById: actor.id,
             previousStock,
             newStock: previousStock + rollupDelta,
-            delta: rollupDelta,
-            reason,
-            lotId: lot.id,
-          },
-        });
-      } else if (delta !== 0) {
-        // Lot outside the sellable rollup: the lot's own quantities are the only honest before/after.
-        await tx.stockAdjustment.create({
-          data: {
-            productId: lot.productId,
-            storeId: count.storeId,
-            adjustedById: actor.id,
-            previousStock: previousQty,
-            newStock: targetQty,
             delta,
             reason,
             lotId: lot.id,
+            lotPreviousQty: previousQty,
+            lotNewQty: targetQty,
           },
         });
       }

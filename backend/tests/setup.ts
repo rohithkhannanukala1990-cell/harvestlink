@@ -2,7 +2,7 @@
  * Per-worker Vitest setup: point Prisma at the test DB and install Stripe mocks
  * before application modules are imported by test files.
  */
-import { beforeAll, beforeEach, inject, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, inject, vi } from "vitest";
 
 process.env.NODE_ENV = "test";
 process.env.JWT_SECRET = process.env.JWT_SECRET ?? "test-jwt-secret-harvestlink-ci";
@@ -43,3 +43,9 @@ beforeEach(async () => {
   const { truncateAll } = await import("./helpers/db.js");
   await truncateAll();
 });
+
+afterAll(async () => {
+  const { prisma } = await import("./helpers/db.js");
+  await prisma.$disconnect();
+});
+

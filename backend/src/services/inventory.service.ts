@@ -16,12 +16,23 @@
 import { LocationType, LotStatus, Prisma, Role, type Product } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
-import { lockLots, lockProducts } from "../lib/locks.js";
+import {
+  lockCatalogItemById,
+  lockCatalogItemBySku,
+  lockLots,
+  lockProducts,
+} from "../lib/locks.js";
 import { moneyDec, unitCostDec } from "../lib/money.js";
 import { prisma } from "../lib/prisma.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
 import { addLot, createProductRow, leaveSellableRollup, setLotRemaining } from "./stockEngine.js";
+
+const BLOCKED_ADJUST_STATUSES: LotStatus[] = [
+  LotStatus.QUARANTINED,
+  LotStatus.RECALLED,
+  LotStatus.EXPIRED,
+];
 
 export { resolveStoreScope };
 
@@ -118,6 +129,13 @@ export type AdjustLotInput = {
   newQuantity: number;
   /** Required audit explanation (shrinkage, damage, receiving fix, etc.). */
   reason: string;
+  /**
+   * Required (COOP_ADMIN only) when adjusting a QUARANTINED / RECALLED / EXPIRED lot —
+   * same gate as stock-count `overrideBlockedLots`.
+   */
+  overrideBlockedLot?: boolean;
+  /** Required when overrideBlockedLot is true. */
+  overrideReason?: string;
   /** Client IP for the platform AuditLog. */
   ipAddress?: string | null;
 };
@@ -262,13 +280,12 @@ export async function createProduct(
   }
 
   try {
-    // Ceiling check runs inside the tx after re-reading CatalogItem so a concurrent
-    // maxShelfPrice change cannot be missed between read and Product create.
+    // LOCK ORDER: CatalogItem (rule 0) FOR UPDATE, then Product — serialises with updateCatalogItem.
     const product = await prisma.$transaction(async (tx) => {
       const catalog = input.catalogItemId
-        ? await tx.catalogItem.findUnique({ where: { id: input.catalogItemId } })
+        ? await lockCatalogItemById(tx, input.catalogItemId)
         : input.sku
-          ? await tx.catalogItem.findUnique({ where: { sku: input.sku.trim() } })
+          ? await lockCatalogItemBySku(tx, input.sku.trim())
           : null;
       if (!catalog || !catalog.isActive) {
         throw new AppError(
@@ -330,6 +347,8 @@ export async function createProduct(
             delta: input.stock,
             reason: "OPENING_STOCK",
             lotId: openingLot.id,
+            lotPreviousQty: 0,
+            lotNewQty: input.stock,
           },
         });
       }
@@ -418,16 +437,18 @@ export async function updateProduct(
   }
 
   try {
-    // Ceiling check runs inside the tx after re-reading CatalogItem so a concurrent
-    // maxShelfPrice change cannot be missed between read and Product update.
+    // LOCK ORDER: CatalogItem (rule 0) FOR UPDATE, then Product — serialises with updateCatalogItem.
     const product = await prisma.$transaction(async (tx) => {
       let nextPrice: Prisma.Decimal | undefined;
       if (input.price !== undefined) {
         nextPrice = moneyDec(input.price);
         if (existing.catalogItemId) {
-          const catalog = await tx.catalogItem.findUniqueOrThrow({
-            where: { id: existing.catalogItemId },
-          });
+          const catalog = await lockCatalogItemById(tx, existing.catalogItemId);
+          if (!catalog) {
+            throw new AppError(404, "CatalogItem not found for product", {
+              catalogItemId: existing.catalogItemId,
+            });
+          }
           if (
             store.locationType === LocationType.RETAIL_STORE &&
             nextPrice.gt(catalog.maxShelfPrice)
@@ -521,8 +542,9 @@ export async function deleteProduct(productId: string, storeId: string): Promise
  *
  * /// A stock change with no lot has no cost and no traceability. Every unit lives in a lot.
  *
- * Decrease → InventoryWriteOff at the lot's unitCost (reason MANUAL:<reason>).
- * Increase → StockAdjustment only (lotId set). Both paths write STOCK_ADJUSTMENT audit entries.
+ * Decrease → InventoryWriteOff at the lot's unitCost (reason MANUAL:<reason>) + StockAdjustment.
+ * Increase → StockAdjustment (reason MANUAL:<reason>). StockAdjustment.delta is the LOT delta;
+ * previousStock/newStock remain the product rollup; lotPreviousQty/lotNewQty record the lot.
  */
 export async function adjustLot(
   productId: string,
@@ -544,6 +566,13 @@ export async function adjustLot(
   if (!Number.isInteger(input.newQuantity) || input.newQuantity < 0) {
     throw new AppError(400, "newQuantity must be a non-negative integer");
   }
+  const overrideReason = input.overrideReason?.trim() ?? "";
+  if (input.overrideBlockedLot && !overrideReason) {
+    throw new AppError(400, "overrideReason is required when overriding a blocked lot");
+  }
+  if (input.overrideBlockedLot && actor.role !== Role.COOP_ADMIN) {
+    throw new AppError(403, "Only COOP_ADMIN may override QUARANTINED, RECALLED or EXPIRED lots");
+  }
 
   const result = await prisma.$transaction(async (tx) => {
     // LOCK ORDER: Product then Lot.
@@ -556,6 +585,16 @@ export async function adjustLot(
       throw new AppError(404, "Lot not found for this product");
     }
 
+    const lotStatus = lot.status as LotStatus;
+    const isBlocked = BLOCKED_ADJUST_STATUSES.includes(lotStatus);
+    if (isBlocked && !input.overrideBlockedLot) {
+      throw new AppError(
+        409,
+        "Cannot adjust a QUARANTINED, RECALLED or EXPIRED lot without an explicit override",
+        { lotId: lot.id, lotNumber: lot.lotNumber, status: lotStatus },
+      );
+    }
+
     const productStockBefore = product.stock;
     const adjusted = await setLotRemaining(tx, product, lot, input.newQuantity);
     if (adjusted.delta === 0) {
@@ -563,8 +602,8 @@ export async function adjustLot(
     }
 
     const productStockAfter = productStockBefore + adjusted.rollupDelta;
+    const ledgerReason = `MANUAL:${reason}`;
     let writeOffId: string | null = null;
-    let stockAdjustmentId: string | null = null;
 
     if (adjusted.delta < 0) {
       const qty = -adjusted.delta;
@@ -575,26 +614,48 @@ export async function adjustLot(
           productId,
           lotId: lot.id,
           quantity: qty,
-          reason: `MANUAL:${reason}`,
+          reason: ledgerReason,
           unitCost,
           value: moneyDec(unitCost.mul(qty)),
         },
       });
       writeOffId = writeOff.id;
-    } else {
-      const adjustment = await tx.stockAdjustment.create({
-        data: {
-          productId,
+    }
+
+    const adjustment = await tx.stockAdjustment.create({
+      data: {
+        productId,
+        storeId,
+        adjustedById: actor.id,
+        previousStock: productStockBefore,
+        newStock: productStockAfter,
+        delta: adjusted.delta,
+        reason: ledgerReason,
+        lotId: lot.id,
+        lotPreviousQty: adjusted.previousQty,
+        lotNewQty: input.newQuantity,
+      },
+    });
+
+    if (isBlocked) {
+      await writeAuditLog(
+        {
+          userId: actor.id,
           storeId,
-          adjustedById: actor.id,
-          previousStock: productStockBefore,
-          newStock: productStockAfter,
-          delta: adjusted.rollupDelta,
-          reason,
-          lotId: lot.id,
+          action: AuditAction.STOCK_COUNT_BLOCKED_LOT_OVERRIDE,
+          entityType: "Lot",
+          entityId: lot.id,
+          before: { status: lotStatus, quantityRemaining: adjusted.previousQty },
+          after: {
+            quantityRemaining: input.newQuantity,
+            overrideReason,
+            reason: ledgerReason,
+            stockAdjustmentId: adjustment.id,
+          },
+          ipAddress: input.ipAddress ?? null,
         },
-      });
-      stockAdjustmentId = adjustment.id;
+        { tx },
+      );
     }
 
     await writeAuditLog(
@@ -612,9 +673,10 @@ export async function adjustLot(
           quantityRemaining: input.newQuantity,
           productStock: productStockAfter,
           delta: adjusted.delta,
-          reason,
+          reason: ledgerReason,
           writeOffId,
-          stockAdjustmentId,
+          stockAdjustmentId: adjustment.id,
+          overrideBlockedLot: isBlocked,
         },
         ipAddress: input.ipAddress ?? null,
       },
@@ -628,7 +690,7 @@ export async function adjustLot(
       previousQty: adjusted.previousQty,
       newQuantity: input.newQuantity,
       delta: adjusted.delta,
-      reason,
+      reason: ledgerReason,
     };
   });
 

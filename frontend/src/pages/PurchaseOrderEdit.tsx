@@ -1,5 +1,6 @@
 /**
  * Create / edit / submit a purchase order.
+ * Currency + FX with live USD equivalent; COOP_ADMIN can record supplier payment.
  */
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -16,9 +17,15 @@ import {
   PageHeader,
   SelectField,
   StatusBadge,
+  UnitCost,
 } from "../components/ui";
 
-type DraftLine = { productId: string; orderedQty: string; unitCost: string };
+type DraftLine = {
+  productId: string;
+  orderedQty: string;
+  unitCost: string;
+  unitCostForeign: string;
+};
 
 function poStatusLabel(status: PurchaseOrder["status"]) {
   if (status === "RECEIVED") return <StatusBadge label="Delivered" tone="success" />;
@@ -28,6 +35,13 @@ function poStatusLabel(status: PurchaseOrder["status"]) {
     return <StatusBadge label="Pending" tone="warning" />;
   }
   return <StatusBadge label={status} tone="neutral" />;
+}
+
+function usdFromForeign(foreign: string, rate: string): number | null {
+  const f = Number(foreign);
+  const r = Number(rate);
+  if (!Number.isFinite(f) || !Number.isFinite(r) || r <= 0) return null;
+  return f * r;
 }
 
 export function PurchaseOrderEditPage() {
@@ -40,11 +54,20 @@ export function PurchaseOrderEditPage() {
   const [supplierId, setSupplierId] = useState("");
   const [tax, setTax] = useState("0");
   const [shipping, setShipping] = useState("0");
+  const [currency, setCurrency] = useState("USD");
+  const [fxRateToUsd, setFxRateToUsd] = useState("1");
   const [coopLevel, setCoopLevel] = useState(false);
   const [lines, setLines] = useState<DraftLine[]>([
-    { productId: "", orderedQty: "1", unitCost: "" },
+    { productId: "", orderedQty: "1", unitCost: "", unitCostForeign: "" },
   ]);
+  const [payment, setPayment] = useState({
+    paidAmountUsd: "",
+    paidAt: "",
+    paymentReference: "",
+  });
   const [message, setMessage] = useState<string | null>(null);
+
+  const foreignCurrency = currency.trim().toUpperCase() !== "USD";
 
   const suppliersQuery = useQuery({
     queryKey: ["suppliers", "active"],
@@ -69,14 +92,27 @@ export function PurchaseOrderEditPage() {
       setSupplierId(po.supplierId);
       setTax(String(po.tax));
       setShipping(String(po.shipping));
+      setCurrency(po.currency ?? "USD");
+      setFxRateToUsd(String(po.fxRateToUsd ?? 1));
       setCoopLevel(po.storeId === null);
       setLines(
         po.lines.map((l) => ({
           productId: l.productId,
           orderedQty: String(l.orderedQty),
           unitCost: String(l.unitCost),
+          unitCostForeign:
+            l.unitCostForeign != null && l.unitCostForeign !== ""
+              ? String(l.unitCostForeign)
+              : "",
         })),
       );
+      if (po.paidAmountUsd != null) {
+        setPayment({
+          paidAmountUsd: String(po.paidAmountUsd),
+          paidAt: po.paidAt ? po.paidAt.slice(0, 10) : "",
+          paymentReference: po.paymentReference ?? "",
+        });
+      }
       return data;
     },
   });
@@ -88,10 +124,14 @@ export function PurchaseOrderEditPage() {
     () =>
       lines.reduce((sum, l) => {
         const qty = Number(l.orderedQty) || 0;
+        if (foreignCurrency) {
+          const usd = usdFromForeign(l.unitCostForeign, fxRateToUsd);
+          return sum + qty * (usd ?? 0);
+        }
         const cost = Number(l.unitCost) || 0;
         return sum + qty * cost;
       }, 0),
-    [lines],
+    [lines, foreignCurrency, fxRateToUsd],
   );
 
   const saveMutation = useMutation({
@@ -101,13 +141,24 @@ export function PurchaseOrderEditPage() {
         storeId: coopLevel ? null : activeStoreId,
         tax: Number(tax) || 0,
         shipping: Number(shipping) || 0,
+        currency: currency.trim().toUpperCase() || "USD",
+        fxRateToUsd: foreignCurrency ? Number(fxRateToUsd) : 1,
         lines: lines
           .filter((l) => l.productId)
-          .map((l) => ({
-            productId: l.productId,
-            orderedQty: Number(l.orderedQty),
-            unitCost: Number(l.unitCost),
-          })),
+          .map((l) => {
+            if (foreignCurrency) {
+              return {
+                productId: l.productId,
+                orderedQty: Number(l.orderedQty),
+                unitCostForeign: Number(l.unitCostForeign),
+              };
+            }
+            return {
+              productId: l.productId,
+              orderedQty: Number(l.orderedQty),
+              unitCost: Number(l.unitCost),
+            };
+          }),
       };
       if (isNew) {
         return apiRequest<{ purchaseOrder: PurchaseOrder }>("/purchasing/purchase-orders", {
@@ -120,6 +171,8 @@ export function PurchaseOrderEditPage() {
         body: {
           tax: body.tax,
           shipping: body.shipping,
+          currency: body.currency,
+          fxRateToUsd: body.fxRateToUsd,
           lines: body.lines,
         },
       });
@@ -149,9 +202,32 @@ export function PurchaseOrderEditPage() {
     onError: (err) => setMessage(err instanceof ApiError ? err.message : "Submit failed"),
   });
 
+  const paymentMutation = useMutation({
+    mutationFn: () =>
+      apiRequest("/shipments/supplier-payments", {
+        method: "POST",
+        body: {
+          poId: id,
+          paidAmountUsd: Number(payment.paidAmountUsd),
+          paidAt: payment.paidAt || undefined,
+          paymentReference: payment.paymentReference || null,
+        },
+      }),
+    onSuccess: () => {
+      setMessage("Supplier payment recorded");
+      void qc.invalidateQueries({ queryKey: ["purchase-order", id] });
+    },
+    onError: (err) =>
+      setMessage(err instanceof ApiError ? err.message : "Payment record failed"),
+  });
+
   useEffect(() => {
     if (coopLevel && !isRole("COOP_ADMIN")) setCoopLevel(false);
   }, [coopLevel, isRole]);
+
+  useEffect(() => {
+    if (!foreignCurrency) setFxRateToUsd("1");
+  }, [foreignCurrency]);
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">
@@ -165,6 +241,18 @@ export function PurchaseOrderEditPage() {
         actions={po ? poStatusLabel(po.status) : undefined}
       />
       {message && <p className="text-sm text-ink-muted">{message}</p>}
+
+      {po?.importShipment && (
+        <p className="rounded-lg border border-brand-terracotta/30 bg-brand-terracotta/10 px-3 py-2 text-sm text-brand-terracotta-ink">
+          On shipment{" "}
+          <Link
+            to={`/shipments/${po.importShipment.id}`}
+            className="font-semibold underline"
+          >
+            {po.importShipment.shipmentNumber}
+          </Link>
+        </p>
+      )}
 
       <Card>
         <form
@@ -185,6 +273,7 @@ export function PurchaseOrderEditPage() {
             {(suppliersQuery.data?.suppliers ?? []).map((s) => (
               <option key={s.id} value={s.id}>
                 {s.name}
+                {s.supplierType ? ` (${s.supplierType})` : ""}
               </option>
             ))}
           </SelectField>
@@ -205,13 +294,27 @@ export function PurchaseOrderEditPage() {
 
           <div className="grid gap-3 sm:grid-cols-2">
             <Field
-              label="Tax"
+              label="Currency"
+              value={currency}
+              disabled={!editable}
+              maxLength={3}
+              onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+            />
+            <Field
+              label="FX rate → USD"
+              value={fxRateToUsd}
+              disabled={!editable || !foreignCurrency}
+              onChange={(e) => setFxRateToUsd(e.target.value)}
+              hint={foreignCurrency ? "1 foreign unit = this many USD" : "Fixed at 1 for USD"}
+            />
+            <Field
+              label="Tax (USD)"
               value={tax}
               disabled={!editable}
               onChange={(e) => setTax(e.target.value)}
             />
             <Field
-              label="Shipping"
+              label="Shipping (USD)"
               value={shipping}
               disabled={!editable}
               onChange={(e) => setShipping(e.target.value)}
@@ -220,79 +323,121 @@ export function PurchaseOrderEditPage() {
 
           <div className="space-y-3">
             <h2 className="font-semibold text-ink">Lines</h2>
-            {lines.map((line, idx) => (
-              <div key={idx} className="grid gap-2 sm:grid-cols-[1fr_100px_100px_auto]">
-                <select
-                  className="min-h-[44px] rounded-md border border-border-strong bg-surface-raised px-2 py-2 text-sm text-ink disabled:bg-surface-sunken"
-                  value={line.productId}
-                  disabled={!editable}
-                  onChange={(e) => {
-                    const productId = e.target.value;
-                    const product = productsQuery.data?.products.find((p) => p.id === productId);
-                    setLines((prev) =>
-                      prev.map((l, i) =>
-                        i === idx
-                          ? {
-                              ...l,
-                              productId,
-                              unitCost: product ? String(product.cost) : l.unitCost,
-                            }
-                          : l,
-                      ),
-                    );
-                  }}
+            {lines.map((line, idx) => {
+              const liveUsd = foreignCurrency
+                ? usdFromForeign(line.unitCostForeign, fxRateToUsd)
+                : Number(line.unitCost) || null;
+              return (
+                <div
+                  key={idx}
+                  className="grid gap-2 sm:grid-cols-[1fr_90px_110px_110px_auto]"
                 >
-                  <option value="">Product…</option>
-                  {(
-                    productsQuery.data?.products ??
-                    (po?.lines
-                      .map((l) => l.product)
-                      .filter((p): p is NonNullable<typeof p> => Boolean(p)) ?? [])
-                  ).map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.sku} — {p.name}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  className="tabular min-h-[44px] rounded-md border border-border-strong px-2 py-2 text-sm"
-                  placeholder="Qty"
-                  disabled={!editable}
-                  value={line.orderedQty}
-                  onChange={(e) =>
-                    setLines((prev) =>
-                      prev.map((l, i) => (i === idx ? { ...l, orderedQty: e.target.value } : l)),
-                    )
-                  }
-                />
-                <input
-                  className="tabular min-h-[44px] rounded-md border border-border-strong px-2 py-2 text-sm"
-                  placeholder="Unit $"
-                  disabled={!editable}
-                  value={line.unitCost}
-                  onChange={(e) =>
-                    setLines((prev) =>
-                      prev.map((l, i) => (i === idx ? { ...l, unitCost: e.target.value } : l)),
-                    )
-                  }
-                />
-                {editable && (
-                  <Button
-                    type="button"
-                    variant="quiet"
-                    onClick={() => setLines((prev) => prev.filter((_, i) => i !== idx))}
+                  <select
+                    className="min-h-[44px] rounded-md border border-border-strong bg-surface-raised px-2 py-2 text-sm text-ink disabled:bg-surface-sunken"
+                    value={line.productId}
+                    disabled={!editable}
+                    onChange={(e) => {
+                      const productId = e.target.value;
+                      const product = productsQuery.data?.products.find(
+                        (p) => p.id === productId,
+                      );
+                      setLines((prev) =>
+                        prev.map((l, i) =>
+                          i === idx
+                            ? {
+                                ...l,
+                                productId,
+                                unitCost: product ? String(product.cost) : l.unitCost,
+                              }
+                            : l,
+                        ),
+                      );
+                    }}
                   >
-                    Remove
-                  </Button>
-                )}
-              </div>
-            ))}
+                    <option value="">Product…</option>
+                    {(
+                      productsQuery.data?.products ??
+                      (po?.lines
+                        .map((l) => l.product)
+                        .filter((p): p is NonNullable<typeof p> => Boolean(p)) ?? [])
+                    ).map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.sku} — {p.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="tabular min-h-[44px] rounded-md border border-border-strong px-2 py-2 text-sm"
+                    placeholder="Qty"
+                    disabled={!editable}
+                    value={line.orderedQty}
+                    onChange={(e) =>
+                      setLines((prev) =>
+                        prev.map((l, i) =>
+                          i === idx ? { ...l, orderedQty: e.target.value } : l,
+                        ),
+                      )
+                    }
+                  />
+                  {foreignCurrency ? (
+                    <input
+                      className="tabular min-h-[44px] rounded-md border border-border-strong px-2 py-2 text-sm"
+                      placeholder={`${currency} unit`}
+                      disabled={!editable}
+                      value={line.unitCostForeign}
+                      onChange={(e) =>
+                        setLines((prev) =>
+                          prev.map((l, i) =>
+                            i === idx ? { ...l, unitCostForeign: e.target.value } : l,
+                          ),
+                        )
+                      }
+                    />
+                  ) : (
+                    <input
+                      className="tabular min-h-[44px] rounded-md border border-border-strong px-2 py-2 text-sm"
+                      placeholder="Unit $"
+                      disabled={!editable}
+                      value={line.unitCost}
+                      onChange={(e) =>
+                        setLines((prev) =>
+                          prev.map((l, i) =>
+                            i === idx ? { ...l, unitCost: e.target.value } : l,
+                          ),
+                        )
+                      }
+                    />
+                  )}
+                  <div className="flex min-h-[44px] items-center text-sm text-ink-muted">
+                    {liveUsd != null ? (
+                      <span>
+                        ≈ <UnitCost value={liveUsd} />
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </div>
+                  {editable && (
+                    <Button
+                      type="button"
+                      variant="quiet"
+                      onClick={() => setLines((prev) => prev.filter((_, i) => i !== idx))}
+                    >
+                      Remove
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
             {editable && (
               <Button
                 type="button"
                 variant="quiet"
                 onClick={() =>
-                  setLines((prev) => [...prev, { productId: "", orderedQty: "1", unitCost: "" }])
+                  setLines((prev) => [
+                    ...prev,
+                    { productId: "", orderedQty: "1", unitCost: "", unitCostForeign: "" },
+                  ])
                 }
               >
                 Add line
@@ -345,6 +490,50 @@ export function PurchaseOrderEditPage() {
               </li>
             ))}
           </ul>
+        </Card>
+      )}
+
+      {!isNew && po && isRole("COOP_ADMIN") && po.status !== "DRAFT" && po.status !== "CANCELLED" && (
+        <Card title="Supplier payment">
+          {po.paidAmountUsd != null && (
+            <p className="mb-3 text-sm text-ink">
+              Recorded <Money value={po.paidAmountUsd} />
+              {po.paidAt ? ` on ${po.paidAt.slice(0, 10)}` : ""}
+              {po.paymentReference ? ` · ref ${po.paymentReference}` : ""}
+            </p>
+          )}
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field
+              label="Paid amount (USD)"
+              value={payment.paidAmountUsd}
+              onChange={(e) =>
+                setPayment((p) => ({ ...p, paidAmountUsd: e.target.value }))
+              }
+            />
+            <Field
+              label="Paid date"
+              type="date"
+              value={payment.paidAt}
+              onChange={(e) => setPayment((p) => ({ ...p, paidAt: e.target.value }))}
+            />
+            <Field
+              label="Reference"
+              value={payment.paymentReference}
+              onChange={(e) =>
+                setPayment((p) => ({ ...p, paymentReference: e.target.value }))
+              }
+            />
+          </div>
+          <div className="mt-3">
+            <Button
+              type="button"
+              disabled={!payment.paidAmountUsd}
+              loading={paymentMutation.isPending}
+              onClick={() => paymentMutation.mutate()}
+            >
+              Record supplier payment
+            </Button>
+          </div>
         </Card>
       )}
     </div>

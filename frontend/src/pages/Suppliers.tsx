@@ -1,11 +1,20 @@
 /**
  * Suppliers list + detail (link preferred products / costs).
+ * FPO profile + certifications with terracotta expiry badges (never gold).
  */
 import { useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
-import type { Product, Supplier } from "../api/types";
+import type {
+  CertificationType,
+  FpoLegalForm,
+  FpoProfile,
+  Product,
+  Supplier,
+  SupplierCertification,
+  SupplierType,
+} from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 import { storeQuery } from "../auth/storeQuery";
 import {
@@ -20,6 +29,47 @@ import {
   type DataTableColumn,
 } from "../components/ui";
 
+const SUPPLIER_TYPES: SupplierType[] = [
+  "FPO",
+  "EXPORTER",
+  "DOMESTIC_DISTRIBUTOR",
+  "DOMESTIC_VENDOR",
+  "OTHER",
+];
+
+const LEGAL_FORMS: FpoLegalForm[] = ["PRODUCER_COMPANY", "COOPERATIVE_SOCIETY", "OTHER"];
+
+const CERT_TYPES: CertificationType[] = [
+  "FSSAI_LICENSE",
+  "APEDA_RCMC",
+  "FDA_FOOD_FACILITY_REGISTRATION",
+  "ORGANIC_NPOP",
+  "ORGANIC_USDA",
+  "FSVP_VERIFICATION",
+  "LAB_ACCREDITATION",
+  "OTHER",
+];
+
+function certExpiryBadge(cert: SupplierCertification) {
+  const now = Date.now();
+  const expires = cert.expiresAt ? new Date(cert.expiresAt).getTime() : null;
+  const review = cert.nextReviewDue ? new Date(cert.nextReviewDue).getTime() : null;
+  if (expires != null && expires < now) {
+    return <StatusBadge label="Expired" tone="danger" />;
+  }
+  if (review != null && review < now) {
+    return <StatusBadge label="Review due" tone="terracotta" />;
+  }
+  const soon = now + 30 * 86_400_000;
+  if (expires != null && expires <= soon) {
+    return <StatusBadge label="Expiring soon" tone="terracotta" />;
+  }
+  if (review != null && review <= soon) {
+    return <StatusBadge label="Review due" tone="terracotta" />;
+  }
+  return <StatusBadge label="Active" tone="success" />;
+}
+
 export function SuppliersPage() {
   const { id } = useParams();
   if (id) return <SupplierDetail id={id} />;
@@ -29,6 +79,8 @@ export function SuppliersPage() {
 function SupplierList() {
   const qc = useQueryClient();
   const [name, setName] = useState("");
+  const [supplierType, setSupplierType] = useState<SupplierType>("OTHER");
+  const [country, setCountry] = useState("US");
   const [error, setError] = useState<string | null>(null);
 
   const listQuery = useQuery({
@@ -40,7 +92,7 @@ function SupplierList() {
     mutationFn: () =>
       apiRequest<{ supplier: Supplier }>("/purchasing/suppliers", {
         method: "POST",
-        body: { name },
+        body: { name, supplierType, country },
       }),
     onSuccess: () => {
       setName("");
@@ -64,6 +116,11 @@ function SupplierList() {
           {s.name}
         </Link>
       ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      cell: (s) => s.supplierType?.replace(/_/g, " ") ?? "—",
     },
     { id: "terms", header: "Terms", cell: (s) => s.paymentTerms },
     {
@@ -102,6 +159,25 @@ function SupplierList() {
             onChange={(e) => setName(e.target.value)}
             required
           />
+          <SelectField
+            label="Type"
+            value={supplierType}
+            onChange={(e) => setSupplierType(e.target.value as SupplierType)}
+          >
+            {SUPPLIER_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t.replace(/_/g, " ")}
+              </option>
+            ))}
+          </SelectField>
+          <Field
+            label="Country"
+            className="w-24"
+            value={country}
+            maxLength={2}
+            onChange={(e) => setCountry(e.target.value.toUpperCase())}
+            required
+          />
           <div className="flex items-end">
             <Button type="submit" loading={createMutation.isPending}>
               Add supplier
@@ -125,7 +201,7 @@ function SupplierList() {
 }
 
 function SupplierDetail({ id }: { id: string }) {
-  const { activeStoreId } = useAuth();
+  const { activeStoreId, isRole } = useAuth();
   const qc = useQueryClient();
   const q = storeQuery(activeStoreId);
   const [form, setForm] = useState({
@@ -136,6 +212,25 @@ function SupplierDetail({ id }: { id: string }) {
     paymentTerms: "NET30",
     leadTimeDays: "7",
     notes: "",
+    supplierType: "OTHER" as SupplierType,
+    country: "US",
+  });
+  const [fpoForm, setFpoForm] = useState({
+    legalForm: "OTHER" as FpoLegalForm,
+    registrationNumber: "",
+    state: "",
+    district: "",
+    memberFarmerCount: "",
+    memberFarmerCountAsOf: "",
+    primaryCrops: "",
+    notes: "",
+  });
+  const [certForm, setCertForm] = useState({
+    certType: "FSVP_VERIFICATION" as CertificationType,
+    certNumber: "",
+    issuedAt: "",
+    expiresAt: "",
+    nextReviewDue: "",
   });
   const [link, setLink] = useState({
     productId: "",
@@ -160,9 +255,47 @@ function SupplierDetail({ id }: { id: string }) {
         paymentTerms: data.supplier.paymentTerms,
         leadTimeDays: String(data.supplier.leadTimeDays),
         notes: data.supplier.notes,
+        supplierType: data.supplier.supplierType ?? "OTHER",
+        country: data.supplier.country ?? "US",
       });
       return data;
     },
+  });
+
+  const fpoQuery = useQuery({
+    queryKey: ["supplier", id, "fpo-profile"],
+    enabled: !!id && isRole("COOP_ADMIN") && form.supplierType === "FPO",
+    queryFn: async () => {
+      try {
+        const data = await apiRequest<{ profile: FpoProfile }>(
+          `/purchasing/suppliers/${id}/fpo-profile`,
+        );
+        const p = data.profile;
+        setFpoForm({
+          legalForm: p.legalForm,
+          registrationNumber: p.registrationNumber,
+          state: p.state,
+          district: p.district,
+          memberFarmerCount: String(p.memberFarmerCount),
+          memberFarmerCountAsOf: p.memberFarmerCountAsOf.slice(0, 10),
+          primaryCrops: p.primaryCrops.join(", "),
+          notes: p.notes,
+        });
+        return data;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) return { profile: null };
+        throw err;
+      }
+    },
+  });
+
+  const certsQuery = useQuery({
+    queryKey: ["supplier", id, "certifications"],
+    enabled: !!id,
+    queryFn: () =>
+      apiRequest<{ certifications: SupplierCertification[] }>(
+        `/compliance/suppliers/${id}/certifications`,
+      ),
   });
 
   const productsQuery = useQuery({
@@ -185,6 +318,57 @@ function SupplierDetail({ id }: { id: string }) {
       void qc.invalidateQueries({ queryKey: ["supplier", id] });
     },
     onError: (err) => setMessage(err instanceof ApiError ? err.message : "Save failed"),
+  });
+
+  const saveFpoMutation = useMutation({
+    mutationFn: () =>
+      apiRequest<{ profile: FpoProfile }>(`/purchasing/suppliers/${id}/fpo-profile`, {
+        method: "PUT",
+        body: {
+          supplierId: id,
+          legalForm: fpoForm.legalForm,
+          registrationNumber: fpoForm.registrationNumber,
+          state: fpoForm.state,
+          district: fpoForm.district,
+          memberFarmerCount: Number(fpoForm.memberFarmerCount) || 0,
+          memberFarmerCountAsOf: fpoForm.memberFarmerCountAsOf
+            ? `${fpoForm.memberFarmerCountAsOf}T00:00:00.000Z`
+            : undefined,
+          primaryCrops: fpoForm.primaryCrops
+            .split(",")
+            .map((c) => c.trim())
+            .filter(Boolean),
+          notes: fpoForm.notes,
+        },
+      }),
+    onSuccess: () => {
+      setMessage("FPO profile saved");
+      void qc.invalidateQueries({ queryKey: ["supplier", id, "fpo-profile"] });
+    },
+    onError: (err) =>
+      setMessage(err instanceof ApiError ? err.message : "FPO profile save failed"),
+  });
+
+  const addCertMutation = useMutation({
+    mutationFn: () =>
+      apiRequest("/compliance/certifications", {
+        method: "POST",
+        body: {
+          supplierId: id,
+          certType: certForm.certType,
+          certNumber: certForm.certNumber || undefined,
+          issuedAt: certForm.issuedAt,
+          expiresAt: certForm.expiresAt || null,
+          nextReviewDue: certForm.nextReviewDue || null,
+        },
+      }),
+    onSuccess: () => {
+      setMessage("Certification added");
+      setCertForm((f) => ({ ...f, certNumber: "", expiresAt: "", nextReviewDue: "" }));
+      void qc.invalidateQueries({ queryKey: ["supplier", id, "certifications"] });
+    },
+    onError: (err) =>
+      setMessage(err instanceof ApiError ? err.message : "Certification save failed"),
   });
 
   const linkMutation = useMutation({
@@ -210,15 +394,24 @@ function SupplierDetail({ id }: { id: string }) {
   });
 
   const supplier = detailQuery.data?.supplier;
+  const isFpo = form.supplierType === "FPO";
 
   return (
     <div className="space-y-6">
       <PageHeader
         title={supplier?.name ?? "…"}
         description={
-          <Link to="/suppliers" className="text-brand-terracotta-ink underline">
-            ← Suppliers
-          </Link>
+          <span className="flex flex-wrap items-center gap-2">
+            <Link to="/suppliers" className="text-brand-terracotta-ink underline">
+              ← Suppliers
+            </Link>
+            {supplier?.supplierType && (
+              <span className="text-ink-muted">
+                · {supplier.supplierType.replace(/_/g, " ")}
+                {supplier.country ? ` · ${supplier.country}` : ""}
+              </span>
+            )}
+          </span>
         }
       />
       {message && <p className="text-sm text-ink-muted">{message}</p>}
@@ -248,6 +441,27 @@ function SupplierDetail({ id }: { id: string }) {
               onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))}
             />
           ))}
+          <SelectField
+            label="Type"
+            value={form.supplierType}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, supplierType: e.target.value as SupplierType }))
+            }
+          >
+            {SUPPLIER_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t.replace(/_/g, " ")}
+              </option>
+            ))}
+          </SelectField>
+          <Field
+            label="Country"
+            value={form.country}
+            maxLength={2}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, country: e.target.value.toUpperCase() }))
+            }
+          />
           <label className="flex flex-col gap-1.5 text-sm sm:col-span-2">
             <span className="font-semibold text-ink">Notes</span>
             <textarea
@@ -263,6 +477,183 @@ function SupplierDetail({ id }: { id: string }) {
             </Button>
           </div>
         </form>
+      </Card>
+
+      {isFpo && isRole("COOP_ADMIN") && (
+        <Card title="FPO profile">
+          {fpoQuery.isLoading ? (
+            <p className="text-sm text-ink-muted">Loading profile…</p>
+          ) : (
+            <form
+              className="grid gap-3 sm:grid-cols-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveFpoMutation.mutate();
+              }}
+            >
+              <SelectField
+                label="Legal form"
+                value={fpoForm.legalForm}
+                onChange={(e) =>
+                  setFpoForm((f) => ({
+                    ...f,
+                    legalForm: e.target.value as FpoLegalForm,
+                  }))
+                }
+              >
+                {LEGAL_FORMS.map((f) => (
+                  <option key={f} value={f}>
+                    {f.replace(/_/g, " ")}
+                  </option>
+                ))}
+              </SelectField>
+              <Field
+                label="Registration #"
+                value={fpoForm.registrationNumber}
+                onChange={(e) =>
+                  setFpoForm((f) => ({ ...f, registrationNumber: e.target.value }))
+                }
+              />
+              <Field
+                label="State"
+                value={fpoForm.state}
+                onChange={(e) => setFpoForm((f) => ({ ...f, state: e.target.value }))}
+              />
+              <Field
+                label="District"
+                value={fpoForm.district}
+                onChange={(e) => setFpoForm((f) => ({ ...f, district: e.target.value }))}
+              />
+              <Field
+                label="Member farmer count"
+                value={fpoForm.memberFarmerCount}
+                onChange={(e) =>
+                  setFpoForm((f) => ({ ...f, memberFarmerCount: e.target.value }))
+                }
+              />
+              <Field
+                label="Farmer count as of"
+                type="date"
+                value={fpoForm.memberFarmerCountAsOf}
+                onChange={(e) =>
+                  setFpoForm((f) => ({ ...f, memberFarmerCountAsOf: e.target.value }))
+                }
+              />
+              <Field
+                label="Primary crops"
+                hint="Comma-separated"
+                className="sm:col-span-2"
+                value={fpoForm.primaryCrops}
+                onChange={(e) =>
+                  setFpoForm((f) => ({ ...f, primaryCrops: e.target.value }))
+                }
+              />
+              {fpoQuery.data?.profile && (
+                <p className="sm:col-span-2 text-sm text-ink-muted">
+                  Current count{" "}
+                  <span className="tabular font-semibold text-ink">
+                    {fpoQuery.data.profile.memberFarmerCount}
+                  </span>{" "}
+                  as of{" "}
+                  {new Date(fpoQuery.data.profile.memberFarmerCountAsOf)
+                    .toISOString()
+                    .slice(0, 10)}
+                </p>
+              )}
+              <div className="sm:col-span-2">
+                <Button type="submit" loading={saveFpoMutation.isPending}>
+                  Save FPO profile
+                </Button>
+              </div>
+            </form>
+          )}
+        </Card>
+      )}
+
+      <Card title="Certifications">
+        <ul className="mb-4 space-y-2 text-sm">
+          {(certsQuery.data?.certifications ?? []).map((c) => (
+            <li
+              key={c.id}
+              className="flex flex-wrap items-center justify-between gap-2 border-b border-border-hairline pb-2"
+            >
+              <span>
+                <span className="font-medium text-ink">
+                  {c.certType.replace(/_/g, " ")}
+                </span>
+                {c.certNumber ? (
+                  <span className="ml-2 font-mono text-xs text-ink-muted">
+                    {c.certNumber}
+                  </span>
+                ) : null}
+                {c.expiresAt && (
+                  <span className="ml-2 text-ink-muted">
+                    exp {c.expiresAt.slice(0, 10)}
+                  </span>
+                )}
+              </span>
+              {certExpiryBadge(c)}
+            </li>
+          ))}
+          {(certsQuery.data?.certifications ?? []).length === 0 && (
+            <li className="text-ink-muted">No certifications on file.</li>
+          )}
+        </ul>
+        {isRole("COOP_ADMIN") && (
+          <div className="grid gap-2 border-t border-border-hairline pt-3 sm:grid-cols-3">
+            <SelectField
+              label="Type"
+              value={certForm.certType}
+              onChange={(e) =>
+                setCertForm((f) => ({
+                  ...f,
+                  certType: e.target.value as CertificationType,
+                }))
+              }
+            >
+              {CERT_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t.replace(/_/g, " ")}
+                </option>
+              ))}
+            </SelectField>
+            <Field
+              label="Number"
+              value={certForm.certNumber}
+              onChange={(e) => setCertForm((f) => ({ ...f, certNumber: e.target.value }))}
+            />
+            <Field
+              label="Issued"
+              type="date"
+              value={certForm.issuedAt}
+              onChange={(e) => setCertForm((f) => ({ ...f, issuedAt: e.target.value }))}
+            />
+            <Field
+              label="Expires"
+              type="date"
+              value={certForm.expiresAt}
+              onChange={(e) => setCertForm((f) => ({ ...f, expiresAt: e.target.value }))}
+            />
+            <Field
+              label="Next review"
+              type="date"
+              value={certForm.nextReviewDue}
+              onChange={(e) =>
+                setCertForm((f) => ({ ...f, nextReviewDue: e.target.value }))
+              }
+            />
+            <div className="flex items-end">
+              <Button
+                type="button"
+                disabled={!certForm.issuedAt}
+                loading={addCertMutation.isPending}
+                onClick={() => addCertMutation.mutate()}
+              >
+                Add certification
+              </Button>
+            </div>
+          </div>
+        )}
       </Card>
 
       <Card title="Linked products">

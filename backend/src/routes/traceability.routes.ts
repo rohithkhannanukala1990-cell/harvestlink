@@ -1,5 +1,5 @@
 /**
- * Traceability HTTP routes — one step forward / one step back / lot genealogy.
+ * Traceability HTTP routes — forward / backward / genealogy / product provenance.
  * Restricted to COOP_ADMIN and STORE_ADMIN (own store only).
  */
 import { Role } from "@prisma/client";
@@ -81,6 +81,18 @@ traceabilityRouter.get("/sale-items/:saleItemId/backward", async (req, res) => {
     const result = await traceability.traceBackward(req.user!, {
       saleItemId: req.params.saleItemId,
     });
+    res.status(200).json(result);
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+traceabilityRouter.get("/catalog/:catalogItemId/provenance", async (req, res) => {
+  try {
+    const result = await traceability.getProductProvenance(
+      req.user!,
+      req.params.catalogItemId,
+    );
     res.status(200).json(result);
   } catch (error) {
     handleError(res, error);

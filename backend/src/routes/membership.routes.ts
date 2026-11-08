@@ -103,6 +103,55 @@ membershipRouter.post(
   },
 );
 
+const cooperativeSettingsPatchSchema = z
+  .object({
+    votingThresholdAmount: z.number().nonnegative().optional(),
+    fiscalYearEnd: z.string().min(1).optional(),
+    legalEntityName: z.string().min(1).optional(),
+    stateOfIncorporation: z.string().optional(),
+    operatingState: z.string().optional(),
+    principalOfficeAddress: z.string().optional(),
+    cashDepositGraceDays: z.number().int().positive().optional(),
+    mainWarehouseId: z.string().nullable().optional(),
+  })
+  .refine((body) => Object.values(body).some((v) => v !== undefined), {
+    message: "At least one settings field is required",
+  });
+
+membershipRouter.get(
+  "/cooperative-settings",
+  requireRole(Role.STORE_ADMIN, Role.COOP_ADMIN),
+  async (_req, res) => {
+    try {
+      const settings = await membershipService.getCooperativeSettings();
+      res.status(200).json({ settings });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+membershipRouter.patch(
+  "/cooperative-settings",
+  requireRole(Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const parsed = cooperativeSettingsPatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "Invalid cooperative settings",
+          details: parsed.error.flatten(),
+        });
+        return;
+      }
+      const settings = await membershipService.updateCooperativeSettings(req.user!, parsed.data);
+      res.status(200).json({ settings });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
 // ── Members list / create ──
 
 membershipRouter.get(

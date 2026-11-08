@@ -81,7 +81,12 @@ export type CooperativeSettings = {
   votingThresholdAmount: string | number;
   fiscalYearEnd: string;
   legalEntityName: string;
+  /** Where the co-op is REGISTERED (e.g. OH). */
   stateOfIncorporation: string;
+  /** Where the co-op OPERATES (e.g. TX) — may differ from registration. */
+  operatingState: string;
+  /** Principal operating office street address. */
+  principalOfficeAddress: string;
   /** Days closed-shift cash may sit undeposited before the store is prompted to bank it. */
   cashDepositGraceDays: number;
   createdAt: string;
@@ -499,6 +504,27 @@ export type PurchaseOrderStatus =
   | "RECEIVED"
   | "CANCELLED";
 
+export type SupplierType =
+  | "FPO"
+  | "EXPORTER"
+  | "DOMESTIC_DISTRIBUTOR"
+  | "DOMESTIC_VENDOR"
+  | "OTHER";
+
+export type FpoLegalForm = "PRODUCER_COMPANY" | "COOPERATIVE_SOCIETY" | "OTHER";
+
+export type OrganicStatus = "CONVENTIONAL" | "IN_CONVERSION" | "CERTIFIED_ORGANIC";
+
+export type CertificationType =
+  | "FSSAI_LICENSE"
+  | "APEDA_RCMC"
+  | "FDA_FOOD_FACILITY_REGISTRATION"
+  | "ORGANIC_NPOP"
+  | "ORGANIC_USDA"
+  | "FSVP_VERIFICATION"
+  | "LAB_ACCREDITATION"
+  | "OTHER";
+
 export type Supplier = {
   id: string;
   name: string;
@@ -510,6 +536,8 @@ export type Supplier = {
   leadTimeDays: number;
   isActive: boolean;
   notes: string;
+  supplierType?: SupplierType;
+  country?: string;
   products?: Array<{
     id: string;
     supplierSku: string;
@@ -522,15 +550,55 @@ export type Supplier = {
   }>;
 };
 
+export type FpoProfile = {
+  id: string;
+  supplierId: string;
+  legalForm: FpoLegalForm;
+  registrationNumber: string;
+  state: string;
+  district: string;
+  block: string | null;
+  memberFarmerCount: number;
+  memberFarmerCountAsOf: string;
+  womenFarmerCount: number | null;
+  primaryCrops: string[];
+  exportsViaSupplierId: string | null;
+  onboardedAt: string;
+  notes: string;
+};
+
+export type SupplierCertification = {
+  id: string;
+  supplierId: string;
+  certType: CertificationType;
+  certNumber: string;
+  issuedAt: string;
+  expiresAt: string | null;
+  nextReviewDue: string | null;
+  documentId: string | null;
+  notes: string;
+  verifiedAt: string | null;
+};
+
 export type PurchaseOrderLine = {
   id: string;
   productId: string;
   orderedQty: number;
   receivedQty: number;
   unitCost: string | number;
+  unitCostForeign?: string | number | null;
   lineTotal: string | number;
   shortClosed?: boolean;
   product?: { id: string; sku: string; name: string; storeId: string; stock?: number };
+};
+
+export type PoImportShipmentSummary = {
+  id: string;
+  shipmentNumber: string;
+  status: ImportShipmentStatus;
+  containerNumber: string | null;
+  eta: string | null;
+  costCount: number;
 };
 
 export type PurchaseOrder = {
@@ -541,14 +609,220 @@ export type PurchaseOrder = {
   status: PurchaseOrderStatus;
   expectedDate: string | null;
   submittedAt: string | null;
+  currency?: string;
+  fxRateToUsd?: string | number;
+  paidAmountUsd?: string | number | null;
+  paidAt?: string | null;
+  paymentReference?: string | null;
   subtotal: string | number;
   tax: string | number;
   shipping: string | number;
   total: string | number;
   createdAt: string;
-  supplier?: { id: string; name: string };
+  supplier?: { id: string; name: string; supplierType?: SupplierType; country?: string };
   store?: { id: string; name: string } | null;
   lines: PurchaseOrderLine[];
+  /** Present on GET /purchase-orders/:id when the PO is on an active import shipment. */
+  importShipment?: PoImportShipmentSummary | null;
+  landedPreviewByPoLineId?: Record<
+    string,
+    { landedAddOnPerUnit: string; quantity: number }
+  >;
+  complianceGaps?: Array<{ code: string; message: string }>;
+  requiresLandedCostAck?: boolean;
+};
+
+export type ImportShipmentStatus =
+  | "PLANNED"
+  | "BOOKED"
+  | "IN_TRANSIT"
+  | "AT_PORT"
+  | "CUSTOMS_HOLD"
+  | "CLEARED"
+  | "DELIVERED"
+  | "RECEIVED"
+  | "COSTED"
+  | "CLOSED"
+  | "CANCELLED";
+
+export type ShipmentMode = "SEA_FCL" | "SEA_LCL" | "AIR";
+export type Incoterm = "FOB" | "CIF" | "CFR" | "EXW" | "DAP";
+export type ShipmentCostStatus = "ESTIMATED" | "FINAL";
+export type ShipmentCostType =
+  | "OCEAN_FREIGHT"
+  | "AIR_FREIGHT"
+  | "INSURANCE"
+  | "CUSTOMS_DUTY"
+  | "BROKER_FEE"
+  | "PORT_CHARGES"
+  | "DRAYAGE"
+  | "INLAND_FREIGHT"
+  | "FDA_EXAM"
+  | "STORAGE_DEMURRAGE"
+  | "FX_DIFFERENCE"
+  | "OTHER";
+export type CostAllocationBasis =
+  | "VALUE"
+  | "WEIGHT"
+  | "VOLUME"
+  | "QUANTITY"
+  | "LINE_SPECIFIC";
+export type ShipmentDocType =
+  | "COMMERCIAL_INVOICE"
+  | "PACKING_LIST"
+  | "BILL_OF_LADING"
+  | "AIR_WAYBILL"
+  | "CERTIFICATE_OF_ORIGIN"
+  | "PHYTOSANITARY_CERTIFICATE"
+  | "FDA_PRIOR_NOTICE"
+  | "CUSTOMS_ENTRY_SUMMARY"
+  | "LAB_REPORT"
+  | "FUMIGATION_CERTIFICATE"
+  | "INSURANCE_CERTIFICATE"
+  | "OTHER";
+
+export type ShipmentCost = {
+  id: string;
+  shipmentId: string;
+  costType: ShipmentCostType;
+  vendorName: string;
+  invoiceNumber: string | null;
+  currency: string;
+  amountForeign: string | number;
+  fxRateToUsd: string | number;
+  amountUsd: string | number;
+  allocationBasis: CostAllocationBasis;
+  status: ShipmentCostStatus;
+  supersedesCostId: string | null;
+  paidAt: string | null;
+  paidAmountUsd: string | number | null;
+  paymentReference: string | null;
+  createdAt: string;
+};
+
+export type ShipmentEvent = {
+  id: string;
+  shipmentId: string;
+  eventType: string;
+  message: string;
+  createdAt: string;
+  createdByUserId: string | null;
+};
+
+export type ShipmentLine = {
+  id: string;
+  shipmentId: string;
+  poLineId: string;
+  quantity: number;
+  grossWeightKg: string | number | null;
+  volumeCbm: string | number | null;
+  htsCode: string | null;
+  dutyRatePercent: string | number | null;
+  customsValueUsd: string | number;
+  dutyAmountUsd: string | number | null;
+  poLine?: {
+    id: string;
+    product?: { id: string; sku: string; name: string };
+    po?: { id: string; poNumber: string };
+  };
+};
+
+export type ImportShipment = {
+  id: string;
+  shipmentNumber: string;
+  status: ImportShipmentStatus;
+  mode: ShipmentMode;
+  incoterm: Incoterm;
+  originPort: string;
+  destinationPort: string;
+  carrier: string;
+  vesselVoyage: string;
+  containerNumber: string | null;
+  billOfLadingNumber: string | null;
+  customsEntryNumber: string | null;
+  etd: string | null;
+  eta: string | null;
+  actualDeparture: string | null;
+  actualArrival: string | null;
+  clearedAt: string | null;
+  deliveredAt: string | null;
+  destinationStoreId: string;
+  holdReason: string | null;
+  createdAt: string;
+  destinationStore?: { id: string; name: string; locationType: string };
+  purchaseOrders?: Array<{
+    id: string;
+    poId: string;
+    po: PurchaseOrder & {
+      supplier?: { id: string; name: string; supplierType?: SupplierType };
+    };
+  }>;
+  lines?: ShipmentLine[];
+  costs?: ShipmentCost[];
+  events?: ShipmentEvent[];
+  goodsValueUsd: string | number;
+  estimatedCostsUsd: string | number;
+  finalCostsUsd: string | number;
+  landedCostsUsd: string | number;
+  landedTotalUsd: string | number;
+  upliftPercent: string | number;
+};
+
+export type AllocationPreview = {
+  shipmentId: string;
+  shipmentNumber: string;
+  status: ImportShipmentStatus;
+  costCount: number;
+  lines: Array<{
+    shipmentLineId: string;
+    poLineId: string;
+    poId: string;
+    poNumber: string;
+    productId: string;
+    sku: string;
+    name: string;
+    quantity: number;
+    customsValueUsd: string | number;
+    allocatedByCostType: Record<string, string>;
+    landedAddOnTotal: string;
+    landedAddOnPerUnit: string;
+    landedUnitCost: string;
+    upliftPercent: string;
+  }>;
+};
+
+export type TrueUpPreview = {
+  shipmentId: string;
+  shipmentNumber: string;
+  status: ImportShipmentStatus;
+  hasChanges: boolean;
+  allCostsFinal: boolean;
+  totalVarianceUsd: string;
+  lots: Array<{
+    lotId: string;
+    productId: string;
+    poLineId: string;
+    quantityReceived: number;
+    unitsConsumed: number;
+    previousAddOn: string;
+    newAddOn: string;
+    deltaPerUnit: string;
+    previousUnitCost: string;
+    newUnitCost: string;
+    varianceAmountUsd: string;
+  }>;
+  wroteChanges?: boolean;
+  movedToCosted?: boolean;
+};
+
+export type ShipmentDocumentRow = {
+  id: string;
+  shipmentId: string;
+  docType: ShipmentDocType;
+  documentId: string;
+  referenceNumber: string | null;
+  uploadedAt: string;
+  document?: { id: string; fileName: string; mimeType: string; sizeBytes: number };
 };
 
 export type ReorderSuggestion = {

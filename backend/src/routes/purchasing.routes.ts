@@ -2,7 +2,13 @@
  * Purchasing HTTP routes — suppliers, POs, receiving, reorder suggestions.
  * CASHIER has no access. STORE_ADMIN is store-scoped; COOP_ADMIN is network-wide.
  */
-import { PurchaseOrderStatus, Role } from "@prisma/client";
+import {
+  FpoLegalForm,
+  OrganicStatus,
+  PurchaseOrderStatus,
+  Role,
+  SupplierType,
+} from "@prisma/client";
 import { Router } from "express";
 import { z } from "zod";
 import { clientIp } from "../lib/audit.js";
@@ -22,6 +28,37 @@ const supplierSchema = z.object({
   leadTimeDays: z.number().int().nonnegative().optional(),
   isActive: z.boolean().optional(),
   notes: z.string().optional(),
+  supplierType: z.nativeEnum(SupplierType).optional(),
+  country: z.string().min(2).max(2).optional(),
+});
+
+const fpoProfileSchema = z.object({
+  supplierId: z.string().min(1),
+  legalForm: z.nativeEnum(FpoLegalForm).optional(),
+  registrationNumber: z.string().optional(),
+  state: z.string().optional(),
+  district: z.string().optional(),
+  block: z.string().nullable().optional(),
+  memberFarmerCount: z.number().int().nonnegative(),
+  memberFarmerCountAsOf: z.coerce.date().optional(),
+  womenFarmerCount: z.number().int().nonnegative().nullable().optional(),
+  primaryCrops: z.array(z.string()).optional(),
+  exportsViaSupplierId: z.string().nullable().optional(),
+  notes: z.string().optional(),
+  onboardedAt: z.coerce.date().optional(),
+});
+
+const sourcingOriginSchema = z.object({
+  fpoSupplierId: z.string().min(1).optional(),
+  state: z.string().min(1),
+  district: z.string().min(1),
+  village: z.string().nullable().optional(),
+  crop: z.string().min(1),
+  variety: z.string().nullable().optional(),
+  harvestSeason: z.string().nullable().optional(),
+  harvestDate: z.coerce.date().nullable().optional(),
+  contributingFarmerCount: z.number().int().nonnegative().nullable().optional(),
+  organicStatus: z.nativeEnum(OrganicStatus).optional(),
 });
 
 const supplierProductSchema = z.object({
@@ -38,7 +75,8 @@ const supplierProductSchema = z.object({
 const poLineSchema = z.object({
   productId: z.string().min(1),
   orderedQty: z.number().int().positive(),
-  unitCost: z.number().nonnegative(),
+  unitCost: z.number().nonnegative().optional(),
+  unitCostForeign: z.number().nonnegative().nullable().optional(),
 });
 
 const createPoSchema = z.object({
@@ -47,6 +85,8 @@ const createPoSchema = z.object({
   expectedDate: z.string().optional().nullable(),
   tax: z.number().nonnegative().optional(),
   shipping: z.number().nonnegative().optional(),
+  currency: z.string().length(3).optional(),
+  fxRateToUsd: z.number().positive().optional(),
   lines: z.array(poLineSchema).min(1),
 });
 
@@ -54,12 +94,16 @@ const updatePoSchema = z.object({
   expectedDate: z.string().optional().nullable(),
   tax: z.number().nonnegative().optional(),
   shipping: z.number().nonnegative().optional(),
+  currency: z.string().length(3).optional(),
+  fxRateToUsd: z.number().positive().optional(),
   lines: z.array(poLineSchema).min(1).optional(),
 });
 
 const receiveSchema = z.object({
   invoiceNumber: z.string().optional().nullable(),
   notes: z.string().optional().nullable(),
+  acknowledgeNoLandedCost: z.boolean().optional(),
+  acknowledgeComplianceGaps: z.boolean().optional(),
   lines: z
     .array(
       z.object({
@@ -73,6 +117,7 @@ const receiveSchema = z.object({
         expiryDate: z.coerce.date().optional().nullable(),
         harvestDate: z.coerce.date().optional().nullable(),
         countryOfOrigin: z.string().optional().nullable(),
+        origin: sourcingOriginSchema.optional().nullable(),
         acknowledgeOverReceipt: z.boolean().optional(),
         closeShort: z.boolean().optional(),
         acknowledgeShortReceipt: z.boolean().optional(),
@@ -158,6 +203,52 @@ purchasingRouter.post("/supplier-products", async (req, res) => {
     handleError(res, error);
   }
 });
+
+// ── FPO profiles + sourcing summary (COOP_ADMIN) ──
+
+purchasingRouter.get(
+  "/sourcing-summary",
+  requireRole(Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const summary = await purchasing.getSourcingSummary(req.user!);
+      res.status(200).json({ summary });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+purchasingRouter.get(
+  "/suppliers/:id/fpo-profile",
+  requireRole(Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const profile = await purchasing.getFpoProfile(req.user!, req.params.id!);
+      res.status(200).json({ profile });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
+
+purchasingRouter.put(
+  "/suppliers/:id/fpo-profile",
+  requireRole(Role.COOP_ADMIN),
+  async (req, res) => {
+    try {
+      const parsed = fpoProfileSchema.safeParse({ ...req.body, supplierId: req.params.id });
+      if (!parsed.success) {
+        res.status(400).json({ error: "Invalid FPO profile", details: parsed.error.flatten() });
+        return;
+      }
+      const profile = await purchasing.upsertFpoProfile(req.user!, parsed.data);
+      res.status(200).json({ profile });
+    } catch (error) {
+      handleError(res, error);
+    }
+  },
+);
 
 // ── Purchase orders ──
 

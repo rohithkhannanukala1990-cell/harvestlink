@@ -203,6 +203,8 @@ model Store {
   productBarcodes ProductBarcode[]
   /// CooperativeSettings rows that name this location as the main warehouse (0–1 in practice).
   mainWarehouseFor CooperativeSettings[] @relation("MainWarehouse")
+  /// Import shipments destined for this location (usually the main warehouse).
+  importShipmentsDestination ImportShipment[] @relation("ImportShipmentDestination")
 }
 
 /// An authenticated account for cashiers, store admins, or co-op admins.
@@ -270,6 +272,18 @@ model User {
   stockCountLinesRecounted StockCountLine[] @relation("StockCountLineRecountedBy")
   /// Catalog backfill disagreements this user marked resolved.
   catalogDisagreementsResolved CatalogDisagreement[] @relation("CatalogDisagreementResolvedBy")
+  /// Import shipments this user created.
+  importShipmentsCreated ImportShipment[] @relation("ImportShipmentCreatedBy")
+  /// Append-only import shipment timeline events this user recorded.
+  shipmentEventsCreated ShipmentEvent[] @relation("ShipmentEventCreatedBy")
+  /// Binary documents this user uploaded (PDFs / images).
+  documentsUploaded Document[] @relation("DocumentUploadedBy")
+  /// Supplier certifications this user verified.
+  certificationsVerified SupplierCertification[] @relation("CertificationVerifiedBy")
+  /// Shipment compliance documents this user attached.
+  shipmentDocumentsUploaded ShipmentDocument[] @relation("ShipmentDocumentUploadedBy")
+  /// Landed-cost variance rows this user recognised (true-up / restock reversal).
+  landedCostVariancesCreated LandedCostVariance[] @relation("LandedCostVarianceCreatedBy")
 
   @@index([storeId])
 }
@@ -283,6 +297,10 @@ enum CatalogDisagreementField {
 
 /// Open (or resolved) SKU identity mismatch across locations — survives multi-host deploys
 /// (unlike a local JSON file). One open row per sku+field; resolve records who accepted chosenValue.
+///
+/// Partial unique index `CatalogDisagreement_sku_field_open_key` (sku, field WHERE resolvedAt IS NULL)
+/// is created in raw SQL — Prisma 6 cannot express it. If a generated migration contains
+/// DROP INDEX for it, delete that line.
 model CatalogDisagreement {
   id               String                    @id @default(cuid())
   sku              String
@@ -437,12 +455,17 @@ model StockAdjustment {
   previousStock Int
   /// On-hand quantity after the adjustment was applied.
   newStock      Int
-  /// Signed delta applied (newStock - previousStock); negative means inventory removed.
+  /// Signed delta for the ledger line. For lot-level adjustments this is the LOT quantity
+  /// change (not the Product.stock rollup delta), so quarantined/recalled lot moves are visible.
   delta         Int
   /// Human-readable explanation required for audit (e.g. "cycle count", "damaged goods").
   reason        String
   /// Lot this adjustment applied to (RECEIPT creates a lot; null for pre-lot / non-lot adjustments).
   lotId         String?
+  /// Lot.quantityRemaining before the adjustment (null on pre-lot rows).
+  lotPreviousQty Int?
+  /// Lot.quantityRemaining after the adjustment (null on pre-lot rows).
+  lotNewQty      Int?
   /// When the adjustment was recorded.
   createdAt     DateTime @default(now())
 
@@ -468,8 +491,12 @@ model CooperativeSettings {
   fiscalYearEnd         String   @default("12-31")
   /// Legal name of the cooperative entity.
   legalEntityName       String   @default("Harvestlink Cooperative")
-  /// US state (or jurisdiction) of incorporation.
+  /// US state (or jurisdiction) of incorporation — where the co-op is REGISTERED.
   stateOfIncorporation  String   @default("")
+  /// US state code where the co-op OPERATES (may differ from stateOfIncorporation).
+  operatingState        String   @default("")
+  /// Street address of the principal operating office (where the co-op runs day-to-day).
+  principalOfficeAddress String  @default("")
   /// Days a closed shift's cash may sit undeposited before the store is prompted to bank it.
   /// Twice this is the escalation point. Age matters more than amount: cash outside the bank
   /// is at risk from robbery, fire or miscount, and every one of those gets worse with time.
@@ -1013,6 +1040,8 @@ model SaleItem {
   refundLines SaleRefundLine[]
   /// Lot allocations for this line (FEFO; one row per lot when a line spans lots).
   lotAllocations SaleItemLot[]
+  /// Per-lot restock rows from refunds that returned units for this line.
+  refundRestocks RefundRestockLot[]
 
   @@index([saleId])
   @@index([productId])
@@ -1079,9 +1108,31 @@ model SaleRefund {
   sale  Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
   lines SaleRefundLine[]
   writeOffs InventoryWriteOff[]
+  restockLots RefundRestockLot[]
 
   @@index([saleId])
   @@index([status])
+}
+
+/// Per-lot record of units returned to inventory on a restocking refund.
+/// restockToLots moves quantity; this table is the auditable trail of which lot got how many,
+/// at the SaleItemLot unitCostSnapshot being reversed (including QUARANTINED lots).
+model RefundRestockLot {
+  id               String   @id @default(cuid())
+  saleRefundId     String
+  saleItemId       String
+  lotId            String
+  quantity         Int
+  /// SaleItemLot.unitCostSnapshot for the units being returned.
+  unitCostSnapshot Decimal  @db.Decimal(14, 4)
+  createdAt        DateTime @default(now())
+
+  saleRefund SaleRefund @relation(fields: [saleRefundId], references: [id], onDelete: Cascade)
+  saleItem   SaleItem   @relation(fields: [saleItemId], references: [id])
+  lot        Lot        @relation(fields: [lotId], references: [id])
+
+  @@index([lotId])
+  @@index([saleRefundId])
 }
 
 /// Line-level allocation within a SaleRefund (supports partial item refunds).
@@ -1279,6 +1330,127 @@ enum PurchaseOrderStatus {
   CANCELLED
 }
 
+/// How the co-op classifies a vendor in the network catalog.
+enum SupplierType {
+  FPO
+  EXPORTER
+  DOMESTIC_DISTRIBUTOR
+  DOMESTIC_VENDOR
+  OTHER
+}
+
+/// Legal form of an Indian Farmer Producer Organisation (on FpoProfile).
+enum FpoLegalForm {
+  PRODUCER_COMPANY
+  COOPERATIVE_SOCIETY
+  OTHER
+}
+
+/// Organic claim at the cluster / SourcingOrigin level — never named-farmer PII.
+enum OrganicStatus {
+  CONVENTIONAL
+  IN_CONVERSION
+  CERTIFIED_ORGANIC
+}
+
+/// Lifecycle of an ocean/air import container from planning through landed-cost close.
+enum ImportShipmentStatus {
+  PLANNED
+  BOOKED
+  IN_TRANSIT
+  AT_PORT
+  CUSTOMS_HOLD
+  CLEARED
+  DELIVERED
+  RECEIVED
+  COSTED
+  CLOSED
+  CANCELLED
+}
+
+/// How goods move on an import shipment.
+enum ShipmentMode {
+  SEA_FCL
+  SEA_LCL
+  AIR
+}
+
+/// Incoterm governing risk/cost split with the overseas seller.
+enum Incoterm {
+  FOB
+  CIF
+  CFR
+  EXW
+  DAP
+}
+
+/// Landed-cost line kinds allocated onto an import shipment.
+enum ShipmentCostType {
+  OCEAN_FREIGHT
+  AIR_FREIGHT
+  INSURANCE
+  CUSTOMS_DUTY
+  BROKER_FEE
+  PORT_CHARGES
+  DRAYAGE
+  INLAND_FREIGHT
+  FDA_EXAM
+  STORAGE_DEMURRAGE
+  FX_DIFFERENCE
+  OTHER
+}
+
+/// How a ShipmentCost is spread across shipment lines / PO value.
+enum CostAllocationBasis {
+  VALUE
+  WEIGHT
+  VOLUME
+  QUANTITY
+  LINE_SPECIFIC
+}
+
+/// Whether a ShipmentCost row is a working estimate or a final invoice.
+enum ShipmentCostStatus {
+  ESTIMATED
+  FINAL
+}
+
+/// Why a LandedCostVariance row was recognised.
+enum LandedCostVarianceReason {
+  /// COGS already consumed, booked in the period of the shipment true-up.
+  TRUE_UP
+  /// Undo true-up COGS when units return to a lot that was trued-up after the sale.
+  RESTOCK_REVERSAL
+}
+
+/// Supplier food-import / organic / facility certification kinds.
+enum CertificationType {
+  FSSAI_LICENSE
+  APEDA_RCMC
+  FDA_FOOD_FACILITY_REGISTRATION
+  ORGANIC_NPOP
+  ORGANIC_USDA
+  FSVP_VERIFICATION
+  LAB_ACCREDITATION
+  OTHER
+}
+
+/// Paperwork kinds commonly required for US food imports (broker confirms per product).
+enum ShipmentDocType {
+  COMMERCIAL_INVOICE
+  PACKING_LIST
+  BILL_OF_LADING
+  AIR_WAYBILL
+  CERTIFICATE_OF_ORIGIN
+  PHYTOSANITARY_CERTIFICATE
+  FDA_PRIOR_NOTICE
+  CUSTOMS_ENTRY_SUMMARY
+  LAB_REPORT
+  FUMIGATION_CERTIFICATE
+  INSURANCE_CERTIFICATE
+  OTHER
+}
+
 /// Vendor that sells goods to the co-op / stores (network-wide; not store-scoped).
 model Supplier {
   /// Primary key uniquely identifying this supplier.
@@ -1301,6 +1473,10 @@ model Supplier {
   isActive      Boolean  @default(true)
   /// Free-form ops notes (dock hours, pallet requirements, etc.).
   notes         String   @default("")
+  /// FPO / exporter / domestic distributor / etc. Default is a US domestic vendor.
+  supplierType  SupplierType @default(DOMESTIC_VENDOR)
+  /// ISO country code for the supplier's domicile (default US).
+  country       String   @default("US")
   /// When this supplier record was created.
   createdAt     DateTime @default(now())
   /// When supplier fields were last updated.
@@ -1311,10 +1487,76 @@ model Supplier {
   /// Purchase orders placed with this supplier.
   purchaseOrders PurchaseOrder[]
   /// Inventory lots sourced from this supplier (null on Lot when unknown / legacy).
+  /// When an exporter invoices, Lot.supplierId is the invoicing exporter (who was paid).
   lots Lot[]
+  /// Present only when supplierType = FPO.
+  fpoProfile FpoProfile?
+  /// FPO profiles that name this supplier as their exporting intermediary.
+  exportsForFpos FpoProfile[] @relation("FpoExportsVia")
+  /// Receipt-line origins naming this supplier as the growing FPO.
+  sourcingOrigins SourcingOrigin[] @relation("SourcingOriginFpo")
+  /// Food-import / organic / FSVP certifications on file for this supplier.
+  certifications SupplierCertification[]
 
   @@index([isActive])
   @@index([name])
+  @@index([supplierType])
+}
+
+/// 1:1 profile for a Supplier of type FPO — cluster-level facts for flyers / website.
+model FpoProfile {
+  id                   String       @id @default(cuid())
+  supplierId           String       @unique
+  legalForm            FpoLegalForm @default(OTHER)
+  registrationNumber   String       @default("")
+  state                String       @default("")
+  district             String       @default("")
+  block                String?
+  /// Self-reported by the FPO. Never shown without its as-of date.
+  memberFarmerCount    Int          @default(0)
+  memberFarmerCountAsOf DateTime    @default(now())
+  womenFarmerCount     Int?
+  primaryCrops         String[]     @default([])
+  /// Exporter that invoices on the FPO's behalf, if any.
+  exportsViaSupplierId String?
+  onboardedAt          DateTime     @default(now())
+  notes                String       @default("")
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  supplier         Supplier  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  exportsVia       Supplier? @relation("FpoExportsVia", fields: [exportsViaSupplierId], references: [id])
+
+  @@index([exportsViaSupplierId])
+  @@index([state])
+}
+
+/// Where one receipt line's goods were grown — cluster level, never named farmers.
+/// When the invoice comes from an exporter, Lot.supplierId is the INVOICING supplier (who was paid)
+/// and SourcingOrigin.fpoSupplierId is the FPO (who grew it).
+model SourcingOrigin {
+  id                      String        @id @default(cuid())
+  goodsReceiptLineId      String        @unique
+  fpoSupplierId           String
+  state                   String
+  district                String
+  village                 String?
+  crop                    String
+  variety                 String?
+  /// e.g. "Rabi 2026" — optional alongside or instead of a precise harvestDate.
+  harvestSeason           String?
+  harvestDate             DateTime?
+  contributingFarmerCount Int?
+  organicStatus           OrganicStatus @default(CONVENTIONAL)
+  /// Deliberately aggregate. Named farmer records are personal data of people in India.
+  createdAt               DateTime      @default(now())
+
+  goodsReceiptLine GoodsReceiptLine @relation(fields: [goodsReceiptLineId], references: [id], onDelete: Cascade)
+  fpoSupplier      Supplier         @relation("SourcingOriginFpo", fields: [fpoSupplierId], references: [id])
+
+  @@index([fpoSupplierId])
+  @@index([state, district])
+  @@index([crop])
 }
 
 /// Links a Supplier to a store Product with pack/cost terms.
@@ -1370,13 +1612,23 @@ model PurchaseOrder {
   submittedAt     DateTime?
   /// User who created the draft.
   createdByUserId String
-  /// Sum of line totals (orderedQty × unitCost) before tax/shipping.
+  /// ISO 4217 currency of the supplier invoice. unitCost on lines is always USD.
+  currency        String              @default("USD") @db.Char(3)
+  /// Multiply foreign amounts by this to get USD. Always 1 when currency is USD.
+  fxRateToUsd     Decimal             @default(1) @db.Decimal(14, 6)
+  /// Amount paid to the supplier in USD (when recorded).
+  paidAmountUsd   Decimal?            @db.Decimal(12, 2)
+  /// When the supplier was paid.
+  paidAt          DateTime?
+  /// Wire / cheque / LC reference for the supplier payment.
+  paymentReference String?
+  /// Sum of line totals (orderedQty × unitCost) before tax/shipping — always USD.
   subtotal        Decimal             @default(0) @db.Decimal(12, 2)
   /// Tax on the PO (entered by buyer; not computed from store sales tax).
   tax             Decimal             @default(0) @db.Decimal(12, 2)
   /// Freight / shipping charged on the PO.
   shipping        Decimal             @default(0) @db.Decimal(12, 2)
-  /// subtotal + tax + shipping — amount expected on the supplier invoice.
+  /// subtotal + tax + shipping — amount expected on the supplier invoice (USD).
   total           Decimal             @default(0) @db.Decimal(12, 2)
   /// When the PO row was created.
   createdAt       DateTime            @default(now())
@@ -1388,6 +1640,8 @@ model PurchaseOrder {
   createdBy User                @relation("PurchaseOrderCreatedBy", fields: [createdByUserId], references: [id])
   lines     PurchaseOrderLine[]
   receipts  GoodsReceipt[]
+  /// Shipments this PO is loaded onto (at most one non-cancelled in practice).
+  shipmentLinks ImportShipmentPurchaseOrder[]
 
   @@index([supplierId])
   @@index([storeId])
@@ -1408,9 +1662,12 @@ model PurchaseOrderLine {
   orderedQty  Int
   /// Cumulative units accepted into stock across all goods receipts.
   receivedQty Int     @default(0)
-  /// Negotiated / expected unit cost at order time (snapshot). 4 dp.
+  /// Negotiated / expected unit cost in USD (= unitCostForeign × fxRateToUsd, 4 dp).
+  /// Always USD so every existing total and report stays unchanged.
   unitCost    Decimal @db.Decimal(14, 4)
-  /// orderedQty × unitCost at last recalculation (2 dp).
+  /// Unit cost in the PO currency when currency ≠ USD; null for USD POs.
+  unitCostForeign Decimal? @db.Decimal(14, 4)
+  /// orderedQty × unitCost at last recalculation (2 dp, USD).
   lineTotal   Decimal @db.Decimal(12, 2)
   /// When true, this line was closed short (short-receipt acknowledged).
   shortClosed Boolean @default(false)
@@ -1418,6 +1675,7 @@ model PurchaseOrderLine {
   po               PurchaseOrder      @relation(fields: [poId], references: [id], onDelete: Cascade)
   product          Product            @relation(fields: [productId], references: [id])
   goodsReceiptLines GoodsReceiptLine[]
+  shipmentLines    ImportShipmentLine[]
 
   @@index([poId])
   @@index([productId])
@@ -1467,6 +1725,12 @@ model GoodsReceiptLine {
   rejectionReason   String?
   /// Actual invoiced unit cost on this receipt (may differ from PO unitCost). 4 dp.
   unitCostActual    Decimal   @db.Decimal(14, 4)
+  /// Per-unit landed-cost add-on from the import shipment allocation (0 for domestic). 4 dp.
+  landedAddOnPerUnit Decimal  @default(0) @db.Decimal(14, 4)
+  /// qty × (unitCostActual + landedAddOnPerUnit) — Phase 4 inventory valuation.
+  receivedValue     Decimal   @default(0) @db.Decimal(12, 2)
+  /// Import shipment that funded the add-on; null for domestic receipts.
+  shipmentId        String?
   /// Supplier / dock lot number for the accepted units; null → auto-generated on receive.
   lotNumber         String?
   /// Sell-by / use-by date for the received lot (FEFO); null if unknown / N/A.
@@ -1479,14 +1743,346 @@ model GoodsReceiptLine {
   receipt GoodsReceipt      @relation(fields: [receiptId], references: [id], onDelete: Cascade)
   poLine  PurchaseOrderLine @relation(fields: [poLineId], references: [id])
   product Product           @relation(fields: [productId], references: [id])
+  shipment ImportShipment?  @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
   /// Lots created from this receipt line (one receipt line may seed one or more lots).
   lots    Lot[]
+  /// Cluster-level growing origin (required for FPO / EXPORTER POs).
+  sourcingOrigin SourcingOrigin?
 
   /// Backward: receipt → lines.
   @@index([receiptId])
   /// Backward: receipt line → PO line → purchase order.
   @@index([poLineId])
   @@index([productId])
+  @@index([shipmentId])
+}
+
+/// An ocean/air container bringing overseas POs into the co-op warehouse.
+model ImportShipment {
+  /// Primary key uniquely identifying this shipment.
+  id                   String               @id @default(cuid())
+  /// Human-readable number (e.g. IMP-2026-0001) — year + sequence.
+  shipmentNumber       String               @unique
+  /// Planning → booked → water → port → cleared → delivered → received → costed → closed.
+  status               ImportShipmentStatus @default(PLANNED)
+  /// Sea FCL/LCL or air.
+  mode                 ShipmentMode
+  /// Incoterm on the commercial invoice.
+  incoterm             Incoterm
+  /// Origin port / airport code (free text; e.g. INNSA, INMAA).
+  originPort           String               @default("")
+  /// Destination port code; default Port of Houston.
+  destinationPort      String               @default("USHOU")
+  /// Ocean / air carrier name.
+  carrier              String               @default("")
+  /// Vessel + voyage or flight identifier.
+  vesselVoyage         String               @default("")
+  /// Container number when known (FCL).
+  containerNumber      String?
+  /// Bill of lading / AWB number.
+  billOfLadingNumber   String?
+  /// Customs entry / ISF / ACE entry number when filed.
+  customsEntryNumber   String?
+  /// Estimated time of departure.
+  etd                  DateTime?
+  /// Estimated time of arrival.
+  eta                  DateTime?
+  /// Actual departure from origin.
+  actualDeparture      DateTime?
+  /// Actual arrival at destination port.
+  actualArrival        DateTime?
+  /// When customs cleared the entry.
+  clearedAt            DateTime?
+  /// When goods arrived at the destination warehouse/store.
+  deliveredAt          DateTime?
+  /// Where the container is delivered; defaults to CooperativeSettings.mainWarehouseId.
+  destinationStoreId   String
+  /// Required while status = CUSTOMS_HOLD — why CBP/FDA is holding the entry.
+  holdReason           String?
+  /// User who created the shipment.
+  createdByUserId      String
+  /// When this shipment row was created.
+  createdAt            DateTime             @default(now())
+  /// When status / logistics fields were last updated.
+  updatedAt            DateTime             @updatedAt
+
+  destinationStore Store                         @relation("ImportShipmentDestination", fields: [destinationStoreId], references: [id])
+  createdBy        User                          @relation("ImportShipmentCreatedBy", fields: [createdByUserId], references: [id])
+  purchaseOrders   ImportShipmentPurchaseOrder[]
+  lines            ImportShipmentLine[]
+  costs            ShipmentCost[]
+  events           ShipmentEvent[]
+  /// Goods receipt lines that applied this shipment's landed-cost allocation.
+  goodsReceiptLines GoodsReceiptLine[]
+  /// Compliance / customs paperwork attached to this shipment.
+  documents ShipmentDocument[]
+  /// True-up / restock-reversal COGS variances recognised against this shipment.
+  landedCostVariances LandedCostVariance[]
+
+  @@index([status])
+  @@index([destinationStoreId])
+  @@index([createdByUserId])
+  @@index([eta])
+  @@index([createdAt])
+}
+
+/// Join: one consolidated container may carry several FPOs' purchase orders.
+/// A PO may sit on at most one non-cancelled shipment (enforced in service).
+model ImportShipmentPurchaseOrder {
+  /// Primary key uniquely identifying this join row.
+  id         String   @id @default(cuid())
+  /// Shipment carrying this PO.
+  shipmentId String
+  /// Purchase order loaded onto the shipment.
+  poId       String
+  /// When the PO was attached.
+  createdAt  DateTime @default(now())
+
+  shipment ImportShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  po       PurchaseOrder  @relation(fields: [poId], references: [id], onDelete: Restrict)
+
+  @@unique([shipmentId, poId])
+  @@index([poId])
+  @@index([shipmentId])
+}
+
+/// Per PO line on a shipment — quantity loaded and customs valuation inputs.
+model ImportShipmentLine {
+  /// Primary key uniquely identifying this shipment line.
+  id               String   @id @default(cuid())
+  /// Parent shipment.
+  shipmentId       String
+  /// PO line being shipped.
+  poLineId         String
+  /// Units on this container (may be a partial PO line).
+  quantity         Int
+  /// Gross weight in kilograms for freight allocation.
+  grossWeightKg    Decimal? @db.Decimal(12, 3)
+  /// Volume in cubic metres for LCL allocation.
+  volumeCbm        Decimal? @db.Decimal(12, 4)
+  /// Harmonized Tariff Schedule code when known.
+  htsCode          String?
+  /// Duty rate percent from the entry (e.g. 6.5).
+  dutyRatePercent  Decimal? @db.Decimal(8, 4)
+  /// Customs value in USD; defaults to quantity × PO line unitCost.
+  customsValueUsd  Decimal  @db.Decimal(12, 2)
+  /// Duty amount from the customs entry when known (LINE_SPECIFIC duty allocation).
+  dutyAmountUsd    Decimal? @db.Decimal(12, 2)
+  /// When this line was created.
+  createdAt        DateTime @default(now())
+  /// When quantity / weight / duty fields were last updated.
+  updatedAt        DateTime @updatedAt
+
+  shipment ImportShipment   @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  poLine   PurchaseOrderLine @relation(fields: [poLineId], references: [id], onDelete: Restrict)
+
+  @@unique([shipmentId, poLineId])
+  @@index([shipmentId])
+  @@index([poLineId])
+}
+
+/// A freight / duty / fee cost on a shipment — estimates are superseded, never edited after receive.
+model ShipmentCost {
+  /// Primary key uniquely identifying this cost row.
+  id               String              @id @default(cuid())
+  /// Parent shipment.
+  shipmentId       String
+  /// Kind of landed cost.
+  costType         ShipmentCostType
+  /// Vendor that invoiced this cost (carrier, broker, warehouse…).
+  vendorName       String              @default("")
+  /// Vendor invoice number when known.
+  invoiceNumber    String?
+  /// ISO 4217 currency of amountForeign.
+  currency         String              @default("USD") @db.Char(3)
+  /// Amount in the vendor's currency.
+  amountForeign    Decimal             @db.Decimal(14, 4)
+  /// FX rate used to convert amountForeign → amountUsd.
+  fxRateToUsd      Decimal             @default(1) @db.Decimal(14, 6)
+  /// USD amount allocated / paid (2 dp).
+  amountUsd        Decimal             @db.Decimal(12, 2)
+  /// How this cost is spread across shipment lines.
+  allocationBasis  CostAllocationBasis @default(VALUE)
+  /// Working estimate vs final invoice.
+  status           ShipmentCostStatus  @default(ESTIMATED)
+  /// When status = FINAL, the ESTIMATED row this replaces (if any).
+  supersedesCostId String?             @unique
+  /// When this cost was paid.
+  paidAt           DateTime?
+  /// Amount paid in USD.
+  paidAmountUsd    Decimal?            @db.Decimal(12, 2)
+  /// Wire / cheque reference for this cost payment.
+  paymentReference String?
+  /// When this cost row was created.
+  createdAt        DateTime            @default(now())
+  /// When amount / status / payment fields were last updated.
+  updatedAt        DateTime            @updatedAt
+
+  shipment   ImportShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  supersedes ShipmentCost?  @relation("ShipmentCostSupersedes", fields: [supersedesCostId], references: [id], onDelete: SetNull)
+  supersededBy ShipmentCost? @relation("ShipmentCostSupersedes")
+
+  @@index([shipmentId])
+  @@index([costType])
+  @@index([status])
+}
+
+/// Append-only timeline for an import shipment (status, ETA, holds, notes).
+model ShipmentEvent {
+  /// Primary key uniquely identifying this event.
+  id          String   @id @default(cuid())
+  /// Parent shipment.
+  shipmentId  String
+  /// Short event kind code (STATUS_CHANGE, ETA_CHANGE, HOLD, NOTE, …).
+  eventType   String
+  /// Free-text detail / note.
+  message     String   @default("")
+  /// Optional structured payload (before/after status, ETA, etc.).
+  payload     Json?
+  /// User who recorded the event; null for system jobs.
+  createdByUserId String?
+  /// When the event occurred / was recorded.
+  createdAt   DateTime @default(now())
+
+  shipment  ImportShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  createdBy User?          @relation("ShipmentEventCreatedBy", fields: [createdByUserId], references: [id])
+
+  @@index([shipmentId, createdAt])
+  @@index([createdByUserId])
+}
+
+/// Binary file stored via lib/storage (local disk or S3). Never publicly served —
+/// downloads go through an authenticated route. Never deleted once attached to a
+/// received shipment.
+model Document {
+  /// Primary key uniquely identifying this document.
+  id               String   @id @default(cuid())
+  /// Opaque key in the storage backend (local path segment or S3 object key).
+  storageKey       String   @unique
+  /// Original filename as uploaded (for download Content-Disposition).
+  fileName         String
+  /// MIME type — only application/pdf, image/jpeg, image/png are accepted.
+  mimeType         String
+  /// Size in bytes (max 15 MB at upload).
+  sizeBytes        Int
+  /// SHA-256 hex digest of the file bytes.
+  sha256           String
+  /// User who uploaded the file.
+  uploadedByUserId String
+  /// When the file was stored.
+  createdAt        DateTime @default(now())
+
+  uploadedBy       User                     @relation("DocumentUploadedBy", fields: [uploadedByUserId], references: [id])
+  certifications   SupplierCertification[]
+  shipmentDocuments ShipmentDocument[]
+
+  @@index([uploadedByUserId])
+  @@index([sha256])
+  @@index([createdAt])
+}
+
+/// A verified certification on a supplier (FSVP, organic, facility registration, …).
+model SupplierCertification {
+  /// Primary key uniquely identifying this certification row.
+  id               String            @id @default(cuid())
+  /// Supplier this certification belongs to.
+  supplierId       String
+  /// Kind of certificate / verification.
+  certType         CertificationType
+  /// Number / registration id on the certificate.
+  certNumber       String            @default("")
+  /// When the certificate was issued.
+  issuedAt         DateTime
+  /// Expiration date when the cert has one; null if open-ended.
+  expiresAt        DateTime?
+  /// When the co-op should next review this verification (FSVP annual review, etc.).
+  nextReviewDue    DateTime?
+  /// Scanned certificate PDF/image, when filed.
+  documentId       String?
+  /// User who verified the certificate is on file / current.
+  verifiedByUserId String
+  /// When verification was recorded.
+  verifiedAt       DateTime          @default(now())
+  /// Free-form notes (scope, products covered, broker comments).
+  notes            String            @default("")
+  /// When this row was created.
+  createdAt        DateTime          @default(now())
+  /// When fields were last updated.
+  updatedAt        DateTime          @updatedAt
+
+  supplier   Supplier  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  verifiedBy User      @relation("CertificationVerifiedBy", fields: [verifiedByUserId], references: [id])
+
+  @@index([supplierId])
+  @@index([certType])
+  @@index([expiresAt])
+  @@index([nextReviewDue])
+  @@index([documentId])
+  @@index([verifiedByUserId])
+}
+
+/// COGS already consumed that must be recognised when landed add-on changes (true-up),
+/// or reversed when refund-restock returns units to a post-sale-trued-up lot.
+/// Never rewrite SaleItemLot.unitCostSnapshot — snapshots are frozen at sale time.
+model LandedCostVariance {
+  /// Primary key uniquely identifying this variance row.
+  id               String                   @id @default(cuid())
+  /// Shipment whose cost change drove this variance; null only if unknown on restock reversal.
+  shipmentId       String?
+  /// Lot whose consumed units are being revalued.
+  lotId            String
+  /// Change in landed add-on per unit (new − previously applied). 4 dp.
+  deltaPerUnit     Decimal                  @db.Decimal(14, 4)
+  /// Units affected. Negative for RESTOCK_REVERSAL.
+  units            Int
+  /// deltaPerUnit × units, rounded to 2 dp (can be negative).
+  amountUsd        Decimal                  @db.Decimal(12, 2)
+  /// When this COGS was recognised / reversed.
+  recognisedAt     DateTime                 @default(now())
+  /// User (or system actor) who booked the variance.
+  createdByUserId  String
+  /// TRUE_UP vs RESTOCK_REVERSAL.
+  reason           LandedCostVarianceReason
+  /// When this row was created.
+  createdAt        DateTime                 @default(now())
+
+  shipment  ImportShipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  lot       Lot             @relation(fields: [lotId], references: [id], onDelete: Restrict)
+  createdBy User            @relation("LandedCostVarianceCreatedBy", fields: [createdByUserId], references: [id])
+
+  @@index([shipmentId])
+  @@index([lotId])
+  @@index([recognisedAt])
+  @@index([createdByUserId])
+  @@index([reason])
+}
+
+/// Compliance / customs paperwork attached to an import shipment.
+model ShipmentDocument {
+  /// Primary key uniquely identifying this attachment.
+  id               String          @id @default(cuid())
+  /// Parent shipment.
+  shipmentId       String
+  /// Kind of paperwork.
+  docType          ShipmentDocType
+  /// Stored file.
+  documentId       String
+  /// Entry / BOL / notice number when known.
+  referenceNumber  String?
+  /// User who attached the document.
+  uploadedByUserId String
+  /// When the document was attached to the shipment.
+  uploadedAt       DateTime        @default(now())
+
+  shipment   ImportShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  document   Document       @relation(fields: [documentId], references: [id], onDelete: Restrict)
+  uploadedBy User           @relation("ShipmentDocumentUploadedBy", fields: [uploadedByUserId], references: [id])
+
+  @@index([shipmentId])
+  @@index([docType])
+  @@index([documentId])
+  @@index([uploadedByUserId])
 }
 
 /// A tracked inventory lot (batch) of a product at a store.
@@ -1527,7 +2123,10 @@ model Lot {
   /// Cost basis for THIS lot (per unit). 4 dp — multiply by qty then round to 2 dp for value.
   /// Lot-level cost is the foundation for accurate margin. Two lots of the same product bought at
   /// different prices have different costs; a single product-level cost averages away the truth.
+  /// For imports this is invoice unitCostActual + landedAddOnApplied.
   unitCost           Decimal   @db.Decimal(14, 4)
+  /// Landed-cost add-on per unit baked into unitCost (0 for domestic / opening stock). 4 dp.
+  landedAddOnApplied Decimal   @default(0) @db.Decimal(14, 4)
   /// Scannable lot label (supplier GS1-128 or a store-printed label), normalized like
   /// ProductBarcode.code. Scanning it goes straight to this lot — needed for lot-level counts.
   barcode            String?
@@ -1550,6 +2149,10 @@ model Lot {
   recallLots RecallLot[]
   /// Physical count lines taken at lot level.
   stockCountLines StockCountLine[]
+  /// Refund restock rows that returned units into this lot.
+  refundRestocks RefundRestockLot[]
+  /// Landed-cost variances recognised against consumed units of this lot.
+  landedCostVariances LandedCostVariance[]
 
   /// One lot number per product per store.
   @@unique([productId, lotNumber, storeId])

@@ -152,6 +152,7 @@ async function main() {
     taxRate: 8.25,
   });
 
+  const houstonWarehouseAddress = "1 Distribution Way, Houston, TX";
   let settings = await prisma.cooperativeSettings.findFirst({ orderBy: { createdAt: "asc" } });
   if (!settings) {
     settings = await prisma.cooperativeSettings.create({
@@ -160,19 +161,32 @@ async function main() {
         votingThresholdAmount: 1000,
         fiscalYearEnd: "12-31",
         legalEntityName: "HarvestLinx Cooperative",
+        // Registered in Ohio; operates from Houston.
         stateOfIncorporation: "OH",
+        operatingState: "TX",
+        principalOfficeAddress: houstonWarehouseAddress,
         mainWarehouseId: warehouse.id,
       },
     });
     console.log(`Created CooperativeSettings with mainWarehouseId=${warehouse.id}`);
-  } else if (!settings.mainWarehouseId) {
-    settings = await prisma.cooperativeSettings.update({
-      where: { id: settings.id },
-      data: { mainWarehouseId: warehouse.id },
-    });
-    console.log(`Set mainWarehouseId=${warehouse.id}`);
   } else {
-    console.log(`CooperativeSettings mainWarehouseId already set (${settings.mainWarehouseId})`);
+    const patch: {
+      mainWarehouseId?: string;
+      operatingState?: string;
+      principalOfficeAddress?: string;
+    } = {};
+    if (!settings.mainWarehouseId) patch.mainWarehouseId = warehouse.id;
+    if (!settings.operatingState) patch.operatingState = "TX";
+    if (!settings.principalOfficeAddress) patch.principalOfficeAddress = houstonWarehouseAddress;
+    if (Object.keys(patch).length > 0) {
+      settings = await prisma.cooperativeSettings.update({
+        where: { id: settings.id },
+        data: patch,
+      });
+      console.log(`Updated CooperativeSettings (${Object.keys(patch).join(", ")})`);
+    } else {
+      console.log(`CooperativeSettings mainWarehouseId already set (${settings.mainWarehouseId})`);
+    }
   }
 
   await upsertUser({

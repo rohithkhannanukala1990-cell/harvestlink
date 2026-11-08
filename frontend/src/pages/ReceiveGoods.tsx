@@ -1,18 +1,19 @@
 /**
  * Back-door receiving UI — large touch targets, barcode scan, quantity keypad.
  * Over/short receipts require explicit acknowledgement checkboxes before submit.
+ * Shipment POs: read-only landed add-on / landed cost from server; FPO/exporter origin;
+ * compliance warnings (terracotta) with acknowledgement.
  *
  * Scanning (keyboard-wedge, see scanner/useScanner):
  * - With focus on the lot number or lot label field, a scan fills that field.
- * - Anywhere else, a scan selects the PO line for the product (manufacturer barcode, our SKU, or the
- *   GTIN inside a GS1-128 case label). A GS1 label also fills lot number and expiry when they are
- *   still empty on that line.
+ * - Anywhere else, a scan selects the PO line for the product.
  */
 import { useCallback, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client";
-import type { PurchaseOrder, PurchaseOrderLine } from "../api/types";
+import type { OrganicStatus, PurchaseOrder, PurchaseOrderLine } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
 import { normalizeBarcode, parseGs1 } from "../scanner/barcode";
 import { lookupBarcode } from "../scanner/lookup";
 import { useScanner } from "../scanner/useScanner";
@@ -22,6 +23,7 @@ import {
   Field,
   Keypad,
   PageHeader,
+  SelectField,
   StatusBadge,
   UnitCost,
 } from "../components/ui";
@@ -34,6 +36,18 @@ function focusedScanTarget(): ScanTarget | null {
   const target = el.dataset.scanTarget;
   return target === "lotNumber" || target === "lotBarcode" ? target : null;
 }
+
+type OriginDraft = {
+  state: string;
+  district: string;
+  village: string;
+  crop: string;
+  variety: string;
+  harvestSeason: string;
+  contributingFarmerCount: string;
+  organicStatus: OrganicStatus;
+  fpoSupplierId: string;
+};
 
 type LineDraft = {
   poLineId: string;
@@ -48,18 +62,44 @@ type LineDraft = {
   acknowledgeOverReceipt: boolean;
   closeShort: boolean;
   acknowledgeShortReceipt: boolean;
+  origin: OriginDraft;
 };
+
+const emptyOrigin = (): OriginDraft => ({
+  state: "",
+  district: "",
+  village: "",
+  crop: "",
+  variety: "",
+  harvestSeason: "",
+  contributingFarmerCount: "",
+  organicStatus: "CONVENTIONAL",
+  fpoSupplierId: "",
+});
+
+function landedUnit(
+  invoice: string,
+  addOn: string | undefined,
+): string | null {
+  const inv = Number(invoice);
+  const add = addOn != null ? Number(addOn) : 0;
+  if (!Number.isFinite(inv)) return null;
+  return (inv + (Number.isFinite(add) ? add : 0)).toFixed(4);
+}
 
 export function ReceiveGoodsPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const { isRole } = useAuth();
   const [skuInput, setSkuInput] = useState("");
   const [activeLineId, setActiveLineId] = useState<string | null>(null);
   const [invoiceNumber, setInvoiceNumber] = useState("");
   const [notes, setNotes] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, LineDraft>>({});
+  const [acknowledgeComplianceGaps, setAcknowledgeComplianceGaps] = useState(false);
+  const [acknowledgeNoLandedCost, setAcknowledgeNoLandedCost] = useState(false);
 
   const poQuery = useQuery({
     queryKey: ["purchase-order", id],
@@ -84,6 +124,7 @@ export function ReceiveGoodsPage() {
           acknowledgeOverReceipt: false,
           closeShort: false,
           acknowledgeShortReceipt: false,
+          origin: emptyOrigin(),
         };
       }
       setDrafts(map);
@@ -94,6 +135,14 @@ export function ReceiveGoodsPage() {
   });
 
   const po = poQuery.data?.purchaseOrder;
+  const supplierType = po?.supplier?.supplierType;
+  const needsOrigin = supplierType === "FPO" || supplierType === "EXPORTER";
+  const isExporter = supplierType === "EXPORTER";
+  const shipment = po?.importShipment ?? null;
+  const landedByLine = po?.landedPreviewByPoLineId ?? {};
+  const complianceGaps = po?.complianceGaps ?? [];
+  const requiresLandedCostAck = Boolean(po?.requiresLandedCostAck);
+
   const openLines = useMemo(
     () =>
       (po?.lines ?? []).filter(
@@ -130,7 +179,6 @@ export function ReceiveGoodsPage() {
     setDrafts((prev) => (prev[lineId] ? { ...prev, [lineId]: { ...prev[lineId], ...patch } } : prev));
   }, []);
 
-  /** Select the open PO line for a scanned or typed product code; fill lot details from GS1. */
   const selectByCode = useCallback(
     async (raw: string) => {
       if (!po || !raw.trim()) return;
@@ -210,24 +258,56 @@ export function ReceiveGoodsPage() {
             Number(d.quantityRejected) > 0 ||
             d.closeShort,
         )
-        .map((d) => ({
-          poLineId: d.poLineId,
-          quantityReceived: Number(d.quantityReceived) || 0,
-          quantityRejected: Number(d.quantityRejected) || 0,
-          rejectionReason: d.rejectionReason || undefined,
-          unitCostActual: Number(d.unitCostActual),
-          lotNumber: d.lotNumber.trim() || undefined,
-          lotBarcode: d.lotBarcode.trim() || undefined,
-          expiryDate: d.expiryDate || undefined,
-          countryOfOrigin: d.countryOfOrigin.trim() || undefined,
-          acknowledgeOverReceipt: d.acknowledgeOverReceipt || undefined,
-          closeShort: d.closeShort || undefined,
-          acknowledgeShortReceipt: d.acknowledgeShortReceipt || undefined,
-        }));
+        .map((d) => {
+          const originPayload =
+            needsOrigin &&
+            (Number(d.quantityReceived) > 0 || Number(d.quantityRejected) > 0)
+              ? {
+                  state: d.origin.state.trim(),
+                  district: d.origin.district.trim(),
+                  village: d.origin.village.trim() || undefined,
+                  crop: d.origin.crop.trim(),
+                  variety: d.origin.variety.trim() || undefined,
+                  harvestSeason: d.origin.harvestSeason.trim() || undefined,
+                  contributingFarmerCount: d.origin.contributingFarmerCount
+                    ? Number(d.origin.contributingFarmerCount)
+                    : undefined,
+                  organicStatus: d.origin.organicStatus,
+                  ...(isExporter && d.origin.fpoSupplierId
+                    ? { fpoSupplierId: d.origin.fpoSupplierId }
+                    : {}),
+                }
+              : undefined;
+          return {
+            poLineId: d.poLineId,
+            quantityReceived: Number(d.quantityReceived) || 0,
+            quantityRejected: Number(d.quantityRejected) || 0,
+            rejectionReason: d.rejectionReason || undefined,
+            unitCostActual: Number(d.unitCostActual),
+            lotNumber: d.lotNumber.trim() || undefined,
+            lotBarcode: d.lotBarcode.trim() || undefined,
+            expiryDate: d.expiryDate || undefined,
+            countryOfOrigin: d.countryOfOrigin.trim() || undefined,
+            acknowledgeOverReceipt: d.acknowledgeOverReceipt || undefined,
+            closeShort: d.closeShort || undefined,
+            acknowledgeShortReceipt: d.acknowledgeShortReceipt || undefined,
+            origin: originPayload,
+          };
+        });
       if (!lines.length) throw new ApiError(400, "Enter quantities on at least one line");
       return apiRequest(`/purchasing/purchase-orders/${id}/receive`, {
         method: "POST",
-        body: { invoiceNumber: invoiceNumber || null, notes: notes || null, lines },
+        body: {
+          invoiceNumber: invoiceNumber || null,
+          notes: notes || null,
+          lines,
+          ...(isRole("COOP_ADMIN") && acknowledgeComplianceGaps
+            ? { acknowledgeComplianceGaps: true }
+            : {}),
+          ...(isRole("COOP_ADMIN") && acknowledgeNoLandedCost
+            ? { acknowledgeNoLandedCost: true }
+            : {}),
+        },
       });
     },
     onSuccess: () => {
@@ -237,12 +317,33 @@ export function ReceiveGoodsPage() {
       setMessage("Receipt recorded");
       navigate(`/purchase-orders/${id}`);
     },
-    onError: (err) => setMessage(err instanceof ApiError ? err.message : "Receive failed"),
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 409 && err.details) {
+        const gaps = (err.details as { gaps?: Array<{ message: string }> }).gaps;
+        if (gaps?.length) {
+          setMessage(
+            `Compliance gaps: ${gaps.map((g) => g.message).join("; ")}. COOP_ADMIN may acknowledge to proceed.`,
+          );
+          return;
+        }
+      }
+      setMessage(err instanceof ApiError ? err.message : "Receive failed");
+    },
   });
 
   if (!po) {
     return <p className="text-ink-muted">Loading PO…</p>;
   }
+
+  const activeAddOn = activeLine
+    ? landedByLine[activeLine.id]?.landedAddOnPerUnit
+    : undefined;
+  const activeLanded =
+    activeDraft && activeAddOn != null
+      ? landedUnit(activeDraft.unitCostActual, activeAddOn)
+      : activeDraft && shipment
+        ? landedUnit(activeDraft.unitCostActual, "0")
+        : null;
 
   return (
     <div className="mx-auto max-w-lg space-y-4 pb-8">
@@ -263,8 +364,59 @@ export function ReceiveGoodsPage() {
           </>
         }
       />
+      {shipment && (
+        <p className="rounded-lg border border-brand-terracotta/30 bg-brand-terracotta/10 px-3 py-2 text-sm text-brand-terracotta-ink">
+          Import shipment{" "}
+          <Link
+            to={`/shipments/${shipment.id}`}
+            className="font-semibold underline"
+          >
+            {shipment.shipmentNumber}
+          </Link>
+          {" · "}
+          {shipment.status.replace(/_/g, " ")}
+          {shipment.containerNumber ? ` · ${shipment.containerNumber}` : ""}
+        </p>
+      )}
+      {complianceGaps.length > 0 && (
+        <div
+          className="rounded-lg border border-brand-terracotta/40 bg-brand-terracotta/10 px-3 py-2 text-sm text-brand-terracotta-ink"
+          role="status"
+        >
+          <p className="font-semibold">Compliance warnings</p>
+          <ul className="mt-1 list-disc space-y-1 pl-5">
+            {complianceGaps.map((g) => (
+              <li key={g.code}>{g.message}</li>
+            ))}
+          </ul>
+          {isRole("COOP_ADMIN") && (
+            <label className="mt-3 flex items-start gap-3">
+              <input
+                type="checkbox"
+                className="mt-1 h-5 w-5"
+                checked={acknowledgeComplianceGaps}
+                onChange={(e) => setAcknowledgeComplianceGaps(e.target.checked)}
+              />
+              <span>I acknowledge these compliance gaps and will receive anyway.</span>
+            </label>
+          )}
+        </div>
+      )}
+      {requiresLandedCostAck && isRole("COOP_ADMIN") && (
+        <label className="flex items-start gap-3 rounded-lg border border-brand-terracotta/40 bg-brand-terracotta/10 p-3 text-sm text-brand-terracotta-ink">
+          <input
+            type="checkbox"
+            className="mt-1 h-5 w-5"
+            checked={acknowledgeNoLandedCost}
+            onChange={(e) => setAcknowledgeNoLandedCost(e.target.checked)}
+          />
+          <span>
+            This shipment has no landed costs yet. Acknowledge receiving with $0 add-on.
+          </span>
+        </label>
+      )}
       {message && (
-        <p className="rounded-lg bg-state-warning/15 px-3 py-2 text-sm text-state-warning">
+        <p className="rounded-lg bg-brand-terracotta/15 px-3 py-2 text-sm text-brand-terracotta-ink">
           {message}
         </p>
       )}
@@ -297,6 +449,7 @@ export function ReceiveGoodsPage() {
         {openLines.map((line) => {
           const selected = line.id === (activeLine?.id ?? "");
           const draft = drafts[line.id];
+          const addOn = landedByLine[line.id]?.landedAddOnPerUnit;
           return (
             <button
               key={line.id}
@@ -314,8 +467,20 @@ export function ReceiveGoodsPage() {
               <div className="text-sm text-ink-muted">
                 {line.product?.sku} · need{" "}
                 <span className="tabular">{remaining(line)}</span> of{" "}
-                <span className="tabular">{line.orderedQty}</span> · PO{" "}
-                <UnitCost value={line.unitCost} />
+                <span className="tabular">{line.orderedQty}</span> · invoice{" "}
+                <UnitCost value={draft?.unitCostActual ?? line.unitCost} />
+                {addOn != null && (
+                  <>
+                    {" "}
+                    · add-on <UnitCost value={addOn} /> · landed{" "}
+                    <UnitCost
+                      value={
+                        landedUnit(draft?.unitCostActual ?? String(line.unitCost), addOn) ??
+                        addOn
+                      }
+                    />
+                  </>
+                )}
               </div>
               {draft?.quantityReceived && (
                 <div className="mt-1 text-base font-medium text-ink">
@@ -357,13 +522,7 @@ export function ReceiveGoodsPage() {
                 size="lg"
                 value={activeDraft.lotNumber}
                 onChange={(e) =>
-                  setDrafts((prev) => ({
-                    ...prev,
-                    [activeLine.id]: {
-                      ...prev[activeLine.id]!,
-                      lotNumber: e.target.value,
-                    },
-                  }))
+                  patchDraft(activeLine.id, { lotNumber: e.target.value })
                 }
                 placeholder="Scan or type lot #"
                 autoComplete="off"
@@ -387,13 +546,7 @@ export function ReceiveGoodsPage() {
                 size="lg"
                 value={activeDraft.expiryDate}
                 onChange={(e) =>
-                  setDrafts((prev) => ({
-                    ...prev,
-                    [activeLine.id]: {
-                      ...prev[activeLine.id]!,
-                      expiryDate: e.target.value,
-                    },
-                  }))
+                  patchDraft(activeLine.id, { expiryDate: e.target.value })
                 }
               />
               <Field
@@ -401,13 +554,7 @@ export function ReceiveGoodsPage() {
                 size="lg"
                 value={activeDraft.countryOfOrigin}
                 onChange={(e) =>
-                  setDrafts((prev) => ({
-                    ...prev,
-                    [activeLine.id]: {
-                      ...prev[activeLine.id]!,
-                      countryOfOrigin: e.target.value,
-                    },
-                  }))
+                  patchDraft(activeLine.id, { countryOfOrigin: e.target.value })
                 }
                 placeholder="e.g. US"
                 maxLength={3}
@@ -415,32 +562,150 @@ export function ReceiveGoodsPage() {
             </div>
 
             <Field
-              label="Actual unit cost (invoice)"
+              label="Invoice unit cost"
               size="lg"
               value={activeDraft.unitCostActual}
               onChange={(e) =>
-                setDrafts((prev) => ({
-                  ...prev,
-                  [activeLine.id]: {
-                    ...prev[activeLine.id]!,
-                    unitCostActual: e.target.value,
-                  },
-                }))
+                patchDraft(activeLine.id, { unitCostActual: e.target.value })
               }
             />
+            {shipment && (
+              <div className="grid grid-cols-2 gap-3 rounded-lg border border-border-hairline bg-surface-sunken p-3 text-sm">
+                <div>
+                  <p className="font-semibold text-ink-muted">Landed add-on</p>
+                  <p className="tabular text-lg text-ink">
+                    <UnitCost value={activeAddOn ?? "0"} />
+                  </p>
+                  <p className="text-xs text-ink-muted">From shipment allocation</p>
+                </div>
+                <div>
+                  <p className="font-semibold text-ink-muted">Landed unit cost</p>
+                  <p className="tabular text-lg text-ink">
+                    <UnitCost value={activeLanded ?? activeDraft.unitCostActual} />
+                  </p>
+                  <p className="text-xs text-ink-muted">Invoice + add-on</p>
+                </div>
+              </div>
+            )}
+
+            {needsOrigin && (
+              <div className="space-y-3 rounded-lg border border-brand-terracotta/30 bg-brand-terracotta/5 p-3">
+                <p className="text-sm font-semibold text-brand-terracotta-ink">
+                  Sourcing origin (required for {supplierType})
+                </p>
+                {isExporter && (
+                  <Field
+                    label="FPO supplier id"
+                    size="lg"
+                    value={activeDraft.origin.fpoSupplierId}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: {
+                          ...activeDraft.origin,
+                          fpoSupplierId: e.target.value,
+                        },
+                      })
+                    }
+                    placeholder="Growing FPO supplier id"
+                  />
+                )}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field
+                    label="State"
+                    size="lg"
+                    value={activeDraft.origin.state}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: { ...activeDraft.origin, state: e.target.value },
+                      })
+                    }
+                    required
+                  />
+                  <Field
+                    label="District"
+                    size="lg"
+                    value={activeDraft.origin.district}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: { ...activeDraft.origin, district: e.target.value },
+                      })
+                    }
+                    required
+                  />
+                  <Field
+                    label="Village"
+                    size="lg"
+                    value={activeDraft.origin.village}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: { ...activeDraft.origin, village: e.target.value },
+                      })
+                    }
+                  />
+                  <Field
+                    label="Crop"
+                    size="lg"
+                    value={activeDraft.origin.crop}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: { ...activeDraft.origin, crop: e.target.value },
+                      })
+                    }
+                    required
+                  />
+                  <Field
+                    label="Season"
+                    size="lg"
+                    value={activeDraft.origin.harvestSeason}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: {
+                          ...activeDraft.origin,
+                          harvestSeason: e.target.value,
+                        },
+                      })
+                    }
+                    placeholder="e.g. Rabi 2026"
+                  />
+                  <Field
+                    label="Farmer count"
+                    size="lg"
+                    value={activeDraft.origin.contributingFarmerCount}
+                    onChange={(e) =>
+                      patchDraft(activeLine.id, {
+                        origin: {
+                          ...activeDraft.origin,
+                          contributingFarmerCount: e.target.value,
+                        },
+                      })
+                    }
+                  />
+                </div>
+                <SelectField
+                  label="Organic status"
+                  value={activeDraft.origin.organicStatus}
+                  onChange={(e) =>
+                    patchDraft(activeLine.id, {
+                      origin: {
+                        ...activeDraft.origin,
+                        organicStatus: e.target.value as OrganicStatus,
+                      },
+                    })
+                  }
+                >
+                  <option value="CONVENTIONAL">Conventional</option>
+                  <option value="IN_CONVERSION">In conversion</option>
+                  <option value="CERTIFIED_ORGANIC">Certified organic</option>
+                </SelectField>
+              </div>
+            )}
 
             <Field
               label="Rejected qty"
               size="lg"
               value={activeDraft.quantityRejected}
               onChange={(e) =>
-                setDrafts((prev) => ({
-                  ...prev,
-                  [activeLine.id]: {
-                    ...prev[activeLine.id]!,
-                    quantityRejected: e.target.value,
-                  },
-                }))
+                patchDraft(activeLine.id, { quantityRejected: e.target.value })
               }
             />
             {Number(activeDraft.quantityRejected) > 0 && (
@@ -449,32 +714,22 @@ export function ReceiveGoodsPage() {
                 size="lg"
                 value={activeDraft.rejectionReason}
                 onChange={(e) =>
-                  setDrafts((prev) => ({
-                    ...prev,
-                    [activeLine.id]: {
-                      ...prev[activeLine.id]!,
-                      rejectionReason: e.target.value,
-                    },
-                  }))
+                  patchDraft(activeLine.id, { rejectionReason: e.target.value })
                 }
                 placeholder="Required when rejecting"
               />
             )}
 
             {Number(activeDraft.quantityReceived) > remaining(activeLine) && (
-              <label className="flex items-start gap-3 rounded-lg bg-state-warning/15 p-3 text-sm text-ink">
+              <label className="flex items-start gap-3 rounded-lg bg-brand-terracotta/15 p-3 text-sm text-ink">
                 <input
                   type="checkbox"
                   className="mt-1 h-5 w-5"
                   checked={activeDraft.acknowledgeOverReceipt}
                   onChange={(e) =>
-                    setDrafts((prev) => ({
-                      ...prev,
-                      [activeLine.id]: {
-                        ...prev[activeLine.id]!,
-                        acknowledgeOverReceipt: e.target.checked,
-                      },
-                    }))
+                    patchDraft(activeLine.id, {
+                      acknowledgeOverReceipt: e.target.checked,
+                    })
                   }
                 />
                 <span>
@@ -489,34 +744,26 @@ export function ReceiveGoodsPage() {
                 className="mt-1 h-5 w-5"
                 checked={activeDraft.closeShort}
                 onChange={(e) =>
-                  setDrafts((prev) => ({
-                    ...prev,
-                    [activeLine.id]: {
-                      ...prev[activeLine.id]!,
-                      closeShort: e.target.checked,
-                      acknowledgeShortReceipt: e.target.checked
-                        ? prev[activeLine.id]!.acknowledgeShortReceipt
-                        : false,
-                    },
-                  }))
+                  patchDraft(activeLine.id, {
+                    closeShort: e.target.checked,
+                    acknowledgeShortReceipt: e.target.checked
+                      ? activeDraft.acknowledgeShortReceipt
+                      : false,
+                  })
                 }
               />
               <span>Close this line short (supplier will not ship the rest)</span>
             </label>
             {activeDraft.closeShort && (
-              <label className="flex items-start gap-3 rounded-lg bg-state-warning/15 p-3 text-sm text-ink">
+              <label className="flex items-start gap-3 rounded-lg bg-brand-terracotta/15 p-3 text-sm text-ink">
                 <input
                   type="checkbox"
                   className="mt-1 h-5 w-5"
                   checked={activeDraft.acknowledgeShortReceipt}
                   onChange={(e) =>
-                    setDrafts((prev) => ({
-                      ...prev,
-                      [activeLine.id]: {
-                        ...prev[activeLine.id]!,
-                        acknowledgeShortReceipt: e.target.checked,
-                      },
-                    }))
+                    patchDraft(activeLine.id, {
+                      acknowledgeShortReceipt: e.target.checked,
+                    })
                   }
                 />
                 <span>

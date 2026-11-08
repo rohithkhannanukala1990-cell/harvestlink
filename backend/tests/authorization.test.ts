@@ -52,6 +52,13 @@ describe("authorization", () => {
       { method: "get", path: "/purchasing/purchase-orders" },
       { method: "post", path: "/purchasing/purchase-orders" },
       { method: "get", path: "/purchasing/reorder-suggestions" },
+      { method: "get", path: "/shipments" },
+      { method: "get", path: "/shipments/fake-shipment-id" },
+      { method: "post", path: "/shipments" },
+      { method: "post", path: "/shipments/fake-shipment-id/costs" },
+      { method: "get", path: "/compliance/documents/fake-doc-id" },
+      { method: "get", path: "/compliance/documents/fake-doc-id/download" },
+      { method: "get", path: "/compliance/shipments/fake-shipment-id/documents" },
     ];
 
     for (const check of checks) {

@@ -84,6 +84,11 @@ export function AppLayout() {
                 Recalls
               </NavLink>
             )}
+            {isRole("COOP_ADMIN") && (
+              <NavLink to="/shipments" className={linkClass}>
+                Shipments
+              </NavLink>
+            )}
             <NavLink to="/" end className={linkClass}>
               Dashboard
             </NavLink>

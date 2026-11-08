@@ -104,6 +104,8 @@ export async function getCooperativeSettings(
       fiscalYearEnd: "12-31",
       legalEntityName: "Harvestlink Cooperative",
       stateOfIncorporation: "",
+      operatingState: "",
+      principalOfficeAddress: "",
     },
   });
 }
@@ -115,6 +117,8 @@ export async function updateCooperativeSettings(
     fiscalYearEnd: string;
     legalEntityName: string;
     stateOfIncorporation: string;
+    operatingState: string;
+    principalOfficeAddress: string;
     cashDepositGraceDays: number;
     varianceThresholdPercent: number;
     varianceThresholdValue: number;
@@ -175,6 +179,12 @@ export async function updateCooperativeSettings(
         : {}),
       ...(input.stateOfIncorporation !== undefined
         ? { stateOfIncorporation: input.stateOfIncorporation.trim() }
+        : {}),
+      ...(input.operatingState !== undefined
+        ? { operatingState: input.operatingState.trim().toUpperCase() }
+        : {}),
+      ...(input.principalOfficeAddress !== undefined
+        ? { principalOfficeAddress: input.principalOfficeAddress.trim() }
         : {}),
       ...(input.cashDepositGraceDays !== undefined
         ? { cashDepositGraceDays: input.cashDepositGraceDays }

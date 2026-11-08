@@ -4,20 +4,19 @@
  * APIs:
  * - GET /stores/:id — load store (CASHIER/STORE_ADMIN/COOP_ADMIN for accessible stores)
  * - PATCH /stores/:id — update name/address (STORE_ADMIN, COOP_ADMIN)
+ * - GET/PATCH /members/cooperative-settings — registered vs operating location (COOP_ADMIN write)
  *
  * operatorPercent is editable only for COOP_ADMIN.
  * Why: changing operatorPercent must NOT rewrite past sales. Each Sale stores a snapshot
  * of operatorPercent / operatorAmount at checkout (Phases 1 & 4). Edits here only affect
  * FUTURE sales. Store admins can rename the store but cannot alter the commission rate.
  *
- * Cooperative settings (voting threshold, discount bearer) are grouped separately from
- * store-local fields. Voting threshold lives in CooperativeSettings on the server; discount
- * bearer is returned on the store record for display. No new save endpoints added here.
+ * Sales tax stays per location (Store.taxRate) — not on CooperativeSettings.
  */
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, apiRequest } from "../api/client.ts";
-import type { Store } from "../api/types.ts";
+import type { CooperativeSettings, Store } from "../api/types.ts";
 import { useAuth } from "../auth/AuthContext.tsx";
 import {
   Button,
@@ -26,6 +25,99 @@ import {
   PageHeader,
   StatusBadge,
 } from "../components/ui";
+
+function CooperativeLocationCard({ canEdit }: { canEdit: boolean }) {
+  const qc = useQueryClient();
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [stateOfIncorporation, setStateOfIncorporation] = useState("");
+  const [operatingState, setOperatingState] = useState("");
+  const [principalOfficeAddress, setPrincipalOfficeAddress] = useState("");
+
+  const settingsQuery = useQuery({
+    queryKey: ["cooperative-settings"],
+    queryFn: () =>
+      apiRequest<{ settings: CooperativeSettings }>("/members/cooperative-settings"),
+  });
+
+  useEffect(() => {
+    const s = settingsQuery.data?.settings;
+    if (!s) return;
+    setStateOfIncorporation(s.stateOfIncorporation ?? "");
+    setOperatingState(s.operatingState ?? "");
+    setPrincipalOfficeAddress(s.principalOfficeAddress ?? "");
+  }, [settingsQuery.data?.settings]);
+
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      apiRequest<{ settings: CooperativeSettings }>("/members/cooperative-settings", {
+        method: "PATCH",
+        body: {
+          stateOfIncorporation,
+          operatingState,
+          principalOfficeAddress,
+        },
+      }),
+    onSuccess: () => {
+      setMessage("Cooperative location saved.");
+      setError(null);
+      void qc.invalidateQueries({ queryKey: ["cooperative-settings"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : "Save failed"),
+  });
+
+  return (
+    <Card title="Registered in / Operates from">
+      <p className="mb-4 text-sm text-ink-muted">
+        HarvestLinx Cooperative is registered in one state and may operate from another. Sales tax
+        stays on each store&apos;s tax rate — not here.
+      </p>
+      {settingsQuery.isLoading && <p className="text-sm text-ink-muted">Loading…</p>}
+      {settingsQuery.data?.settings && (
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (canEdit) saveMutation.mutate();
+          }}
+        >
+          <Field
+            label="Registered in (state of incorporation)"
+            value={stateOfIncorporation}
+            onChange={(e) => setStateOfIncorporation(e.target.value)}
+            disabled={!canEdit}
+            required
+          />
+          <Field
+            label="Operates from (state)"
+            value={operatingState}
+            onChange={(e) => setOperatingState(e.target.value)}
+            disabled={!canEdit}
+            required
+          />
+          <Field
+            label="Principal office address"
+            value={principalOfficeAddress}
+            onChange={(e) => setPrincipalOfficeAddress(e.target.value)}
+            disabled={!canEdit}
+            required
+          />
+          {canEdit && (
+            <Button type="submit" loading={saveMutation.isPending}>
+              Save location
+            </Button>
+          )}
+          {message && <p className="text-sm text-state-success">{message}</p>}
+          {error && (
+            <p className="text-sm text-state-danger" role="alert">
+              {error}
+            </p>
+          )}
+        </form>
+      )}
+    </Card>
+  );
+}
 
 function StoreSettingsForm({ store }: { store: Store }) {
   const { activeStoreId, isRole } = useAuth();
@@ -117,6 +209,8 @@ function StoreSettingsForm({ store }: { store: Store }) {
           )}
         </form>
       </Card>
+
+      <CooperativeLocationCard canEdit={isCoop} />
 
       <Card
         title={

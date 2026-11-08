@@ -133,25 +133,29 @@ export async function getCatalogDisagreements(
 export async function upsertOpenCatalogDisagreement(
   input: UpsertCatalogDisagreementInput,
 ): Promise<CatalogDisagreementRow> {
-  const existing = await prisma.catalogDisagreement.findFirst({
-    where: { sku: input.sku, field: input.field, resolvedAt: null },
-  });
-  if (existing) {
-    return prisma.catalogDisagreement.update({
-      where: { id: existing.id },
+  // Find-then-update/create in one transaction — does not rely on the partial unique index
+  // CatalogDisagreement_sku_field_open_key (raw SQL; Prisma cannot express it).
+  return prisma.$transaction(async (tx) => {
+    const existing = await tx.catalogDisagreement.findFirst({
+      where: { sku: input.sku, field: input.field, resolvedAt: null },
+    });
+    if (existing) {
+      return tx.catalogDisagreement.update({
+        where: { id: existing.id },
+        data: {
+          values: input.values as Prisma.InputJsonValue,
+          chosenValue: input.chosenValue,
+        },
+      });
+    }
+    return tx.catalogDisagreement.create({
       data: {
+        sku: input.sku,
+        field: input.field,
         values: input.values as Prisma.InputJsonValue,
         chosenValue: input.chosenValue,
       },
     });
-  }
-  return prisma.catalogDisagreement.create({
-    data: {
-      sku: input.sku,
-      field: input.field,
-      values: input.values as Prisma.InputJsonValue,
-      chosenValue: input.chosenValue,
-    },
   });
 }
 

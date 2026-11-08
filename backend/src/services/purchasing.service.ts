@@ -13,9 +13,14 @@
  * the actual invoiced cost for THIS receipt (never averaged away).
  */
 import {
+  FpoLegalForm,
+  ImportShipmentStatus,
+  OrganicStatus,
   Prisma,
   PurchaseOrderStatus,
   Role,
+  SupplierType,
+  type FpoProfile,
   type GoodsReceipt,
   type PurchaseOrder,
   type Supplier,
@@ -23,9 +28,11 @@ import {
 } from "@prisma/client";
 import { AuditAction, writeAuditLog } from "../lib/audit.js";
 import { AppError } from "../lib/errors.js";
-import { lockProducts } from "../lib/locks.js";
+import { lockImportShipment, lockProducts } from "../lib/locks.js";
 import { moneyDec, unitCostDec } from "../lib/money.js";
 import { claimLotBarcode } from "./barcode.service.js";
+import { findReceiveComplianceGaps } from "./compliance.service.js";
+import { allocateShipmentCosts } from "./landedCost.service.js";
 import { addLot } from "./stockEngine.js";
 import { prisma } from "../lib/prisma.js";
 import type { AuthUser } from "../types/auth.js";
@@ -36,6 +43,12 @@ const money = moneyDec;
 function assertAdmin(actor: AuthUser): void {
   if (actor.role !== Role.STORE_ADMIN && actor.role !== Role.COOP_ADMIN) {
     throw new AppError(403, "Cashiers cannot access purchasing");
+  }
+}
+
+function assertCoopAdmin(actor: AuthUser): void {
+  if (actor.role !== Role.COOP_ADMIN) {
+    throw new AppError(403, "Only COOP_ADMIN may manage FPO profiles");
   }
 }
 
@@ -112,6 +125,8 @@ export type SupplierInput = {
   leadTimeDays?: number;
   isActive?: boolean;
   notes?: string;
+  supplierType?: SupplierType;
+  country?: string;
 };
 
 export async function listSuppliers(activeOnly = false): Promise<Supplier[]> {
@@ -158,6 +173,8 @@ export async function createSupplier(actor: AuthUser, input: SupplierInput): Pro
       leadTimeDays: input.leadTimeDays ?? 7,
       isActive: input.isActive ?? true,
       notes: input.notes?.trim() ?? "",
+      supplierType: input.supplierType ?? SupplierType.DOMESTIC_VENDOR,
+      country: (input.country?.trim() || "US").toUpperCase(),
     },
   });
 }
@@ -181,8 +198,162 @@ export async function updateSupplier(
       ...(input.leadTimeDays !== undefined ? { leadTimeDays: input.leadTimeDays } : {}),
       ...(input.isActive !== undefined ? { isActive: input.isActive } : {}),
       ...(input.notes !== undefined ? { notes: input.notes.trim() } : {}),
+      ...(input.supplierType !== undefined ? { supplierType: input.supplierType } : {}),
+      ...(input.country !== undefined ? { country: input.country.trim().toUpperCase() || "US" } : {}),
     },
   });
+}
+
+// ─── FPO profiles (COOP_ADMIN) ───────────────────────────────────────────────
+
+export type FpoProfileInput = {
+  supplierId: string;
+  legalForm?: FpoLegalForm;
+  registrationNumber?: string;
+  state?: string;
+  district?: string;
+  block?: string | null;
+  memberFarmerCount: number;
+  memberFarmerCountAsOf?: Date | string;
+  womenFarmerCount?: number | null;
+  primaryCrops?: string[];
+  exportsViaSupplierId?: string | null;
+  notes?: string;
+  onboardedAt?: Date | string;
+};
+
+export async function upsertFpoProfile(
+  actor: AuthUser,
+  input: FpoProfileInput,
+): Promise<FpoProfile> {
+  assertCoopAdmin(actor);
+  const supplier = await prisma.supplier.findUnique({ where: { id: input.supplierId } });
+  if (!supplier) throw new AppError(404, "Supplier not found");
+  if (supplier.supplierType !== SupplierType.FPO) {
+    throw new AppError(400, "FpoProfile requires a supplier with supplierType FPO", {
+      supplierId: supplier.id,
+      supplierType: supplier.supplierType,
+    });
+  }
+  if (!Number.isInteger(input.memberFarmerCount) || input.memberFarmerCount < 0) {
+    throw new AppError(400, "memberFarmerCount must be a non-negative integer");
+  }
+  if (input.exportsViaSupplierId) {
+    const exporter = await prisma.supplier.findUnique({
+      where: { id: input.exportsViaSupplierId },
+    });
+    if (!exporter) throw new AppError(404, "exportsViaSupplierId not found");
+  }
+
+  const asOf = input.memberFarmerCountAsOf
+    ? new Date(input.memberFarmerCountAsOf)
+    : new Date();
+  if (Number.isNaN(asOf.getTime())) {
+    throw new AppError(400, "memberFarmerCountAsOf is not a valid date");
+  }
+  const onboardedAt = input.onboardedAt ? new Date(input.onboardedAt) : new Date();
+
+  return prisma.fpoProfile.upsert({
+    where: { supplierId: input.supplierId },
+    create: {
+      supplierId: input.supplierId,
+      legalForm: input.legalForm ?? FpoLegalForm.OTHER,
+      registrationNumber: input.registrationNumber?.trim() ?? "",
+      state: input.state?.trim() ?? "",
+      district: input.district?.trim() ?? "",
+      block: input.block?.trim() || null,
+      memberFarmerCount: input.memberFarmerCount,
+      memberFarmerCountAsOf: asOf,
+      womenFarmerCount: input.womenFarmerCount ?? null,
+      primaryCrops: input.primaryCrops?.map((c) => c.trim()).filter(Boolean) ?? [],
+      exportsViaSupplierId: input.exportsViaSupplierId ?? null,
+      notes: input.notes?.trim() ?? "",
+      onboardedAt,
+    },
+    update: {
+      ...(input.legalForm !== undefined ? { legalForm: input.legalForm } : {}),
+      ...(input.registrationNumber !== undefined
+        ? { registrationNumber: input.registrationNumber.trim() }
+        : {}),
+      ...(input.state !== undefined ? { state: input.state.trim() } : {}),
+      ...(input.district !== undefined ? { district: input.district.trim() } : {}),
+      ...(input.block !== undefined ? { block: input.block?.trim() || null } : {}),
+      memberFarmerCount: input.memberFarmerCount,
+      memberFarmerCountAsOf: asOf,
+      ...(input.womenFarmerCount !== undefined
+        ? { womenFarmerCount: input.womenFarmerCount }
+        : {}),
+      ...(input.primaryCrops !== undefined
+        ? { primaryCrops: input.primaryCrops.map((c) => c.trim()).filter(Boolean) }
+        : {}),
+      ...(input.exportsViaSupplierId !== undefined
+        ? { exportsViaSupplierId: input.exportsViaSupplierId }
+        : {}),
+      ...(input.notes !== undefined ? { notes: input.notes.trim() } : {}),
+      ...(input.onboardedAt !== undefined ? { onboardedAt } : {}),
+    },
+  });
+}
+
+export async function getFpoProfile(actor: AuthUser, supplierId: string): Promise<FpoProfile> {
+  assertCoopAdmin(actor);
+  const profile = await prisma.fpoProfile.findUnique({ where: { supplierId } });
+  if (!profile) throw new AppError(404, "FPO profile not found");
+  return profile;
+}
+
+/**
+ * FPOs the co-op has actually RECEIVED goods from in the last 12 months —
+ * the number for the website / flyer. Onboarded-but-never-supplied FPOs don't count.
+ */
+export async function getSourcingSummary(actor: AuthUser): Promise<{
+  activeFpoCount: number;
+  totalMemberFarmers: number;
+  states: string[];
+  asOfDates: string[];
+}> {
+  assertCoopAdmin(actor);
+  const since = new Date();
+  since.setUTCFullYear(since.getUTCFullYear() - 1);
+
+  const origins = await prisma.sourcingOrigin.findMany({
+    where: { goodsReceiptLine: { receipt: { receivedAt: { gte: since } } } },
+    select: {
+      fpoSupplierId: true,
+      state: true,
+      fpoSupplier: {
+        select: {
+          fpoProfile: {
+            select: { memberFarmerCount: true, memberFarmerCountAsOf: true },
+          },
+        },
+      },
+    },
+  });
+
+  const fpoIds = new Set<string>();
+  const states = new Set<string>();
+  let totalMemberFarmers = 0;
+  const asOfDates = new Set<string>();
+  const countedFarmers = new Set<string>();
+
+  for (const row of origins) {
+    fpoIds.add(row.fpoSupplierId);
+    if (row.state.trim()) states.add(row.state.trim());
+    const profile = row.fpoSupplier.fpoProfile;
+    if (profile && !countedFarmers.has(row.fpoSupplierId)) {
+      countedFarmers.add(row.fpoSupplierId);
+      totalMemberFarmers += profile.memberFarmerCount;
+      asOfDates.add(profile.memberFarmerCountAsOf.toISOString());
+    }
+  }
+
+  return {
+    activeFpoCount: fpoIds.size,
+    totalMemberFarmers,
+    states: [...states].sort(),
+    asOfDates: [...asOfDates].sort(),
+  };
 }
 
 export type SupplierProductInput = {
@@ -259,7 +430,10 @@ export async function upsertSupplierProduct(
 export type PoLineInput = {
   productId: string;
   orderedQty: number;
-  unitCost: number;
+  /** USD unit cost. Required when currency is USD; otherwise derived from unitCostForeign × rate. */
+  unitCost?: number;
+  /** Foreign-currency unit cost when PO currency ≠ USD. */
+  unitCostForeign?: number | null;
 };
 
 export type CreatePoInput = {
@@ -269,6 +443,10 @@ export type CreatePoInput = {
   expectedDate?: string | null;
   tax?: number;
   shipping?: number;
+  /** ISO 4217; default USD. */
+  currency?: string;
+  /** FX rate to USD; must be 1 when currency is USD. */
+  fxRateToUsd?: number;
   lines: PoLineInput[];
   ipAddress?: string | null;
 };
@@ -277,9 +455,40 @@ export type UpdatePoInput = {
   expectedDate?: string | null;
   tax?: number;
   shipping?: number;
+  currency?: string;
+  fxRateToUsd?: number;
   lines?: PoLineInput[];
   ipAddress?: string | null;
 };
+
+function normalizeCurrency(raw: string | undefined): string {
+  const currency = (raw ?? "USD").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new AppError(400, "currency must be a 3-letter ISO 4217 code");
+  }
+  return currency;
+}
+
+function resolvePoLineCosts(
+  line: PoLineInput,
+  currency: string,
+  fxRateToUsd: Prisma.Decimal,
+): { unitCost: Prisma.Decimal; unitCostForeign: Prisma.Decimal | null } {
+  if (currency === "USD") {
+    if (line.unitCost === undefined || line.unitCost === null) {
+      throw new AppError(400, "unitCost is required for USD purchase orders");
+    }
+    return { unitCost: unitCostDec(line.unitCost), unitCostForeign: null };
+  }
+  if (line.unitCostForeign === undefined || line.unitCostForeign === null) {
+    throw new AppError(400, "unitCostForeign is required when currency is not USD");
+  }
+  const unitCostForeign = unitCostDec(line.unitCostForeign);
+  return {
+    unitCost: unitCostDec(unitCostForeign.mul(fxRateToUsd)),
+    unitCostForeign,
+  };
+}
 
 const poInclude = {
   supplier: true,
@@ -339,7 +548,99 @@ export async function listPurchaseOrders(
 export async function getPurchaseOrder(actor: AuthUser, id: string) {
   const po = await loadPo(id);
   assertCanAccessPo(actor, po);
-  return po;
+
+  const link = await prisma.importShipmentPurchaseOrder.findFirst({
+    where: {
+      poId: id,
+      shipment: { status: { not: ImportShipmentStatus.CANCELLED } },
+    },
+    include: {
+      shipment: {
+        select: {
+          id: true,
+          shipmentNumber: true,
+          status: true,
+          containerNumber: true,
+          eta: true,
+          lines: true,
+          costs: true,
+        },
+      },
+    },
+  });
+
+  let importShipment: {
+    id: string;
+    shipmentNumber: string;
+    status: ImportShipmentStatus;
+    containerNumber: string | null;
+    eta: Date | null;
+    costCount: number;
+  } | null = null;
+  const landedPreviewByPoLineId: Record<
+    string,
+    { landedAddOnPerUnit: string; quantity: number }
+  > = {};
+  let complianceGaps: Array<{ code: string; message: string }> = [];
+  let requiresLandedCostAck = false;
+
+  if (link) {
+    const ship = link.shipment;
+    const activeCosts = ship.costs.filter((c) => {
+      const superseded = new Set(
+        ship.costs.filter((x) => x.supersedesCostId).map((x) => x.supersedesCostId!),
+      );
+      return !superseded.has(c.id);
+    });
+    importShipment = {
+      id: ship.id,
+      shipmentNumber: ship.shipmentNumber,
+      status: ship.status,
+      containerNumber: ship.containerNumber,
+      eta: ship.eta,
+      costCount: activeCosts.length,
+    };
+    requiresLandedCostAck = activeCosts.length === 0;
+
+    if (ship.lines.length > 0 && activeCosts.length > 0) {
+      const allocations = allocateShipmentCosts(
+        ship.lines.map((l) => ({
+          id: l.id,
+          customsValueUsd: l.customsValueUsd,
+          grossWeightKg: l.grossWeightKg,
+          volumeCbm: l.volumeCbm,
+          quantity: l.quantity,
+          dutyAmountUsd: l.dutyAmountUsd,
+        })),
+        ship.costs,
+      );
+      const byShipLine = new Map(allocations.map((a) => [a.lineId, a]));
+      for (const sl of ship.lines) {
+        const alloc = byShipLine.get(sl.id);
+        if (!alloc) continue;
+        landedPreviewByPoLineId[sl.poLineId] = {
+          landedAddOnPerUnit: alloc.landedAddOnPerUnit.toFixed(4),
+          quantity: sl.quantity,
+        };
+      }
+    }
+
+    complianceGaps = (
+      await findReceiveComplianceGaps({
+        supplierId: po.supplierId,
+        supplierType: po.supplier.supplierType,
+        shipmentId: ship.id,
+      })
+    ).map((g) => ({ code: g.code, message: g.message }));
+  }
+
+  return {
+    ...po,
+    importShipment,
+    landedPreviewByPoLineId,
+    complianceGaps,
+    requiresLandedCostAck,
+  };
 }
 
 export async function createPurchaseOrder(actor: AuthUser, input: CreatePoInput) {
@@ -352,17 +653,28 @@ export async function createPurchaseOrder(actor: AuthUser, input: CreatePoInput)
     throw new AppError(400, "Supplier not found or inactive");
   }
 
+  const currency = normalizeCurrency(input.currency);
+  const fxRateToUsd =
+    currency === "USD" ? new Prisma.Decimal(1) : new Prisma.Decimal(input.fxRateToUsd ?? NaN);
+  if (currency === "USD" && input.fxRateToUsd !== undefined && Number(input.fxRateToUsd) !== 1) {
+    throw new AppError(400, "USD purchase orders must use fxRateToUsd = 1");
+  }
+  if (!fxRateToUsd.isFinite() || fxRateToUsd.lte(0)) {
+    throw new AppError(400, "fxRateToUsd must be a positive number");
+  }
+
   const tax = money(input.tax ?? 0);
   const shipping = money(input.shipping ?? 0);
   const lineDrafts = input.lines.map((line) => {
     if (!Number.isInteger(line.orderedQty) || line.orderedQty <= 0) {
       throw new AppError(400, "orderedQty must be a positive integer");
     }
-    const unitCost = unitCostDec(line.unitCost);
+    const { unitCost, unitCostForeign } = resolvePoLineCosts(line, currency, fxRateToUsd);
     return {
       productId: line.productId,
       orderedQty: line.orderedQty,
       unitCost,
+      unitCostForeign,
       lineTotal: money(unitCost.mul(line.orderedQty)),
     };
   });
@@ -399,6 +711,8 @@ export async function createPurchaseOrder(actor: AuthUser, input: CreatePoInput)
         status: PurchaseOrderStatus.DRAFT,
         expectedDate,
         createdByUserId: actor.id,
+        currency,
+        fxRateToUsd,
         subtotal,
         tax,
         shipping,
@@ -423,11 +737,26 @@ export async function updatePurchaseOrder(
 
   const tax = input.tax !== undefined ? money(input.tax) : po.tax;
   const shipping = input.shipping !== undefined ? money(input.shipping) : po.shipping;
+  const currency =
+    input.currency !== undefined ? normalizeCurrency(input.currency) : po.currency;
+  let fxRateToUsd = po.fxRateToUsd;
+  if (currency === "USD") {
+    fxRateToUsd = new Prisma.Decimal(1);
+    if (input.fxRateToUsd !== undefined && Number(input.fxRateToUsd) !== 1) {
+      throw new AppError(400, "USD purchase orders must use fxRateToUsd = 1");
+    }
+  } else if (input.fxRateToUsd !== undefined) {
+    fxRateToUsd = new Prisma.Decimal(input.fxRateToUsd);
+  }
+  if (!fxRateToUsd.isFinite() || fxRateToUsd.lte(0)) {
+    throw new AppError(400, "fxRateToUsd must be a positive number");
+  }
 
   let lineDrafts = po.lines.map((l) => ({
     productId: l.productId,
     orderedQty: l.orderedQty,
     unitCost: l.unitCost,
+    unitCostForeign: l.unitCostForeign,
     lineTotal: l.lineTotal,
   }));
 
@@ -437,12 +766,36 @@ export async function updatePurchaseOrder(
       if (!Number.isInteger(line.orderedQty) || line.orderedQty <= 0) {
         throw new AppError(400, "orderedQty must be a positive integer");
       }
-      const unitCost = unitCostDec(line.unitCost);
+      const { unitCost, unitCostForeign } = resolvePoLineCosts(line, currency, fxRateToUsd);
       return {
         productId: line.productId,
         orderedQty: line.orderedQty,
         unitCost,
+        unitCostForeign,
         lineTotal: money(unitCost.mul(line.orderedQty)),
+      };
+    });
+  } else if (input.currency !== undefined || input.fxRateToUsd !== undefined) {
+    lineDrafts = po.lines.map((l) => {
+      if (currency === "USD") {
+        return {
+          productId: l.productId,
+          orderedQty: l.orderedQty,
+          unitCost: l.unitCost,
+          unitCostForeign: null,
+          lineTotal: money(l.unitCost.mul(l.orderedQty)),
+        };
+      }
+      if (l.unitCostForeign == null) {
+        throw new AppError(400, "unitCostForeign is required when currency is not USD");
+      }
+      const unitCost = unitCostDec(l.unitCostForeign.mul(fxRateToUsd));
+      return {
+        productId: l.productId,
+        orderedQty: l.orderedQty,
+        unitCost,
+        unitCostForeign: l.unitCostForeign,
+        lineTotal: money(unitCost.mul(l.orderedQty)),
       };
     });
   }
@@ -450,7 +803,7 @@ export async function updatePurchaseOrder(
   const { subtotal, total } = recomputePoTotals(lineDrafts, tax, shipping);
 
   return prisma.$transaction(async (tx) => {
-    if (input.lines) {
+    if (input.lines || input.currency !== undefined || input.fxRateToUsd !== undefined) {
       await tx.purchaseOrderLine.deleteMany({ where: { poId: id } });
       await tx.purchaseOrderLine.createMany({
         data: lineDrafts.map((l) => ({
@@ -458,6 +811,7 @@ export async function updatePurchaseOrder(
           productId: l.productId,
           orderedQty: l.orderedQty,
           unitCost: l.unitCost,
+          unitCostForeign: l.unitCostForeign,
           lineTotal: l.lineTotal,
         })),
       });
@@ -469,6 +823,8 @@ export async function updatePurchaseOrder(
         shipping,
         subtotal,
         total,
+        currency,
+        fxRateToUsd,
         ...(input.expectedDate !== undefined
           ? { expectedDate: input.expectedDate ? new Date(input.expectedDate) : null }
           : {}),
@@ -552,6 +908,21 @@ export async function cancelPurchaseOrder(
 
 // ─── Receiving ───────────────────────────────────────────────────────────────
 
+/** Cluster-level growing origin for one receipt line (never named farmers). */
+export type SourcingOriginInput = {
+  /** Growing FPO. Defaults to the PO supplier when that supplier is FPO. */
+  fpoSupplierId?: string;
+  state: string;
+  district: string;
+  village?: string | null;
+  crop: string;
+  variety?: string | null;
+  harvestSeason?: string | null;
+  harvestDate?: Date | string | null;
+  contributingFarmerCount?: number | null;
+  organicStatus?: OrganicStatus;
+};
+
 export type ReceiveLineInput = {
   poLineId: string;
   quantityReceived: number;
@@ -568,6 +939,11 @@ export type ReceiveLineInput = {
   harvestDate?: Date | string | null;
   /** Country of origin (COOL). */
   countryOfOrigin?: string | null;
+  /**
+   * Required when the PO supplier is FPO or EXPORTER.
+   * When an exporter invoices, Lot.supplierId stays the exporter; origin.fpoSupplierId is the FPO.
+   */
+  origin?: SourcingOriginInput | null;
   /**
    * Required when quantityReceived exceeds remaining ordered qty on the line.
    * Over-receipt is allowed only with this explicit flag — never silently.
@@ -586,6 +962,16 @@ export type ReceiveGoodsInput = {
   notes?: string | null;
   lines: ReceiveLineInput[];
   ipAddress?: string | null;
+  /**
+   * COOP_ADMIN only. When the PO is on a shipment with zero cost rows, receive at invoice
+   * cost (add-on 0). Audited — silently receiving an import at invoice cost is forbidden.
+   */
+  acknowledgeNoLandedCost?: boolean;
+  /**
+   * COOP_ADMIN only. Override FSVP / FDA prior-notice gaps on import receive.
+   * Audited — a warning with a recorded override, not a silent skip.
+   */
+  acknowledgeComplianceGaps?: boolean;
 };
 
 /**
@@ -593,18 +979,19 @@ export type ReceiveGoodsInput = {
  *
  * Accepted units (qtyIn > 0), in the SAME transaction:
  *   1. Create GoodsReceiptLine (+ optional lot metadata)
- *   2. Create Lot (quantityRemaining = qtyIn, unitCost = unitCostActual)
+ *   2. Create Lot (quantityRemaining = qtyIn, unitCost = unitCostActual + landedAddOnPerUnit)
  *   3. Increment Product.stock by qtyIn
  *      /// Product.stock remains a cached rollup of its ACTIVE lots, kept for POS speed. Lots are the
  *      /// source of truth. Any code that changes one MUST change the other in the same transaction.
  *   4. Write StockAdjustment (reason RECEIPT) with lotId
  *
+ * When the PO is on an ImportShipment: claim the shipment (rule 0) before Product locks, then
+ * allocate shipment costs inside the same transaction. Client landed values are ignored.
+ * Domestic POs keep landedAddOnPerUnit = 0.
+ *
  * Rejected units create no lot — they never entered sellable stock.
  *
- * Weighted-average Product.cost when unitCostActual ≠ Product.cost:
- *   newCost = (previousStock × oldCost + quantityReceived × unitCostActual)
- *             / (previousStock + quantityReceived)
- *   If previousStock ≤ 0, newCost = unitCostActual (no reliable weight).
+ * Weighted-average Product.cost uses the landed unit cost (invoice + add-on).
  */
 export async function receiveGoods(
   actor: AuthUser,
@@ -617,7 +1004,7 @@ export async function receiveGoods(
   const result = await prisma.$transaction(async (tx) => {
     const po = await tx.purchaseOrder.findUnique({
       where: { id: poId },
-      include: { lines: true },
+      include: { lines: true, supplier: true },
     });
     if (!po) throw new AppError(404, "Purchase order not found");
     assertCanAccessPo(actor, po);
@@ -629,6 +1016,10 @@ export async function receiveGoods(
       throw new AppError(409, "PO is not open for receiving", { status: po.status });
     }
 
+    const originRequired =
+      po.supplier.supplierType === SupplierType.FPO ||
+      po.supplier.supplierType === SupplierType.EXPORTER;
+
     const lineById = new Map(po.lines.map((l) => [l.id, l]));
     const costChanges: Array<{
       productId: string;
@@ -636,7 +1027,128 @@ export async function receiveGoods(
       after: string;
       quantityReceived: number;
       unitCostActual: string;
+      landedUnitCost: string;
     }> = [];
+
+    // ── Import shipment: rule-0 document lock BEFORE Product locks ──
+    let shipmentId: string | null = null;
+    let shipmentNumber: string | null = null;
+    let acknowledgedNoLandedCost = false;
+    let complianceGapsAcknowledged: Array<{
+      code: string;
+      message: string;
+    }> | null = null;
+    /** poLineId → landedAddOnPerUnit from shipment allocation (ignore client). */
+    const addOnByPoLineId = new Map<string, Prisma.Decimal>();
+
+    const shipmentLink = await tx.importShipmentPurchaseOrder.findFirst({
+      where: {
+        poId,
+        shipment: { status: { not: ImportShipmentStatus.CANCELLED } },
+      },
+      select: { shipmentId: true },
+    });
+
+    if (shipmentLink) {
+      const lockedShipment = await lockImportShipment(tx, shipmentLink.shipmentId);
+      if (!lockedShipment) throw new AppError(404, "Shipment not found");
+      if (
+        lockedShipment.status === ImportShipmentStatus.CLOSED ||
+        lockedShipment.status === ImportShipmentStatus.CANCELLED
+      ) {
+        throw new AppError(409, "Cannot receive against a closed or cancelled shipment", {
+          shipmentNumber: lockedShipment.shipmentNumber,
+          status: lockedShipment.status,
+        });
+      }
+
+      shipmentId = lockedShipment.id;
+      shipmentNumber = lockedShipment.shipmentNumber;
+
+      const gaps = await findReceiveComplianceGaps({
+        supplierId: po.supplierId,
+        supplierType: po.supplier.supplierType,
+        shipmentId: lockedShipment.id,
+      });
+      if (gaps.length) {
+        if (!input.acknowledgeComplianceGaps) {
+          throw new AppError(
+            409,
+            "Compliance gaps on this shipment — attach missing paperwork or set acknowledgeComplianceGaps",
+            {
+              shipmentNumber: lockedShipment.shipmentNumber,
+              gaps,
+              requireAcknowledgeComplianceGaps: true,
+            },
+          );
+        }
+        if (actor.role !== Role.COOP_ADMIN) {
+          throw new AppError(403, "acknowledgeComplianceGaps is COOP_ADMIN only");
+        }
+        complianceGapsAcknowledged = gaps.map((g) => ({
+          code: g.code,
+          message: g.message,
+        }));
+      }
+
+      const [shipLines, shipCosts] = await Promise.all([
+        tx.importShipmentLine.findMany({ where: { shipmentId } }),
+        tx.shipmentCost.findMany({ where: { shipmentId } }),
+      ]);
+
+      if (shipCosts.length === 0) {
+        if (!input.acknowledgeNoLandedCost) {
+          throw new AppError(
+            409,
+            `${lockedShipment.shipmentNumber} has no landed costs. Enter estimates, or receive at invoice cost only with acknowledgeNoLandedCost.`,
+            { shipmentId, shipmentNumber: lockedShipment.shipmentNumber },
+          );
+        }
+        if (actor.role !== Role.COOP_ADMIN) {
+          throw new AppError(
+            403,
+            "acknowledgeNoLandedCost is COOP_ADMIN only",
+          );
+        }
+        acknowledgedNoLandedCost = true;
+        for (const pl of po.lines) {
+          addOnByPoLineId.set(pl.id, unitCostDec(0));
+        }
+      } else {
+        if (!shipLines.length) {
+          throw new AppError(
+            409,
+            `${lockedShipment.shipmentNumber} has costs but no shipment lines — upsert lines before receiving`,
+            { shipmentId },
+          );
+        }
+        const allocations = allocateShipmentCosts(
+          shipLines.map((l) => ({
+            id: l.id,
+            customsValueUsd: l.customsValueUsd,
+            grossWeightKg: l.grossWeightKg,
+            volumeCbm: l.volumeCbm,
+            quantity: l.quantity,
+            dutyAmountUsd: l.dutyAmountUsd,
+          })),
+          shipCosts,
+        );
+        const allocByShipLine = new Map(allocations.map((a) => [a.lineId, a]));
+        for (const sl of shipLines) {
+          const alloc = allocByShipLine.get(sl.id)!;
+          addOnByPoLineId.set(sl.poLineId, alloc.landedAddOnPerUnit);
+        }
+        for (const raw of input.lines) {
+          if (raw.quantityReceived > 0 && !addOnByPoLineId.has(raw.poLineId)) {
+            throw new AppError(
+              409,
+              "PO line is not on the shipment — upsert shipment lines before receiving",
+              { poLineId: raw.poLineId, shipmentNumber: lockedShipment.shipmentNumber },
+            );
+          }
+        }
+      }
+    }
 
     // Product before Lot create / Product.stock write (lib/locks.ts). New lots have no prior row.
     const lockedProducts = await lockProducts(
@@ -723,10 +1235,24 @@ export async function receiveGoods(
       }
 
       const unitCostActual = unitCostDec(raw.unitCostActual);
+      const landedAddOnPerUnit =
+        shipmentId != null
+          ? (addOnByPoLineId.get(poLine.id) ?? unitCostDec(0))
+          : unitCostDec(0);
+      const landedUnitCost = unitCostDec(unitCostActual.add(landedAddOnPerUnit));
+      const receivedValue = money(landedUnitCost.mul(qtyIn));
       const expiryDate = parseOptionalDate(raw.expiryDate);
       const harvestDate = parseOptionalDate(raw.harvestDate);
       const countryOfOrigin = raw.countryOfOrigin?.trim() || null;
       const suppliedLotNumber = raw.lotNumber?.trim() || null;
+
+      if (originRequired && qtyIn > 0 && !raw.origin) {
+        throw new AppError(
+          400,
+          "origin is required when receiving from an FPO or EXPORTER supplier",
+          { poLineId: poLine.id, supplierType: po.supplier.supplierType },
+        );
+      }
 
       const receiptLine = await tx.goodsReceiptLine.create({
         data: {
@@ -737,12 +1263,61 @@ export async function receiveGoods(
           quantityRejected: qtyReject,
           rejectionReason: qtyReject > 0 ? raw.rejectionReason!.trim() : null,
           unitCostActual,
+          landedAddOnPerUnit,
+          receivedValue,
+          shipmentId,
           lotNumber: suppliedLotNumber,
           expiryDate,
           harvestDate,
           countryOfOrigin,
         },
       });
+
+      if (raw.origin) {
+        const origin = raw.origin;
+        const fpoSupplierId =
+          origin.fpoSupplierId?.trim() ||
+          (po.supplier.supplierType === SupplierType.FPO ? po.supplierId : "");
+        if (!fpoSupplierId) {
+          throw new AppError(400, "origin.fpoSupplierId is required for exporter receipts", {
+            poLineId: poLine.id,
+          });
+        }
+        const state = origin.state.trim();
+        const district = origin.district.trim();
+        const crop = origin.crop.trim();
+        if (!state || !district || !crop) {
+          throw new AppError(400, "origin.state, origin.district and origin.crop are required");
+        }
+        if (
+          origin.contributingFarmerCount != null &&
+          (!Number.isInteger(origin.contributingFarmerCount) ||
+            origin.contributingFarmerCount < 0)
+        ) {
+          throw new AppError(400, "origin.contributingFarmerCount must be a non-negative integer");
+        }
+        const fpo = await tx.supplier.findUnique({ where: { id: fpoSupplierId } });
+        if (!fpo || fpo.supplierType !== SupplierType.FPO) {
+          throw new AppError(400, "origin.fpoSupplierId must reference an FPO supplier", {
+            fpoSupplierId,
+          });
+        }
+        await tx.sourcingOrigin.create({
+          data: {
+            goodsReceiptLineId: receiptLine.id,
+            fpoSupplierId,
+            state,
+            district,
+            village: origin.village?.trim() || null,
+            crop,
+            variety: origin.variety?.trim() || null,
+            harvestSeason: origin.harvestSeason?.trim() || null,
+            harvestDate: parseOptionalDate(origin.harvestDate ?? null),
+            contributingFarmerCount: origin.contributingFarmerCount ?? null,
+            organicStatus: origin.organicStatus ?? OrganicStatus.CONVENTIONAL,
+          },
+        });
+      }
 
       await tx.purchaseOrderLine.update({
         where: { id: poLine.id },
@@ -791,7 +1366,8 @@ export async function receiveGoods(
           quantity: qtyIn,
           countryOfOrigin,
           receivedAt,
-          unitCost: unitCostActual,
+          unitCost: landedUnitCost,
+          landedAddOnApplied: landedAddOnPerUnit,
         });
         locked.stock = previousStock + qtyIn;
 
@@ -813,18 +1389,20 @@ export async function receiveGoods(
             delta: qtyIn,
             reason: "RECEIPT",
             lotId: lot.id,
+            lotPreviousQty: 0,
+            lotNewQty: qtyIn,
           },
         });
 
-        // Weighted-average cost — drives margin reporting (Phase 21).
-        if (!unitCostActual.eq(product.cost)) {
+        // Weighted-average cost uses landed unit cost (invoice + add-on).
+        if (!landedUnitCost.eq(product.cost)) {
           let newCost: Prisma.Decimal;
           if (previousStock <= 0) {
-            newCost = unitCostActual;
+            newCost = landedUnitCost;
           } else {
             const numerator = unitCostDec(product.cost)
               .mul(previousStock)
-              .add(unitCostActual.mul(qtyIn));
+              .add(landedUnitCost.mul(qtyIn));
             const denominator = previousStock + qtyIn;
             newCost = unitCostDec(numerator.div(denominator));
           }
@@ -838,6 +1416,7 @@ export async function receiveGoods(
             after: newCost.toFixed(4),
             quantityReceived: qtyIn,
             unitCostActual: unitCostActual.toFixed(4),
+            landedUnitCost: landedUnitCost.toFixed(4),
           });
         }
       }
@@ -854,12 +1433,59 @@ export async function receiveGoods(
       include: poInclude,
     });
 
+    let shipmentMarkedReceived = false;
+    if (shipmentId) {
+      const links = await tx.importShipmentPurchaseOrder.findMany({
+        where: { shipmentId },
+        include: { po: { include: { lines: true } } },
+      });
+      const allPosDone = links.every((link) =>
+        link.po.lines.every(
+          (l) => l.shortClosed || l.receivedQty >= l.orderedQty,
+        ),
+      );
+      if (allPosDone) {
+        const current = await tx.importShipment.findUnique({ where: { id: shipmentId } });
+        if (
+          current &&
+          current.status !== ImportShipmentStatus.RECEIVED &&
+          current.status !== ImportShipmentStatus.COSTED &&
+          current.status !== ImportShipmentStatus.CLOSED &&
+          current.status !== ImportShipmentStatus.CANCELLED
+        ) {
+          await tx.importShipment.update({
+            where: { id: shipmentId },
+            data: { status: ImportShipmentStatus.RECEIVED },
+          });
+          await tx.shipmentEvent.create({
+            data: {
+              shipmentId,
+              eventType: "STATUS_CHANGE",
+              message: `${current.status} → RECEIVED (all attached POs received)`,
+              payload: { from: current.status, to: ImportShipmentStatus.RECEIVED },
+              createdByUserId: actor.id,
+            },
+          });
+          shipmentMarkedReceived = true;
+        }
+      }
+    }
+
     const fullReceipt = await tx.goodsReceipt.findUniqueOrThrow({
       where: { id: receipt.id },
       include: { lines: true },
     });
 
-    return { receipt: fullReceipt, purchaseOrder: updatedPo, costChanges };
+    return {
+      receipt: fullReceipt,
+      purchaseOrder: updatedPo,
+      costChanges,
+      shipmentId,
+      shipmentNumber,
+      acknowledgedNoLandedCost,
+      complianceGapsAcknowledged,
+      shipmentMarkedReceived,
+    };
   });
 
   await writeAuditLog({
@@ -874,9 +1500,47 @@ export async function receiveGoods(
       status: result.purchaseOrder.status,
       invoiceNumber: result.receipt.invoiceNumber,
       lineCount: result.receipt.lines.length,
+      shipmentId: result.shipmentId,
+      shipmentNumber: result.shipmentNumber,
+      shipmentMarkedReceived: result.shipmentMarkedReceived,
+      complianceGapsAcknowledged: result.complianceGapsAcknowledged,
     },
     ipAddress: input.ipAddress ?? null,
   });
+
+  if (result.complianceGapsAcknowledged?.length && result.shipmentId) {
+    await writeAuditLog({
+      userId: actor.id,
+      storeId: result.purchaseOrder.storeId,
+      action: AuditAction.COMPLIANCE_GAP_OVERRIDE,
+      entityType: "ImportShipment",
+      entityId: result.shipmentId,
+      after: {
+        shipmentNumber: result.shipmentNumber,
+        poId,
+        receiptId: result.receipt.id,
+        gaps: result.complianceGapsAcknowledged,
+      },
+      ipAddress: input.ipAddress ?? null,
+    });
+  }
+
+  if (result.acknowledgedNoLandedCost && result.shipmentId) {
+    await writeAuditLog({
+      userId: actor.id,
+      storeId: result.purchaseOrder.storeId,
+      action: AuditAction.RECEIVE_NO_LANDED_COST,
+      entityType: "ImportShipment",
+      entityId: result.shipmentId,
+      after: {
+        shipmentNumber: result.shipmentNumber,
+        poId,
+        receiptId: result.receipt.id,
+        reason: "COOP_ADMIN acknowledged receive at invoice cost with no shipment costs",
+      },
+      ipAddress: input.ipAddress ?? null,
+    });
+  }
 
   for (const change of result.costChanges) {
     await writeAuditLog({
@@ -891,7 +1555,8 @@ export async function receiveGoods(
         reason: "WEIGHTED_AVG_ON_RECEIPT",
         quantityReceived: change.quantityReceived,
         unitCostActual: change.unitCostActual,
-        formula: "(oldStock*oldCost + qty*unitCostActual)/(oldStock+qty)",
+        landedUnitCost: change.landedUnitCost,
+        formula: "(oldStock*oldCost + qty*landedUnitCost)/(oldStock+qty)",
       },
       ipAddress: input.ipAddress ?? null,
     });

@@ -53,6 +53,7 @@ import { getStripe, toStripeCents } from "../lib/stripe.js";
 import { moneyDec } from "../lib/money.js";
 import { resolveStoreScope } from "../lib/storeScope.js";
 import type { AuthUser } from "../types/auth.js";
+import { recordRestockReversalVariances } from "./landedCost.service.js";
 import {
   allocateFefo,
   consumeDirect,
@@ -1401,7 +1402,7 @@ export async function finalizeSucceededRefund(
         .filter((item): item is NonNullable<typeof item> => item != null);
       const allocationsByItem = new Map<
         string,
-        Array<{ id: string; lotId: string; quantity: number }>
+        Array<{ id: string; lotId: string; quantity: number; unitCostSnapshot: Prisma.Decimal }>
       >();
       for (const item of restockItems) {
         allocationsByItem.set(
@@ -1409,7 +1410,7 @@ export async function finalizeSucceededRefund(
           await tx.saleItemLot.findMany({
             where: { saleItemId: item.id },
             orderBy: { id: "asc" },
-            select: { id: true, lotId: true, quantity: true },
+            select: { id: true, lotId: true, quantity: true, unitCostSnapshot: true },
           }),
         );
       }
@@ -1451,7 +1452,11 @@ export async function finalizeSucceededRefund(
 
         let skip = item.refundedQuantity - line.quantity; // already-refunded before this line
         let toRestore = line.quantity;
-        const restorations: Array<{ lotId: string; quantity: number }> = [];
+        const restorations: Array<{
+          lotId: string;
+          quantity: number;
+          unitCostSnapshot: Prisma.Decimal;
+        }> = [];
         for (const alloc of allocations) {
           if (toRestore <= 0) break;
           const skipHere = Math.min(alloc.quantity, skip);
@@ -1459,7 +1464,11 @@ export async function finalizeSucceededRefund(
           const capacity = alloc.quantity - skipHere;
           const restore = Math.min(capacity, toRestore);
           if (restore <= 0) continue;
-          restorations.push({ lotId: alloc.lotId, quantity: restore });
+          restorations.push({
+            lotId: alloc.lotId,
+            quantity: restore,
+            unitCostSnapshot: alloc.unitCostSnapshot,
+          });
           toRestore -= restore;
         }
         if (toRestore > 0) {
@@ -1473,7 +1482,37 @@ export async function finalizeSucceededRefund(
         if (!product) {
           throw new AppError(500, "Product missing at refund restock", { productId: item.productId });
         }
-        await restockToLots(tx, product, lockedLots, restorations);
+        const applied = await restockToLots(
+          tx,
+          product,
+          lockedLots,
+          restorations.map((r) => ({ lotId: r.lotId, quantity: r.quantity })),
+        );
+        const costByLot = new Map(restorations.map((r) => [r.lotId, r.unitCostSnapshot]));
+        for (const row of applied) {
+          const unitCostSnapshot = costByLot.get(row.lotId);
+          if (!unitCostSnapshot) {
+            throw new AppError(500, "Missing unitCostSnapshot for restocked lot", {
+              lotId: row.lotId,
+            });
+          }
+          await tx.refundRestockLot.create({
+            data: {
+              saleRefundId: refund.id,
+              saleItemId: item.id,
+              lotId: row.lotId,
+              quantity: row.quantity,
+              unitCostSnapshot,
+            },
+          });
+          // If the lot was trued-up after this sale, reverse that COGS for returned units.
+          await recordRestockReversalVariances(tx, {
+            lotId: row.lotId,
+            quantity: row.quantity,
+            salePaidAt: sale.paidAt,
+            createdByUserId: refund.createdByUserId,
+          });
+        }
       }
     }
 

@@ -6,6 +6,7 @@
  * - GET /settlement/network-summary — co-op-wide rollup totals (Phase 6)
  * - GET /settlement/network-cash-position — undeposited cash per store, worst first
  * - GET /reports/shrinkage — last 30 days' shrinkage rate for the network and each store
+ * - GET /compliance/expiring-certifications — supplier certs / reviews due within 30 days
  *
  * Rows follow the cash-position order so the store whose cash has waited longest is on top.
  */
@@ -43,6 +44,18 @@ type StoreRow = Store & {
   currentlyOwed: string;
 };
 
+type ExpiringCertification = {
+  id: string;
+  supplierId: string;
+  supplierName: string;
+  certType: string;
+  certNumber: string;
+  expiresAt: string | null;
+  nextReviewDue: string | null;
+  reason: "EXPIRING" | "REVIEW_DUE";
+  daysUntil: number;
+};
+
 export function NetworkOverviewPage() {
   const { setStoreId } = useAuth();
   const navigate = useNavigate();
@@ -70,6 +83,14 @@ export function NetworkOverviewPage() {
     queryFn: () => fetchShrinkage({}),
   });
 
+  const certsQuery = useQuery({
+    queryKey: ["compliance", "expiring-certifications"],
+    queryFn: () =>
+      apiRequest<{ certifications: ExpiringCertification[] }>(
+        "/compliance/expiring-certifications?days=30",
+      ),
+  });
+
   function openStoreDashboard(storeId: string) {
     setStoreId(storeId);
     navigate("/");
@@ -94,6 +115,7 @@ export function NetworkOverviewPage() {
   const shrinkageByStore = new Map(
     (shrinkage?.comparison.stores ?? []).map((s) => [s.storeId, s]),
   );
+  const expiringCerts = certsQuery.data?.certifications ?? [];
 
   const columns: DataTableColumn<StoreRow>[] = [
     {
@@ -308,6 +330,49 @@ export function NetworkOverviewPage() {
           />
         </div>
       )}
+
+      <div className="space-y-3">
+        <h2 className="text-lg font-semibold text-ink">Supplier certifications · next 30 days</h2>
+        <p className="text-sm text-ink-muted">
+          Expiring certificates and FSVP reviews due soon. Flagged daily by the compliance job.
+        </p>
+        {certsQuery.isLoading ? (
+          <p className="text-sm text-ink-muted">Loading certifications…</p>
+        ) : expiringCerts.length === 0 ? (
+          <p className="text-sm text-ink-muted">Nothing due in the next 30 days.</p>
+        ) : (
+          <ul className="divide-y divide-border rounded-md border border-border bg-surface-raised">
+            {expiringCerts.map((row) => (
+              <li
+                key={`${row.id}-${row.reason}`}
+                className="flex flex-wrap items-baseline justify-between gap-2 px-4 py-3"
+              >
+                <div>
+                  <div className="font-medium text-ink">
+                    {row.supplierName}{" "}
+                    <span className="text-sm font-normal text-ink-muted">· {row.certType}</span>
+                  </div>
+                  <div className="text-xs text-ink-muted">
+                    {row.certNumber || "No number"} ·{" "}
+                    {row.reason === "EXPIRING" ? "Expires" : "Review due"}{" "}
+                    {(row.reason === "EXPIRING" ? row.expiresAt : row.nextReviewDue)?.slice(0, 10)}
+                  </div>
+                </div>
+                <StatusBadge
+                  label={
+                    row.daysUntil < 0
+                      ? `${Math.abs(row.daysUntil)}d overdue`
+                      : row.daysUntil === 0
+                        ? "Due today"
+                        : `${row.daysUntil}d`
+                  }
+                  tone={row.daysUntil <= 7 ? "warning" : "neutral"}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }

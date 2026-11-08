@@ -5,7 +5,9 @@ export type StatusTone =
   | "warning"
   | "danger"
   | "neutral"
-  | "gold";
+  | "gold"
+  /** Holds / operational warnings — never gold (gold is member ownership). */
+  | "terracotta";
 
 /** Known operational labels and the tone they must use. */
 export const STATUS_TONE_BY_LABEL = {
@@ -27,6 +29,10 @@ export const STATUS_TONE_BY_LABEL = {
   Cancelled: "neutral",
   "Voting rights": "gold",
   "Founding investor": "gold",
+  "On hold": "terracotta",
+  "At port": "terracotta",
+  "Expiring soon": "terracotta",
+  "Review due": "terracotta",
 } as const satisfies Record<string, StatusTone>;
 
 export type KnownStatusLabel = keyof typeof STATUS_TONE_BY_LABEL;
@@ -47,6 +53,7 @@ const toneClass: Record<StatusTone, string> = {
   danger: "bg-state-danger/15 text-state-danger",
   neutral: "bg-surface-sunken text-ink-muted",
   gold: "bg-brand-gold/15 text-brand-gold",
+  terracotta: "bg-brand-terracotta/15 text-brand-terracotta-ink",
 };
 
 function SafetyIcon() {

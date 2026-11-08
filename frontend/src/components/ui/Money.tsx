@@ -13,6 +13,7 @@ const toneClass: Record<StatTone, string> = {
   capital: "text-brand-gold",
   warning: "text-state-warning",
   alert: "text-state-danger",
+  terracotta: "text-brand-terracotta-ink",
 };
 
 /** Format as currency with exactly two decimal places. Never strips .00. */
